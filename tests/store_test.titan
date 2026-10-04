@@ -1,0 +1,230 @@
+local test = import "test"
+local fs = import "fs"
+local os = import "os"
+local strings = import "string"
+local async = import "async"
+local timer = import "timer"
+local store = import "relay.store.titan"
+
+local function fixture(context: test.Context): (store.Store, string)
+  local path = fs.tmpname()
+  context:cleanup(function()
+    if fs.stat(path) then fs.unlink(path) end
+  end)
+  local database = store.open(path)
+  context:cleanup(function() database:close() end)
+  return database, path
+end
+
+local function expect_error(action: function(): (), expected: string)
+  local caught = false
+  do
+    action()
+  catch
+    caught = true
+    test.assert(error == expected, "operation raised an unexpected error")
+  end
+  test.assert(caught, "operation unexpectedly succeeded")
+end
+
+function test_credentials_and_metadata_survive_restart(context: test.Context)
+  local database, path = fixture(context)
+  local paired = database:pair {
+    world_id = "polis", world_title = "Polis 世界", server_fingerprint = "server-1",
+    server_origin = "http://localhost:30000"
+  }
+  database:update(paired.client_id, "polis", "Polis Sector", "3.0.9",
+                  [[{"systemId":"swnr","title":"A GM's world"}]])
+  database:close()
+  local reopened = store.open(path)
+  defer reopened:close()
+  local client? = reopened:get(paired.client_id)
+  test.assert(client ~= nil, "paired client disappeared after restart")
+  test.assert(client.token == paired.token and client.world_id == "polis",
+              "restart changed credentials or world identity")
+  test.assert(client.world_title == "Polis Sector" and client.module_version == "3.0.9" and
+              client.metadata_json == [[{"systemId":"swnr","title":"A GM's world"}]],
+              "client metadata did not persist")
+  test.assert(client.last_seen > 0 and reopened:authenticate(client.client_id, client.token) ~= nil,
+              "persisted credential did not authenticate")
+end
+
+function test_database_mode_restricts_credentials_to_the_owner(context: test.Context)
+  if os.getenv("OS") == "Windows_NT" then test.skip("POSIX permission bits are unavailable on Windows") end
+  local database, path = fixture(context)
+  database:pair("private-world", "Private world")
+  test.assert((fs.stat(path).mode & 511) == 384, "database is readable by other local users")
+end
+
+function test_pairing_reuses_identity_and_supports_multiple_worlds(context: test.Context)
+  local database = fixture(context)
+  local original = database:pair("first", "First", "fingerprint", "http://localhost:30000")
+  local repeated = database:pair("first", "Renamed", "fingerprint", "http://localhost:30000")
+  test.assert(repeated.client_id == original.client_id and repeated.token == original.token,
+              "re-pairing changed a world's credential")
+  test.assert(repeated.world_title == "Renamed", "re-pairing did not refresh world title")
+  local another_world = database:pair("second", "Second", "fingerprint", "http://localhost:30000")
+  local another_server = database:pair("first", "Elsewhere", "fingerprint", "http://localhost:30001")
+  test.assert(another_world.client_id ~= original.client_id and another_world.token ~= original.token,
+              "two worlds share credentials")
+  test.assert(another_server.client_id ~= original.client_id,
+              "separate Foundry server origins share a client identity")
+  local clients = database:list()
+  test.assert(#clients == 3, "client listing omitted a persisted world")
+  test.assert(clients[1].world_title == "Elsewhere" and clients[3].world_title == "Second",
+              "client listing order is unstable")
+end
+
+function test_pairing_matches_existing_id_and_origin_fallback(context: test.Context)
+  local database = fixture(context)
+  local paired = database:pair("world", "World", nil, "http://localhost:30000")
+  local with_fingerprint = database:pair("world", "World", "added-later", "http://localhost:30000")
+  test.assert(with_fingerprint.client_id == paired.client_id and with_fingerprint.token == paired.token,
+              "adding a fingerprint abandoned the existing world")
+  local supplied = database:pair("world", "Updated", "updated-fingerprint", "http://localhost:30000",
+                                paired.client_id)
+  test.assert(supplied.client_id == paired.client_id and supplied.server_fingerprint == "updated-fingerprint",
+              "existing client identity was not retained")
+  local other_world = database:pair("other", "Other", nil, "http://localhost:30000", paired.client_id)
+  test.assert(other_world.client_id ~= paired.client_id,
+              "existingClientId moved a credential to another world")
+end
+
+function test_credentials_are_bound_to_their_client_and_can_be_revoked(context: test.Context)
+  local database = fixture(context)
+  local first = database:pair("first", "First")
+  local second = database:pair("second", "Second")
+  test.assert(database:authenticate(first.client_id, first.token) ~= nil,
+              "valid credential was rejected")
+  test.assert(database:authenticate(second.client_id, first.token) == nil and
+              database:authenticate(first.client_id, second.token) == nil,
+              "credential was accepted for another world")
+  test.assert(database:authenticate(first.client_id, "invalid") == nil and
+              database:authenticate("unknown", first.token) == nil,
+              "invalid credential or unknown client was accepted")
+  test.assert(database:remove(first.client_id) and not database:remove(first.client_id),
+              "client revocation reported the wrong result")
+  test.assert(database:authenticate(first.client_id, first.token) == nil,
+              "revoked credential still authenticates")
+end
+
+function test_sql_values_remain_data_and_missing_metadata_is_preserved(context: test.Context)
+  local database = fixture(context)
+  local world = "'; DROP TABLE clients; --"
+  local paired = database:pair(world, "GM's world", "f'ingerprint", "o'rigin")
+  database:update(paired.client_id, "", "", "v1", [[{"title":"O'Brien"}]])
+  database:update(paired.client_id, "", "", "", "")
+  database:update("' OR 1=1 --", "changed", "changed", "changed", "changed")
+  local found? = database:get(paired.client_id)
+  test.assert(found ~= nil and found.world_id == world and found.world_title == "GM's world",
+              "SQL-looking identity was interpreted as syntax")
+  test.assert(found.module_version == "v1" and found.metadata_json == [[{"title":"O'Brien"}]],
+              "absent reconnect metadata erased persisted details")
+  test.assert(#database:list() == 1, "SQL-looking fields damaged the client table")
+end
+
+function test_self_unpair_revokes_credential_and_preserves_the_world(context: test.Context)
+  local database = fixture(context)
+  local paired = database:pair("world", "World")
+  test.assert(database:revoke("unknown") == nil, "unknown credential revoked a world")
+  test.assert(database:revoke(paired.token) == paired.client_id,
+              "self-unpair returned the wrong client identity")
+  test.assert(database:authenticate(paired.client_id, paired.token) == nil,
+              "self-unpair left its connection credential valid")
+  local repairing = database:pair("world", "World")
+  test.assert(repairing.client_id == paired.client_id and repairing.token ~= paired.token,
+              "self-unpair removed world identity or restored the revoked credential")
+  test.assert(#database:list() == 1, "self-unpair removed the known world")
+end
+
+function test_parallel_pairings_converge_without_database_contention(context: test.Context)
+  local database = fixture(context)
+  local tasks: {async.Task<|store.Client, value|>} = {}
+  for index = 1, 12 do
+    tasks[index] = async.run<|store.Client, value|>(function(): store.Client
+      return database:pair("world", "World", "fingerprint", "http://localhost:30000")
+    end)
+  end
+  local first: store.Client?
+  for index = 1, #tasks do
+    case async.join(tasks[index])
+    when succeeded(client) then
+      if first then
+        test.assert(client.client_id == first.client_id and client.token == first.token,
+                    "parallel pairings minted different credentials")
+      else first = client end
+    when failed(failure) then failure:raise()
+    else raise "parallel pairing did not succeed"
+    end
+  end
+  test.assert(#database:list() == 1, "parallel pairings persisted duplicate clients")
+end
+
+function test_cancelled_store_waiter_does_not_block_later_requests(context: test.Context)
+  local database = fixture(context)
+  database:acquire()
+  local cancelled = async.run<|store.Client, value|>(function(): store.Client
+    return database:pair("cancelled", "Cancelled")
+  end)
+  local surviving = async.run<|store.Client, value|>(function(): store.Client
+    return database:pair("surviving", "Surviving")
+  end)
+  while #database.waiters < 2 do timer.yield() end
+  cancelled:cancel()
+  test.assert(#database.waiters == 1, "cancellation retained its queued store waiter")
+  database:release()
+  test.assert((async.join(cancelled):has_cancelled()), "queued request did not cancel")
+  local status = async.join(surviving)
+  case status
+  when succeeded(client) then test.assert(client.world_id == "surviving")
+  when failed(failure) then failure:raise()
+  else raise "surviving request did not succeed"
+  end
+  test.assert(#database:list() == 1, "cancelled queued request created a world")
+end
+
+function test_cancel_after_gate_handoff_releases_the_reserved_owner(context: test.Context)
+  local database = fixture(context)
+  database:acquire()
+  local cancelled = async.run<|store.Client, value|>(function(): store.Client
+    return database:pair("cancelled", "Cancelled")
+  end)
+  local surviving = async.run<|store.Client, value|>(function(): store.Client
+    return database:pair("surviving", "Surviving")
+  end)
+  while #database.waiters < 2 do timer.yield() end
+  database:release()
+  -- release reserves ownership, while resume is deferred. Cancel in that real
+  -- handoff interval and prove that the next waiter receives the reservation.
+  cancelled:cancel()
+  test.assert((async.join(cancelled):has_cancelled()), "reserved request did not cancel")
+  case async.join(surviving)
+  when succeeded(client) then test.assert(client.world_id == "surviving")
+  when failed(failure) then failure:raise()
+  else raise "handoff cancellation stranded the next request"
+  end
+  test.assert(#database:list() == 1, "cancelled handoff admitted database work")
+end
+
+function test_store_close_rejects_new_operations(context: test.Context)
+  local database = fixture(context)
+  database:close()
+  database:close()
+  expect_error(function() database:list() end, "relay store is closed")
+  expect_error(function() database:pair("world", "World") end, "relay store is closed")
+end
+
+function test_secure_token_and_secret_comparison(_context: test.Context)
+  local token = store.secure_token()
+  local second = store.secure_token()
+  test.assert(#token == 64 and #store.secure_token(16) == 32,
+              "random token has the wrong byte length")
+  test.assert(token ~= second, "independent OS random tokens unexpectedly repeated")
+  for index = 1, #token do
+    local found? = strings.find("0123456789abcdef", strings.sub(token, index, index))
+    test.assert(found ~= nil, "random token is not lowercase hex")
+  end
+  test.assert(store.same_secret(token, token) and not store.same_secret(token, second) and
+              not store.same_secret(token, token .. "0"), "secret comparison gave the wrong result")
+  expect_error(function() store.secure_token(0) end, "random token size must be between 1 and 1024 bytes")
+end

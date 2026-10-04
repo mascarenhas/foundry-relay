@@ -1,0 +1,247 @@
+local router = import "relay.router"
+local test = import "test"
+local json = import "json"
+local strings = import "string"
+
+function test_parameter_routes(_context: test.Context)
+  local routes = router.Router({router.Route("GET", "/api/worlds/:world/actors/:id", "actor")})
+  local result = routes:match("GET", "/api/worlds/Polis%20Sector/actors/A%2FB")
+  test.assert(result.status == 200)
+  test.assert(result.match.action == "actor")
+  test.assert(result.match.params["world"] == "Polis Sector")
+  test.assert(result.match.params["id"] == "A/B", "encoded slash split a parameter")
+end
+
+function test_declaration_order(_context: test.Context)
+  local routes = router.Router({
+    router.Route("GET", "/api/special", "special"),
+    router.Route("GET", "/api/:name", "generic"),
+  })
+  test.assert(routes:match("GET", "/api/special").match.action == "special")
+  test.assert(routes:match("GET", "/api/other").match.action == "generic")
+end
+
+function test_wildcard_prefix(_context: test.Context)
+  local routes = router.Router({router.Route("*", "/api/*", "forward")})
+  test.assert(routes:match("PATCH", "/api/actors/A%2FB").match.params["wildcard"] == "actors/A/B")
+  test.assert(routes:match("GET", "/api").match.params["wildcard"] == "")
+  test.assert(routes:match("GET", "/apricot").status == 404)
+end
+
+function test_not_found_and_method_not_allowed(_context: test.Context)
+  local routes = router.Router({
+    router.Route("GET", "/resource/:id", "read"),
+    router.Route("POST", "/resource/:id", "update"),
+    router.Route("GET", "/resource/:name", "other_read"),
+  })
+  local rejected = routes:match("DELETE", "/resource/one")
+  test.assert(rejected.status == 405 and rejected.match == nil)
+  test.assert(#rejected.allowed == 2, "allowed methods were not deduplicated")
+  test.assert(router.allow_header(rejected.allowed) == "GET, POST")
+  test.assert(routes:match("GET", "/missing").status == 404)
+  test.assert(routes:match("GET", "/resource/").status == 404)
+end
+
+function test_query_values_preserve_duplicates(_context: test.Context)
+  local parsed = router.parse_target("/relay?world=Polis+Sector&tag=a&tag=b&empty=&flag&data=a%3Db%26c")
+  test.assert(parsed.path == "/relay")
+  test.assert(parsed.query["world"] == "Polis Sector")
+  test.assert(parsed.query["tag"] == "a")
+  test.assert(#parsed.query_values["tag"] == 2)
+  test.assert(parsed.query_values["tag"][2] == "b")
+  test.assert(parsed.query["empty"] == "" and parsed.query["flag"] == "")
+  test.assert(parsed.query["data"] == "a=b&c")
+end
+
+function test_decoding_distinguishes_path_plus(_context: test.Context)
+  local parsed = router.parse_target("/a+b?literal=a%2Bb&form=a+b")
+  test.assert(parsed.segments[1] == "a+b")
+  test.assert(parsed.query["literal"] == "a+b")
+  test.assert(parsed.query["form"] == "a b")
+end
+
+local function malformed_case(context: test.Context, name: string, target: string)
+  context:run(name, function(_child: test.Context)
+    local routes = router.Router({router.Route("GET", "/*", "catch_all")})
+    local result = routes:match("GET", target)
+    test.assert(result.status == 400 and result.match == nil)
+    test.assert(result.error ~= nil)
+  end)
+end
+
+function test_rejects_malformed_target(context: test.Context)
+  malformed_case(context, "incomplete_escape", "/x%")
+  malformed_case(context, "invalid_escape", "/x%GG")
+  malformed_case(context, "nul_escape", "/x%00")
+  malformed_case(context, "malformed_query", "/?x=%q1")
+  malformed_case(context, "absolute_form", "http://example.com/")
+  malformed_case(context, "fragment", "/#bad")
+  malformed_case(context, "control", "/bad\n")
+  malformed_case(context, "target_limit", "/" .. strings.rep("a", 16384))
+  malformed_case(context, "query_limit", "/?" .. strings.rep("x=1&", 256) .. "x=1")
+end
+
+local function invalid_route_case(context: test.Context, name: string, pattern: string)
+  context:run(name, function(_child: test.Context)
+    local rejected = false
+    do
+      router.Route("GET", pattern, "invalid")
+    catch
+      rejected = true
+    end
+    test.assert(rejected, "invalid pattern was accepted")
+  end)
+end
+
+function test_rejects_invalid_route(context: test.Context)
+  invalid_route_case(context, "wildcard_not_terminal", "/api/*/suffix")
+  invalid_route_case(context, "partial_wildcard", "/api/act*")
+  invalid_route_case(context, "duplicate_parameter", "/:id/:id")
+  invalid_route_case(context, "wildcard_parameter_collision", "/:wildcard/*")
+  invalid_route_case(context, "unnamed_parameter", "/api/:")
+  invalid_route_case(context, "query", "/api?x=y")
+  invalid_route_case(context, "relative", "api")
+end
+
+function test_root_and_trailing_slash(_context: test.Context)
+  local routes = router.Router({router.Route("GET", "/", "root"), router.Route("GET", "/api/", "api")})
+  test.assert(routes:match("GET", "/").match.action == "root")
+  test.assert(routes:match("GET", "/api/").match.action == "api")
+  test.assert(routes:match("GET", "/api").status == 404)
+end
+
+function test_router_snapshots_declaration_array(_context: test.Context)
+  local declarations: {router.Route} = {router.Route("GET", "/original", "original")}
+  local routes = router.Router(declarations)
+  declarations[1] = router.Route("GET", "/replacement", "replacement")
+  test.assert(routes:match("GET", "/original").status == 200)
+  test.assert(routes:match("GET", "/replacement").status == 404)
+end
+
+function test_error_body_escapes_json(_context: test.Context)
+  local message = "invalid \"quoted\" input\nnext line"
+  local body: {string: value} = json.decode(router.error_body(message))
+  test.assert(body["error"] == message)
+end
+
+function test_route_parser_returns_typed_parts(_context: test.Context)
+  local parts?, problem? = router.parse_route("/api/:name/*")
+  test.assert(problem == nil and #parts == 3)
+  case parts[1]
+  when literal(text, position) then test.assert(text == "api" and position == 2)
+  else raise "literal route part had the wrong type"
+  end
+  case parts[2]
+  when parameter(name, position) then test.assert(name == "name" and position == 6)
+  else raise "parameter route part had the wrong type"
+  end
+  case parts[3]
+  when wildcard(position) then test.assert(position == 12)
+  else raise "wildcard route part had the wrong type"
+  end
+  local root?, failure? = router.parse_route("/")
+  test.assert(failure == nil and #root == 0)
+end
+
+local function diagnostic_case(context: test.Context, name: string, pattern: string,
+                               code: string, position: integer)
+  context:run(name, function(_child: test.Context)
+    local parts?, problem? = router.parse_route(pattern)
+    test.assert(parts == nil and problem ~= nil, "invalid route did not produce a diagnostic")
+    test.assert(problem.code == code, "wrong route label: " .. problem.code)
+    test.assert(problem.position == position, "route label reported the wrong byte")
+    test.assert(problem.line == 1 and problem.column == position)
+    test.assert(problem.message ~= "")
+  end)
+end
+
+function test_route_parser_labeled_diagnostics(context: test.Context)
+  diagnostic_case(context, "leading_slash", "relative", "expected_slash", 1)
+  diagnostic_case(context, "empty_parameter", "/:", "expected_parameter_name", 3)
+  diagnostic_case(context, "parameter_identifier", "/:9name", "expected_parameter_name", 3)
+  diagnostic_case(context, "parameter_suffix", "/:id.tail", "parameter_tail", 5)
+  diagnostic_case(context, "nonterminal_wildcard", "/api/*/tail", "wildcard_not_terminal", 7)
+  diagnostic_case(context, "partial_wildcard", "/api/act*", "partial_wildcard", 9)
+  diagnostic_case(context, "query", "/api?x=y", "query_or_fragment", 5)
+  diagnostic_case(context, "fragment", "/api#x", "query_or_fragment", 5)
+  diagnostic_case(context, "short_escape", "/a%", "percent_escape", 4)
+  diagnostic_case(context, "bad_first_hex", "/a%q1", "percent_escape", 4)
+  diagnostic_case(context, "bad_second_hex", "/a%1q", "percent_escape", 5)
+  diagnostic_case(context, "encoded_nul", "/a%00", "nul_escape", 4)
+  diagnostic_case(context, "control", "/a\n", "control_character", 3)
+  diagnostic_case(context, "duplicate_parameter", "/:id/:id", "duplicate_parameter", 6)
+  diagnostic_case(context, "duplicate_wildcard", "/:wildcard/*", "duplicate_parameter", 12)
+  diagnostic_case(context, "route_byte_limit", "/" .. strings.rep("a", 1024), "route_limit", 1025)
+  diagnostic_case(context, "route_part_limit", "/" .. strings.rep("a/", 64) .. "a", "route_limit", 130)
+  diagnostic_case(context, "unicode_byte_position", "/🌑/*/tail", "wildcard_not_terminal", 8)
+end
+
+function test_route_constructor_raises_structured_diagnostic(_context: test.Context)
+  local rejected = false
+  do
+    router.Route("GET", "/bad/:", "invalid")
+  catch
+    rejected = true
+    test.assert(error is router.RouteError)
+    local problem: router.RouteError = error
+    test.assert(problem.code == "expected_parameter_name" and problem.position == 7)
+  end
+  test.assert(rejected, "invalid constructor did not raise")
+end
+
+local function empty_declaration_case(context: test.Context, name: string, method: string, action: string)
+  context:run(name, function(_child: test.Context)
+    local rejected = false
+    do
+      router.Route(method, "/", action)
+    catch
+      rejected = true
+      test.assert(error is router.RouteError)
+      local problem: router.RouteError = error
+      test.assert(problem.code == "invalid_declaration" and problem.position == 1)
+    end
+    test.assert(rejected)
+  end)
+end
+
+function test_route_constructor_requires_method_and_action(context: test.Context)
+  empty_declaration_case(context, "empty_method", "", "action")
+  empty_declaration_case(context, "empty_action", "GET", "")
+end
+
+function test_route_limits_accept_their_boundaries(_context: test.Context)
+  local maximum_bytes = "/" .. strings.rep("a", 1023)
+  local routes = router.Router({router.Route("GET", maximum_bytes, "maximum_bytes")})
+  test.assert(routes:match("GET", maximum_bytes).status == 200)
+  local maximum_parts = "/" .. strings.rep("/", 63)
+  local parts?, problem? = router.parse_route(maximum_parts)
+  test.assert(problem == nil and #parts == 64)
+  local separators = router.Router({router.Route("GET", maximum_parts, "maximum_parts")})
+  test.assert(separators:match("GET", maximum_parts).status == 200)
+end
+
+function test_peg_literal_matcher_preserves_uri_segment_boundaries(_context: test.Context)
+  local routes = router.Router({
+    router.Route("GET", "/api/:id", "parameter"),
+    router.Route("GET", "/encoded/a%2Fb", "literal_slash"),
+    router.Route("GET", "/percent/%25", "literal_percent"),
+    router.Route("GET", "/literal/a.b(+)'", "literal_punctuation"),
+  })
+  local escaped = routes:match("GET", "/%61pi/A%2fB")
+  test.assert(escaped.status == 200 and escaped.match.params["id"] == "A/B")
+  test.assert(routes:match("GET", "/encoded/a%2fb").match.action == "literal_slash")
+  test.assert(routes:match("GET", "/encoded/a/b").status == 404)
+  test.assert(routes:match("GET", "/percent/%25").match.action == "literal_percent")
+  test.assert(routes:match("GET", "/literal/a.b(+)'" ).match.action == "literal_punctuation")
+  test.assert(routes:match("GET", "/api/name/suffix").status == 404, "PEG matcher accepted a path prefix")
+  test.assert(routes:match("GET", "/api/").status == 404, "PEG parameter matched an empty segment")
+end
+
+function test_peg_routes_are_reusable_without_capture_state(_context: test.Context)
+  local routes = router.Router({router.Route("GET", "/api/:name", "parameter")})
+  local first = routes:match("GET", "/api/first")
+  local second = routes:match("GET", "/api/second")
+  first.match.params["name"] = "changed"
+  test.assert(second.match.params["name"] == "second", "matches shared their capture envelope")
+  test.assert(routes:match("GET", "/api/third").match.params["name"] == "third")
+end

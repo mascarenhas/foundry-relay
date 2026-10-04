@@ -1,0 +1,13 @@
+/build/
+/main
+/tests/*_test
+*.sqlite3
+*.sqlite3-*
+.env
+*.c
+*.o
+*.ffi.h
+*.titan.h
+*.so
+*.a
+*.lua

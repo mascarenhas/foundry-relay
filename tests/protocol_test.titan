@@ -1,0 +1,142 @@
+local test = import "test"
+local wire = import "relay.wire"
+local config = import "relay.config"
+local hub = import "relay.hub.titan"
+local async = import "async"
+local timer = import "timer"
+local strings = import "string"
+
+function test_nulls_and_nested_arrays_round_trip(_context: test.Context)
+  local source = [[{"a":[1,null,null],"b":null,"c":{"d":null}}]]
+  test.assert(wire.encode(wire.decode(source)) == source,
+    "relay changed explicit nulls or trailing array positions")
+end
+
+function test_empty_objects_arrays_and_false_stay_distinct(_context: test.Context)
+  local source = [[{"a":[],"b":{},"c":false,"d":0,"e":""}]]
+  test.assert(wire.encode(wire.object(source)) == source)
+end
+
+function test_secret_comparison_observes_every_byte(_context: test.Context)
+  test.assert(config.secret_equal("api-key", "api-key"))
+  test.assert(not config.secret_equal("api-key", "API-key"))
+  test.assert(not config.secret_equal("api-key", "api-key\0"))
+  test.assert(not config.secret_equal("", "api-key"))
+end
+
+function test_error_json_escapes_protocol_bytes(_context: test.Context)
+  local source = "quoted \" text\nline\0end"
+  local decoded = wire.object(wire.error_body(source))
+  test.assert(wire.text(decoded, "error") == source)
+end
+
+function test_wire_rejects_non_object_envelopes(_context: test.Context)
+  local caught = false
+  do wire.object("[]")
+  catch caught = true end
+  test.assert(caught, "array was accepted as a Foundry protocol envelope")
+end
+
+function test_reply_completion_wakes_exact_pending_request(_context: test.Context)
+  local pending = hub.Pending("test", "entity", async.ResumeToken("test pending"), nil, nil)
+  local waiting = async.run<|integer, value|>(function (): integer
+    pending.waiter = async.running()
+    async.suspend(pending.token, function () pending.waiter = nil end)
+    return pending.reply.status
+  end)
+  defer hub.drain(waiting)
+  while waiting:status():as_string() == "ready" do timer.yield() end
+  pending:complete(hub.Reply(200, "first"))
+  pending:complete(hub.Reply(400, "duplicate"))
+  case async.join(waiting)
+  when succeeded(status) then test.assert(status == 200 and pending.reply.body == "first")
+  when failed(failure) then failure:raise()
+  else raise "request waiter did not finish"
+  end
+end
+
+function test_cancelled_pending_request_cannot_be_resumed(_context: test.Context)
+  local pending = hub.Pending("test", "entity", async.ResumeToken("cancel pending"), nil, nil)
+  local waiting = async.run<|nil, value|>(function (): nil
+    pending.waiter = async.running()
+    async.suspend(pending.token, function () pending.waiter = nil end)
+    return nil
+  end)
+  defer hub.drain(waiting)
+  while waiting:status():as_string() == "ready" do timer.yield() end
+  waiting:cancel()
+  test.assert(pending.waiter == nil, "cancellation retained a protocol wake capability")
+  pending:complete(hub.Reply(200, "late"))
+  test.assert((async.join(waiting):has_cancelled()))
+end
+
+function test_late_reply_stores_result_before_wait_registration(_context: test.Context)
+  local pending = hub.Pending("test", "entity", async.ResumeToken("early reply"), nil, nil)
+  pending:complete(hub.Reply(200, "already delivered"))
+  test.assert(pending.reply.status == 200 and pending.waiter == nil)
+end
+
+function test_large_json_response_preserves_multibyte_text(_context: test.Context)
+  local text = strings.rep("世界🚀\n", 20000)
+  local object: {string: value} = { ["text"] = text }
+  test.assert(wire.text(wire.object(wire.encode(object)), "text") == text)
+end
+
+function test_queued_output_skips_expired_and_cancelled_requests(_context: test.Context)
+  local pending = hub.Pending("request", "entity", async.ResumeToken("output test"), nil, nil)
+  local requests: {string: hub.Pending} = { ["request"] = pending }
+  local message = hub.Outgoing("request payload", "request")
+  test.assert(message:should_send(requests), "live queued request was discarded")
+  pending:complete(hub.Reply(408, "expired"))
+  test.assert(not message:should_send(requests), "expired request remained eligible for output")
+  requests["request"] = nil
+  test.assert(not message:should_send(requests), "cancelled request remained eligible for output")
+  test.assert(hub.Outgoing("subscription update", nil):should_send(requests),
+              "request-independent control message was discarded")
+end
+
+function test_unsubscribe_compacts_the_subscriber_registry(_context: test.Context)
+  local worlds = hub.Hub(128, 30000)
+  defer worlds:close()
+  local first = worlds:subscribe("world", "chat-events")
+  defer worlds:unsubscribe(first)
+  local second = worlds:subscribe("world", "chat-events")
+  local third = worlds:subscribe("world", "hooks")
+  defer worlds:unsubscribe(third)
+  local fourth = worlds:subscribe("world", "chat-events")
+  worlds:unsubscribe(second)
+  worlds:unsubscribe(fourth)
+  test.assert(#worlds.subscribers == 2 and worlds.subscribers[1] == first and worlds.subscribers[2] == third,
+              "unsubscription retained holes or changed active subscriber order")
+  test.assert(worlds:subscription_count("world", "chat-events") == 1 and
+              worlds:subscription_count("world", "hooks") == 1,
+              "unsubscription left incorrect per-channel counts")
+end
+
+function test_hub_shutdown_ends_waiters_and_stops_new_subscriptions(_context: test.Context)
+  local worlds = hub.Hub(128, 30000)
+  defer worlds:close()
+  local subscriber = worlds:subscribe("world", "chat-events")
+  defer worlds:unsubscribe(subscriber)
+  local reading = async.run<|string?, value|>(subscriber:next)
+  defer hub.drain(reading)
+  while reading:status():as_string() == "ready" do timer.yield() end
+  worlds:close()
+  case async.join(reading)
+  when succeeded(message) then test.assert(message == nil, "shutdown did not end an SSE waiter")
+  when failed(failure) then failure:raise()
+  else raise "SSE waiter did not retire after shutdown"
+  end
+  local selected?, problem? = worlds:select("world")
+  test.assert(selected == nil and problem == "relay is closed" and not worlds:online("world"),
+              "closed hub still admits world operations")
+  local rejected = false
+  do
+    worlds:subscribe("world", "hooks")
+  catch
+    rejected = true
+    test.assert(error == "relay is closed")
+  end
+  test.assert(rejected and #worlds.subscribers == 1,
+              "closed hub accepted a new subscriber")
+end

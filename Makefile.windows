@@ -1,0 +1,57 @@
+# Run from an MSYS2 CLANG64 shell with a prepared native Windows Titan SDK.
+PREFIX ?= /c/Titan/sdk
+TITANC := $(abspath $(PREFIX))/bin/titanc.exe
+TITAN_JOBS := 1
+WINDOWS_ROOT := $(shell cygpath -m "$(abspath .)")
+WINDOWS_PREFIX := $(shell cygpath -m "$(abspath $(PREFIX))")
+APP_SOURCES := $(wildcard relay/*.titan) main.titan
+CORE_SOURCES := $(APP_SOURCES) $(wildcard tests/*.titan)
+CORE_ROOTS := tests.router_test tests.store_test tests.api_test tests.protocol_test tests.integration_test
+RUNTIME_DLLS := lua-5.5.1.dll libuv-1.dll libllhttp-9.4.dll libsqlite3-0.dll libcrypto-3-x64.dll libssl-3-x64.dll
+
+export CC := clang
+export AR := llvm-ar
+export RANLIB := llvm-ranlib
+export RC := llvm-rc
+export MSYS2_ARG_CONV_EXCL := *
+export TITAN_ROCKS_ROOT := $(WINDOWS_PREFIX)
+export TITAN_RUNTIME_PREBUILT := 1
+export TITAN_PROBE_CACHE_DISABLE := 1
+export TITAN_PATH_0_6 := $(WINDOWS_PREFIX)/lib/titan/0.6
+export TITAN_EXTRA_CPPFLAGS := $(TITAN_EXTRA_CPPFLAGS) -DUSING_UV_SHARED=1 -I"$(WINDOWS_PREFIX)/include"
+export TITAN_EXTRA_LDFLAGS := $(TITAN_EXTRA_LDFLAGS) -Wl,--stack,8388608
+
+.PHONY: all core-test-build test clean require-clang64
+all: build/windows/app/bin/foundry-relay.exe
+
+require-clang64:
+	test "$(MSYSTEM)" = CLANG64
+	test -f "$(TITANC)" -a -f "$(PREFIX)/lib/titan/0.6/titan.dll"
+
+build/windows/app/bin/foundry-relay.exe: $(APP_SOURCES) THIRD_PARTY_NOTICES.md Makefile.windows | require-clang64
+	mkdir -p build/windows/app-src/relay build/windows/app/bin build/windows/app/lib/titan/0.6
+	cp relay/*.titan build/windows/app-src/relay/
+	cp main.titan build/windows/app-src/
+	set -e; for name in $(RUNTIME_DLLS); do cp "$(PREFIX)/bin/$$name" build/windows/app/bin/; done
+	cp "$(PREFIX)/lib/titan/0.6/titan.dll" build/windows/app/lib/titan/0.6/
+	cp THIRD_PARTY_NOTICES.md build/windows/app/
+	mkdir -p build/windows/app/licenses
+	cp "$(PREFIX)/share/titan/LICENSE" "$(PREFIX)/share/titan/THIRD_PARTY_NOTICES.md" build/windows/app/licenses/
+	cp -R "$(PREFIX)/share/titan/LICENSES" build/windows/app/licenses/
+	cd build/windows/app && "$(TITANC)" --incremental -j 1 --launcher-name foundry-relay --tree "$(WINDOWS_ROOT)/build/windows/app-src" main
+
+core-test-build: build/windows/test/bin/relay-tests.exe
+
+build/windows/test/bin/relay-tests.exe: $(CORE_SOURCES) Makefile.windows | require-clang64
+	mkdir -p build/windows/test-src/relay build/windows/test-src/tests build/windows/test/bin build/windows/test/lib/titan/0.6
+	cp relay/*.titan build/windows/test-src/relay/
+	cp tests/*.titan build/windows/test-src/tests/
+	set -e; for name in $(RUNTIME_DLLS); do cp "$(PREFIX)/bin/$$name" build/windows/test/bin/; done
+	cp "$(PREFIX)/lib/titan/0.6/titan.dll" build/windows/test/lib/titan/0.6/
+	cd build/windows/test && "$(TITANC)" --incremental -j 1 --launcher-name relay-tests --test --tree "$(WINDOWS_ROOT)/build/windows/test-src" $(CORE_ROOTS)
+
+test: all core-test-build
+	powershell.exe -NoProfile -NonInteractive -File "$(WINDOWS_ROOT)/scripts/check-windows.ps1" -Application "$(WINDOWS_ROOT)/build/windows/app" -TestPayload "$(WINDOWS_ROOT)/build/windows/test" -ReadObj "$$(cygpath -m "$$(command -v llvm-readobj)")"
+
+clean:
+	rm -rf build/windows

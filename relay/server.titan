@@ -1,0 +1,319 @@
+local http = import "http"
+local websocket = import "websocket"
+local async = import "async"
+local timer = import "timer"
+local strings = import "string"
+local iteration = import "iteration"
+local os = import "os"
+local config = import "relay.config"
+local wire = import "relay.wire"
+local router = import "relay.router"
+local store = import "relay.store"
+local hub = import "relay.hub"
+local api = import "relay.api"
+
+record Server
+  const config: config.Config
+  const worlds: hub.Hub
+  local const database: store.Store
+  local const routes: router.Router
+  local listener: http.Server?
+  local closed: boolean
+end
+
+local function body(request: http.Request): string
+  local output = strings.writer()
+  local length = 0
+  for chunk in request:read do
+    length = length + #chunk
+    if length > 16777216 then raise "request body exceeds 16 MiB" end
+    output:write(chunk)
+  end
+  return output:drain()
+end
+
+local function json_body(request: http.Request): {string: value}
+  local source = body(request)
+  if source == "" then return {} end
+  local content_type = strings.lower(request.headers:get("Content-Type") or "")
+  if strings.sub(content_type, 1, 16) ~= "application/json" then
+    raise "request body must use application/json"
+  end
+  return wire.object(source)
+end
+
+function Server.new(settings: config.Config): Server
+  local declarations = api.routes()
+  local local_routes: {router.Route} = {
+    router.Route("GET", "/health", "health"),
+    router.Route("POST", "/auth/pair", "pair"),
+    router.Route("POST", "/api/self-unpair", "unpair"),
+    router.Route("GET", "/api/clients/:clientId/active", "active"),
+    router.Route("GET", "/relay", "relay"),
+    router.Route("GET", "/clients", "clients"),
+    router.Route("DELETE", "/clients/:clientId", "forget"),
+    router.Route("GET", "/chat/subscribe", "sse:chat-events"),
+    router.Route("GET", "/rolls/subscribe", "sse:roll-events"),
+    router.Route("GET", "/hooks/subscribe", "sse:hooks"),
+    router.Route("GET", "/encounters/subscribe", "sse:combat-events"),
+    router.Route("GET", "/actor/subscribe", "sse:actor-events"),
+    router.Route("GET", "/scene/subscribe", "sse:scene-events") }
+  -- Specific local routes precede the upstream route table.
+  for i = 1, #declarations do local_routes[#local_routes + 1] = declarations[i] end
+  return { config = settings, worlds = hub.Hub(settings.max_pending, settings.heartbeat),
+    database = store.open(settings.database), routes = router.Router(local_routes), listener = nil, closed = false }
+end
+
+local function Server:origin_allowed(request: http.Request): boolean
+  local origins = request.headers:values("Origin")
+  if #origins == 0 then return true end
+  if #origins ~= 1 then return false end
+  local origin = origins[1]
+  if origin == request.url.scheme .. "://" .. request.url.authority then return true end
+  for i = 1, #self.config.origins do if origin == self.config.origins[i] then return true end end
+  return false
+end
+
+local function Server:authorized(request: http.Request): boolean
+  local keys = request.headers:values("x-api-key")
+  return #keys == 1 and config.secret_equal(keys[1], self.config.api_key)
+end
+
+local function Server:pair(request: http.Request, response: http.Response)
+  local data = json_body(request)
+  local code = wire.text(data, "code")
+  if not config.secret_equal(code, self.config.pairing_code) then
+    router.error_response(response, 401, "invalid pairing code")
+    return
+  end
+  local world_id = wire.text(data, "worldId")
+  if world_id == "" then router.error_response(response, 400, "worldId is required"); return end
+  local client = self.database:pair(world_id, wire.text(data, "worldTitle", world_id),
+    wire.text(data, "serverFingerprint"), wire.text(data, "serverOrigin"), wire.text(data, "existingClientId"))
+  local result: {string: value} = { ["token"] = client.token, ["clientId"] = client.client_id,
+    ["relayUrl"] = self.config.public_url }
+  router.json_response(response, 200, wire.encode(result))
+end
+
+local function Server:unpair(request: http.Request, response: http.Response)
+  local data = json_body(request)
+  local id? = self.database:revoke(wire.text(data, "token"))
+  if not id then router.error_response(response, 401, "invalid pairing token"); return end
+  self.worlds:disconnect(id)
+  router.json_response(response, 200, "{\"success\":true}")
+end
+
+local function Server:websocket(request: http.Request, response: http.Response, match: router.Match)
+  local id? = match.query["id"]
+  if not id or id == "" then router.error_response(response, 400, "id is required"); return end
+  local connection = websocket.accept(request, response, websocket.AcceptOptions {
+    allowed_origins = self.config.origins, read_limit = 16777216, handshake_timeout = self.config.auth_timeout })
+  defer connection:close()
+  local deadline = async.run<|nil, value|>(function (): nil
+    timer.sleep(self.config.auth_timeout)
+    connection:close()
+    return nil
+  end)
+  defer hub.drain(deadline)
+  local kind?, text? = connection:read()
+  if not kind or kind ~= websocket.TEXT then return end
+  local auth = wire.object(text)
+  local token = wire.text(auth, "token")
+  local client? = self.database:authenticate(id, token)
+  if wire.text(auth, "type") ~= "auth" or not client then
+    connection:write(websocket.TEXT, "{\"type\":\"auth-failed\",\"error\":\"invalid pairing token\"}")
+    connection:shutdown(1008, "authentication failed", 1000)
+    return
+  end
+  hub.drain(deadline)
+  local metadata: {string: value} = {}
+  for key, item in iteration.pairs(match.query) do metadata[key] = item end
+  self.database:update(client.client_id, client.world_id,
+    match.query["worldTitle"] or client.world_title, match.query["version"] or "", wire.encode(metadata))
+  -- Metadata publication suspends. Recheck revocation, then let Hub register
+  -- ownership before any output can yield; unpair now always finds the session.
+  client = self.database:authenticate(id, token)
+  if not client then
+    connection:write(websocket.TEXT, "{\"type\":\"auth-failed\",\"error\":\"invalid pairing token\"}")
+    connection:shutdown(1008, "authentication failed", 1000)
+    return
+  end
+  self.worlds:run(client.client_id, connection)
+catch
+  -- The connection owns its transferred stream and all cleanup. A malformed
+  -- module message or ordinary network loss affects only this world.
+  os.stderr:write("Foundry WebSocket session ended\n")
+end
+
+local function Server:clients(response: http.Response)
+  local clients = self.database:list()
+  local results: {value} = {}
+  for i = 1, #clients do
+    local client = clients[i]
+    local metadata = wire.object(client.metadata_json)
+    local item: {string: value} = { ["id"] = client.client_id, ["clientId"] = client.client_id,
+      ["worldId"] = client.world_id, ["worldTitle"] = client.world_title,
+      ["version"] = client.module_version, ["lastSeen"] = client.last_seen,
+      ["connected"] = self.worlds:online(client.client_id) }
+    for key, content in iteration.pairs(metadata) do
+      if key ~= "id" and key ~= "token" and key ~= "clientId" and key ~= "connected" then item[key] = content end
+    end
+    results[i] = item
+  end
+  router.json_response(response, 200, wire.encode(results))
+end
+
+local function sse_name(channel: string, data: {string: value}): string
+  local event_type = wire.text(data, "eventType", "create")
+  if channel == "roll-events" then return "roll" end
+  if channel == "hooks" then return wire.text(data, "hook", wire.text(data, "hookName", "hook")) end
+  local prefix = "chat"
+  if channel == "combat-events" then prefix = "combat" end
+  if channel == "actor-events" then prefix = "actor" end
+  if channel == "scene-events" then prefix = "scene" end
+  local name = prefix .. "-" .. event_type
+  if strings.find(name, "\n") or strings.find(name, "\r") then return prefix end
+  return name
+end
+
+local function Server:stream(response: http.Response, match: router.Match)
+  local session?, problem? = self.worlds:select(match.query["clientId"])
+  if not session then router.error_response(response, 503, problem); return end
+  local channel = strings.sub(match.action, 5)
+  local subscriber = self.worlds:subscribe(session.id, channel)
+  defer self.worlds:unsubscribe(subscriber)
+  response:set_header("Content-Type", "text/event-stream")
+  response:set_header("Cache-Control", "no-cache")
+  response:set_header("X-Accel-Buffering", "no")
+  local initial: {string: value} = { ["clientId"] = session.id }
+  response:write("event: connected\ndata: " .. wire.encode(initial) .. "\n\n")
+  local reading: async.Task<|string?, value|>? = nil
+  defer if reading then hub.drain(reading) end
+  while true do
+    if not reading then reading = async.run<|string?, value|>(subscriber:next) end
+    local keepalive = async.run<|nil, value|>(function (): nil timer.sleep(15000); return nil end)
+    defer hub.drain(keepalive)
+    case async.race_two(reading, keepalive)
+    when first(status) then
+      case status
+      when succeeded(text) then
+        if not text then return end
+        local envelope = wire.object(text)
+        local data: {string: value} = envelope
+        if envelope["data"] is {string: value} then data = envelope["data"] as {string: value} end
+        local name = sse_name(channel, data)
+        if strings.find(name, "\n") or strings.find(name, "\r") then name = "event" end
+        response:write("event: " .. name .. "\ndata: " .. wire.encode(data) .. "\n\n")
+        reading = nil
+      else return
+      end
+    when second() then response:write(": keepalive\n\n")
+    end
+  end
+end
+
+local function Server:forward(request: http.Request, response: http.Response, match: router.Match)
+  local endpoint = api.endpoint_for(match.action)
+  local data: {string: value} = {}
+  local content_type = request.headers:get("Content-Type") or "application/octet-stream"
+  if endpoint.special == "upload" and strings.sub(strings.lower(content_type), 1, 16) ~= "application/json" then
+    -- Binary upload metadata comes from the declared query parameters.
+    data["fileData"] = "data:" .. content_type .. ";base64," .. api.encode_base64(body(request))
+  else
+    data = json_body(request)
+  end
+  local payload = api.build_payload(endpoint, match, data)
+  local client_id? = match.query["clientId"]
+  if not client_id and data["clientId"] is string then client_id = data["clientId"] as string end
+  local session?, problem? = self.worlds:select(client_id)
+  if not session then
+    local status = 503
+    if problem == "multiple worlds are online; specify clientId" then status = 400 end
+    router.error_response(response, status, problem)
+    return
+  end
+  local timeout = self.config.request_timeout
+  if timeout == 0 then timeout = endpoint.timeout_ms end
+  local reply = session:request(endpoint.action, payload, timeout)
+  if reply.status ~= 200 then router.json_response(response, reply.status, reply.body); return end
+  local converted = api.response(endpoint, wire.object(reply.body), match.query["format"])
+  response:set_status(converted.status)
+  response:set_header("Content-Type", converted.content_type)
+  for key, content in iteration.pairs(converted.headers) do response:set_header(key, content) end
+  response:write(converted.body)
+end
+
+function Server:handle(request: http.Request, response: http.Response)
+  if self.closed then
+    response:set_header("Connection", "close")
+    router.error_response(response, 503, "relay is closed")
+    return
+  end
+  if not self:origin_allowed(request) then router.error_response(response, 403, "origin is not allowed"); return end
+  local origin? = request.headers:get("Origin")
+  if origin then
+    response:set_header("Access-Control-Allow-Origin", origin)
+    response:set_header("Vary", "Origin")
+  end
+  if request.method == "OPTIONS" then
+    response:set_header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+    response:set_header("Access-Control-Allow-Headers", "Content-Type,X-API-Key")
+    response:set_status(204)
+    return
+  end
+  local resolution = self.routes:match(request.method, request.target)
+  if resolution.status ~= 200 then
+    if resolution.status == 405 then response:set_header("Allow", router.allow_header(resolution.allowed)) end
+    router.error_response(response, resolution.status, resolution.error or "route not found")
+    return
+  end
+  local match = resolution.match
+  if match.action == "health" then router.json_response(response, 200, "{\"status\":\"ok\"}"); return end
+  if match.action == "pair" then self:pair(request, response); return end
+  if match.action == "relay" then self:websocket(request, response, match); return end
+  if match.action == "unpair" then self:unpair(request, response); return end
+  if match.action == "active" then
+    local id = match.params["clientId"]
+    if not self.database:get(id) then router.error_response(response, 404, "unknown client"); return end
+    local data: {string: value} = { ["active"] = self.worlds:online(id) }
+    router.json_response(response, 200, wire.encode(data))
+    return
+  end
+  if not self:authorized(request) then router.error_response(response, 401, "invalid API key"); return end
+  if match.action == "clients" then self:clients(response); return end
+  if match.action == "forget" then
+    local id = match.params["clientId"]
+    if not self.database:remove(id) then router.error_response(response, 404, "unknown client"); return end
+    self.worlds:disconnect(id)
+    router.json_response(response, 200, "{\"success\":true}")
+    return
+  end
+  if strings.sub(match.action, 1, 4) == "sse:" then self:stream(response, match); return end
+  self:forward(request, response, match)
+catch
+  -- Validation failures are request-local; never serialize internal traces or
+  -- credentials into HTTP errors. Network failures after commit close the stream.
+  router.error_response(response, 400, "invalid request")
+end
+
+function Server:start()
+  if self.closed then raise "relay server is closed" end
+  if self.listener then return end
+  local listener = http.listen(self.config.host, self:handle, self.config.port, 128, 10000)
+  self.listener = listener
+end
+
+function Server:serve()
+  self:start()
+  local listener = self.listener
+  defer listener:close()
+  listener:serve()
+end
+
+function Server:close()
+  if self.closed then return end
+  self.closed = true
+  if self.listener then self.listener:close() end
+  self.worlds:close()
+  self.database:close()
+end

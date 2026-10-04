@@ -1,0 +1,84 @@
+local os = import "os"
+local math = import "math"
+local strings = import "string"
+local url = import "url"
+
+record Config
+  const host: string
+  const port: integer
+  const api_key: string
+  const pairing_code: string
+  const database: string
+  const public_url: string
+  const origins: {string}
+  const request_timeout: integer
+  const heartbeat: integer
+  const auth_timeout: integer
+  const max_pending: integer
+end
+
+local function number(name: string, fallback: integer, maximum: integer): integer
+  local source? = os.getenv(name)
+  if not source then return fallback end
+  local n? = math.tointeger(source)
+  if not n or n < 1 or n > maximum then raise "invalid " .. name end
+  return n
+end
+
+local function required(name: string): string
+  local contents = os.getenv(name) or ""
+  if contents == "" then raise name .. " is required" end
+  return contents
+end
+
+function load(): Config
+  local key = required("FOUNDRY_REST_API_KEY")
+  local code = strings.upper(required("FOUNDRY_PAIRING_CODE"))
+  if #code ~= 6 then raise "FOUNDRY_PAIRING_CODE must contain exactly six characters" end
+  for index = 1, #code do
+    local byte: integer = strings.byte(code, index)
+    if (byte < 48 or byte > 57) and (byte < 65 or byte > 90) then
+      raise "FOUNDRY_PAIRING_CODE must contain only letters and digits"
+    end
+  end
+  local host = os.getenv("RELAY_HOST") or "127.0.0.1"
+  local port = number("RELAY_PORT", 3010, 65535)
+  local public_url = os.getenv("RELAY_PUBLIC_URL") or ("ws://127.0.0.1:" .. port .. "/relay")
+  local parsed?, problem? = url.parse(public_url)
+  if problem or (parsed.scheme ~= "ws" and parsed.scheme ~= "wss") then
+    raise "RELAY_PUBLIC_URL must be an absolute ws:// or wss:// URL"
+  end
+  if parsed.path ~= "/relay" or parsed.query then
+    raise "RELAY_PUBLIC_URL must end in /relay without a query"
+  end
+  local origin_text = os.getenv("RELAY_ALLOWED_ORIGINS") or
+    "http://127.0.0.1:30000,http://localhost:30000"
+  local origins: {string} = {}
+  local start = 1
+  while start <= #origin_text do
+    local comma? = strings.find(origin_text, ",", start)
+    local finish = comma or (#origin_text + 1)
+    local origin = strings.sub(origin_text, start, finish - 1)
+    if origin ~= "" then origins[#origins + 1] = origin end
+    start = finish + 1
+  end
+  return Config { host = host, port = port, api_key = key, pairing_code = code,
+    database = os.getenv("RELAY_DATABASE") or "relay.sqlite3", public_url = public_url,
+    origins = origins, request_timeout = number("RELAY_REQUEST_TIMEOUT_MS", 0, 3600000),
+    heartbeat = number("RELAY_HEARTBEAT_MS", 30000, 3600000),
+    auth_timeout = number("RELAY_AUTH_TIMEOUT_MS", 10000, 60000),
+    max_pending = number("RELAY_MAX_PENDING", 128, 10000) }
+end
+
+-- Scan all bytes, including when lengths differ; secrets never appear in logs.
+function secret_equal(left: string, right: string): boolean
+  local different = #left ~ #right
+  local maximum = #left
+  if #right > maximum then maximum = #right end
+  for i = 1, maximum do
+    local a = strings.byte(left, i) or 0
+    local b = strings.byte(right, i) or 0
+    different = different | (a ~ b)
+  end
+  return different == 0
+end

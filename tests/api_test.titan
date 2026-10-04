@@ -1,0 +1,188 @@
+local test = import "test"
+local api = import "relay.api.titan"
+local router = import "relay.router"
+local wire = import "relay.wire"
+local strings = import "string"
+
+local function payload(method: string, target: string, body: string): {string: value}
+  local routes = router.Router(api.routes())
+  local resolved = routes:match(method, target)
+  test.assert(resolved.status == 200, "expected an API route")
+  local endpoint = api.endpoint_for(resolved.match.action)
+  return api.build_payload(endpoint, resolved.match, wire.object(body))
+end
+
+local function expect_error(operation: function(): (), expected: string)
+  local caught = false
+  do
+    operation()
+  catch
+    caught = true
+    test.assert(error == expected, "wrong validation error")
+  end
+  test.assert(caught, "invalid parameters were accepted")
+end
+
+function test_catalog_is_complete(context: test.Context)
+  local endpoints = api.definitions()
+  test.assert(#endpoints == 91, "forwarding endpoint coverage changed")
+  local routes = router.Router(api.routes())
+  for index = 1, #endpoints do
+    local endpoint = endpoints[index]
+    context:run(endpoint.key, function(_child: test.Context)
+      test.assert(api.endpoint_for(endpoint.key).action == endpoint.action)
+      test.assert(endpoint.timeout_ms > 0)
+    end)
+  end
+  local macro = routes:match("POST", "/macro/Macro.test/execute")
+  test.assert(macro.match.params["uuid"] == "Macro.test")
+  test.assert(api.endpoint_for(macro.match.action).action == "macro-execute")
+  endpoints[1] = nil
+  test.assert(#api.definitions() == 91, "catalog array was exposed for mutation")
+end
+
+function test_query_coercion_preserves_false(_context: test.Context)
+  local result = payload("GET", "/get?uuid=Actor.a&selected=false&actor=true", "{}")
+  test.assert(result["selected"] == false)
+  test.assert(result["actor"] == true)
+  test.assert(result["uuid"] == "Actor.a")
+end
+
+function test_array_query_json(_context: test.Context)
+  local result = payload("GET", "/dnd5e/get-actor-details?actorUuid=Actor.a&details=%5B%22items%22%2C%22spells%22%5D", "{}")
+  local details: {value} = result["details"]
+  test.assert(#details == 2 and details[1] == "items" and details[2] == "spells")
+end
+
+function test_parameter_source_precedence(_context: test.Context)
+  local result = payload("POST", "/move-token?x=20&y=30&userId=query", '{"x":10,"y":11,"userId":"body"}')
+  test.assert(result["x"] == 10 and result["y"] == 11, "body/query precedence changed")
+  test.assert(result["userId"] == "query", "query/body precedence changed")
+end
+
+function test_protocol_fields_are_owned_by_hub(_context: test.Context)
+  local result = payload("GET", "/get?uuid=Actor.a&clientId=other&type=evil&requestId=evil&_scopes=evil", '{"type":"evil","requestId":"evil","clientId":"evil","_scopes":["evil"]}')
+  test.assert(result["type"] == nil and result["requestId"] == nil)
+  test.assert(result["clientId"] == nil and result["_scopes"] == nil)
+  test.assert(result["data"] is {string: value})
+end
+
+function test_lossless_entity_data_and_speaker(_context: test.Context)
+  local result = payload("POST", "/create", '{"entityType":"Actor","data":{"a":null,"tail":[1,null,null]}}')
+  local data: {string: value} = result["data"]
+  test.assert(wire.encode(data) == '{"a":null,"tail":[1,null,null]}')
+  local roll = payload("POST", "/roll", '{"formula":"1d20","speaker":{"actor":"actor-id"}}')
+  test.assert(roll["speaker"] is {string: value}, "speaker object was rejected")
+end
+
+function test_canvas_class_name(_context: test.Context)
+  local result = payload("PUT", "/canvas/lights?sceneId=scene", '{"documentId":"light","data":{"hidden":false}}')
+  test.assert(result["documentType"] == "lights" and result["className"] == "AmbientLight")
+  local regions = payload("GET", "/canvas/regions", "{}")
+  test.assert(regions["className"] == "Region")
+end
+
+function test_required_and_alternative_parameters(context: test.Context)
+  context:run("required", function(_child: test.Context)
+    expect_error(function()
+      payload("POST", "/create", '{"data":{}}')
+    end, "'entityType' is required")
+  end)
+  context:run("search", function(_child: test.Context)
+    expect_error(function() payload("GET", "/search", "{}") end, "'query' or 'filter' is required")
+  end)
+  context:run("selection", function(_child: test.Context)
+    expect_error(function() payload("POST", "/select", "{}") end,
+      "At least one of 'uuids', 'name', 'data', or 'all' is required")
+  end)
+  context:run("scene", function(_child: test.Context)
+    expect_error(function() payload("GET", "/scene", "{}") end,
+      "At least one of 'sceneId', 'name', 'active', 'viewed', or 'all' is required")
+  end)
+  context:run("invalid_canvas", function(_child: test.Context)
+    expect_error(function() payload("GET", "/canvas/not-a-type", "{}") end, "Invalid documentType")
+  end)
+end
+
+function test_invalid_parameter_types(context: test.Context)
+  context:run("boolean", function(_child: test.Context)
+    expect_error(function() payload("GET", "/get?selected=1", "{}") end, "'selected' must be a valid boolean")
+  end)
+  context:run("number", function(_child: test.Context)
+    expect_error(function() payload("GET", "/rolls?limit=NaN", "{}") end, "'limit' must be a valid number")
+  end)
+  context:run("object", function(_child: test.Context)
+    expect_error(function() payload("POST", "/create", '{"entityType":"Actor","data":[]}') end, "'data' must be a valid object")
+  end)
+  context:run("explicit_null", function(_child: test.Context)
+    expect_error(function() payload("POST", "/create", '{"entityType":null,"data":{}}') end, "'entityType' must be a valid string")
+  end)
+  context:run("array_json", function(_child: test.Context)
+    expect_error(function() payload("GET", "/dnd5e/get-actor-details?actorUuid=a&details=%7B%7D", "{}") end,
+      "'details' must be a valid array")
+  end)
+end
+
+function test_base64_binary_roundtrip(context: test.Context)
+  local variants: {string} = {"", "f", "fo", "foo", "foob", "fooba", "foobar", strings.char(0, 255, 1, 254, 2)}
+  for index = 1, #variants do
+    local original = variants[index]
+    context:run("bytes_" .. #original .. "_case_" .. index, function(_child: test.Context)
+      test.assert(api.decode_base64(api.encode_base64(original)) == original)
+    end)
+  end
+  test.assert(api.encode_base64("foobar") == "Zm9vYmFy")
+  test.assert(api.decode_base64("data:text/plain;base64,Zm9vYmFy") == "foobar")
+end
+
+function test_rejects_noncanonical_base64(context: test.Context)
+  context:run("length", function(_child: test.Context)
+    expect_error(function() api.decode_base64("YQ=") end, "invalid base64 length")
+  end)
+  context:run("padding", function(_child: test.Context)
+    expect_error(function() api.decode_base64("YR==") end, "invalid base64 padding")
+  end)
+  context:run("trailing_data", function(_child: test.Context)
+    expect_error(function() api.decode_base64("YQ==Yg==") end, "invalid base64 padding")
+  end)
+end
+
+function test_download_binary_and_base64_modes(_context: test.Context)
+  local endpoint = api.endpoint_for("GET /download")
+  local result = wire.object('{"type":"download-file-result","requestId":"x","success":true,"fileData":"data:text/plain;base64,AAH/","filename":"test.bin","mimeType":"application/octet-stream"}')
+  local binary = api.response(endpoint, result)
+  test.assert(binary.status == 200 and binary.body == strings.char(0, 1, 255))
+  test.assert(binary.headers["Content-Disposition"] == 'attachment; filename="test.bin"')
+  local encoded = api.response(endpoint, result, "base64")
+  test.assert(encoded.content_type == "application/json" and encoded.body == wire.encode(result))
+end
+
+function test_binary_error_stays_json(_context: test.Context)
+  local result = wire.object('{"type":"download-file-result","requestId":"x","error":"missing"}')
+  local reply = api.response(api.endpoint_for("GET /download"), result)
+  test.assert(reply.status == 400 and reply.content_type == "application/json")
+  test.assert(reply.body == wire.encode(result))
+end
+
+function test_screenshot_nested_data(_context: test.Context)
+  local result = wire.object('{"type":"sheet-screenshot-result","data":{"imageData":"data:image/png;base64,eA=="},"width":640,"height":480,"mimeType":"image/png"}')
+  local reply = api.response(api.endpoint_for("GET /sheet"), result)
+  test.assert(reply.body == "x" and reply.content_type == "image/png")
+  test.assert(reply.headers["X-Image-Width"] == "640" and reply.headers["X-Image-Height"] == "480")
+end
+
+function test_upload_requires_data_url(_context: test.Context)
+  expect_error(function()
+    payload("POST", "/upload", '{"path":"scratch","filename":"file.txt","fileData":"eA=="}')
+  end, "'fileData' must be a base64 data URL")
+  local result = payload("POST", "/upload", '{"path":"scratch","filename":"file.txt","fileData":"data:text/plain;base64,eA=="}')
+  test.assert(result["source"] == "data")
+end
+
+function test_untrusted_binary_headers_are_safe(_context: test.Context)
+  local result = wire.object('{"fileData":"eA==","filename":"evil\\\"\\r\\nX: injected","mimeType":"image/png\\r\\nX: injected"}')
+  local reply = api.response(api.endpoint_for("GET /download"), result)
+  test.assert(reply.content_type == "application/octet-stream")
+  test.assert(not strings.find(reply.headers["Content-Disposition"], "\r"))
+  test.assert(not strings.find(reply.headers["Content-Disposition"], "\n"))
+end

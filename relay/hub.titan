@@ -1,0 +1,394 @@
+local async = import "async"
+local timer = import "timer"
+local websocket = import "websocket"
+local iteration = import "iteration"
+local wire = import "relay.wire"
+local store = import "relay.store"
+
+record Reply
+  const status: integer
+  const body: string
+end
+
+local record Pending
+  const id: string
+  const action: string
+  const token: async.ResumeToken
+  reply: Reply?
+  waiter: async.Task?
+end
+
+local function Pending:complete(reply: Reply)
+  if self.reply then return end
+  self.reply = reply
+  local waiter? = self.waiter
+  self.waiter = nil
+  if waiter then waiter:resume(self.token) end
+end
+
+local record Outgoing
+  text: string
+  request_id: string?
+end
+
+local function Outgoing:should_send(pending_requests: {string: Pending}): boolean
+  if not self.request_id then return true end
+  local pending? = pending_requests[self.request_id]
+  return pending ~= nil and pending.reply == nil
+end
+
+record Session
+  const id: string
+  local const connection: websocket.Connection
+  local const pending: {string: Pending}
+  local const outbox: async.BufferedSubscription<|Outgoing, string|>
+  local const publish: function (Outgoing): (boolean)
+  local const finish: function (): (boolean)
+  local count: integer
+  local queued: integer
+  local closed: boolean
+  local retirement: async.Task<|nil, value|>?
+  local const max_pending: integer
+end
+
+record Subscriber
+  const client_id: string
+  const channel: string
+  local const source: async.BufferedSubscription<|string, string|>
+  local const publish: function (string): (boolean)
+  local const finish: function (): (boolean)
+  local queued: integer
+  local closed: boolean
+end
+
+record Hub
+  local const sessions: {string: Session}
+  local const subscribers: {Subscriber}
+  local const maximum: integer
+  local const heartbeat: integer
+  local closed: boolean
+end
+
+function Hub.new(maximum: integer, heartbeat: integer): Hub
+  return { sessions = {}, subscribers = {}, maximum = maximum, heartbeat = heartbeat, closed = false }
+end
+
+local function await_terminal<|A|>(task: async.Task<|A, value|>)
+  if task:status():has_finished() then return end
+  local remove: (function (): ())? = nil
+  defer if remove then remove() end
+  async.await_cleanup<|nil, nil|>(function (resolve, _reject, _fatal)
+    if task:status():has_finished() then
+      resolve(nil)
+    else
+      remove = task:add_terminal_listener(function (_status) resolve(nil) end)
+    end
+  end)
+end
+
+function drain<|A|>(task: async.Task<|A, value|>)
+  if task:status():has_finished() then return end
+  task:cancel()
+  await_terminal(task)
+end
+
+local function Session.new(id: string, connection: websocket.Connection, maximum: integer): Session
+  local publish: (function (Outgoing): (boolean))? = nil
+  local finish: (function (): (boolean))? = nil
+  local outbox = async.BufferedSubscription<|Outgoing, string|>(function (p, _fail, f)
+    publish = p
+    finish = f
+    return async.SubscriptionActions<|Outgoing|>(function () end, function (_drain) end)
+  end)
+  return { id = id, connection = connection, pending = {}, outbox = outbox,
+    publish = publish, finish = finish, count = 0, queued = 0, closed = false, retirement = nil,
+    max_pending = maximum }
+end
+
+local function Session:enqueue(text: string, request_id: string?)
+  if self.closed then raise "Foundry world is disconnected" end
+  if self.queued >= self.max_pending + 16 then raise "Foundry output queue is full" end
+  if not self.publish(Outgoing(text, request_id)) then raise "Foundry output queue is closed" end
+  self.queued = self.queued + 1
+end
+
+local function Session:stop()
+  if self.closed then return end
+  self.closed = true
+  self.finish()
+  for _, pending in iteration.pairs(self.pending) do
+    pending:complete(Reply(503, wire.error_body("Foundry world disconnected")))
+  end
+end
+
+function Session:close()
+  self:stop()
+  -- Abort transport before waiting for the reader or writer to retire.
+  self.connection:close()
+end
+
+local function Session:replace()
+  if self.closed then return end
+  self:stop()
+  self.retirement = async.run<|nil, value|>(function(): nil
+    defer self.connection:close()
+    self.connection:shutdown(1000, "Replaced by reconnect", 1000)
+    return nil
+  catch
+    -- The deadline's abort still retires stalled native ownership. A failed
+    -- incumbent cannot prevent admission of its authenticated replacement.
+    return nil
+  end)
+end
+
+local function Session:retire()
+  if self.retirement then await_terminal(self.retirement) end
+  self:close()
+end
+
+local function Session:write_loop(): nil
+  while not self.closed do
+    case self.outbox:next()
+    when item(item) then
+      self.queued = self.queued - 1
+      if self.closed then return nil end
+      if item:should_send(self.pending) then
+        self.connection:write(websocket.TEXT, item.text)
+      end
+    else return nil
+    end
+  end
+  return nil
+catch
+  if not self.retirement then self:close() end
+  return nil
+end
+
+local function Session:heartbeat_loop(milliseconds: integer): nil
+  while not self.closed do
+    timer.sleep(milliseconds)
+    if not self.closed then self.connection:ping(5000) end
+  end
+  return nil
+catch
+  if not self.retirement then self:close() end
+  return nil
+end
+
+function Session:request(action: string, payload: {string: value}, timeout: integer): Reply
+  async.checkpoint()
+  if self.closed then return Reply(503, wire.error_body("Foundry world is offline")) end
+  if self.count >= self.max_pending then return Reply(429, wire.error_body("too many pending requests")) end
+  local id = store.secure_token(16)
+  local pending = Pending(id, action, async.ResumeToken("Foundry reply"), nil, nil)
+  self.pending[id] = pending
+  self.count = self.count + 1
+  local deadline: async.Task<|nil, value|>? = nil
+  defer do
+    -- Detach queued work before yielding to retire its timeout Task. The writer
+    -- must not admit a cancelled mutation while native timer cleanup runs.
+    self.pending[id] = nil
+    self.count = self.count - 1
+    pending.waiter = nil
+    if deadline then drain(deadline) end
+  end
+  deadline = async.run<|nil, value|>(function (): nil
+    timer.sleep(timeout)
+    pending:complete(Reply(408, wire.error_body("Foundry request timed out")))
+    return nil
+  end)
+  payload["type"] = action
+  payload["requestId"] = id
+  payload["clientId"] = nil
+  self:enqueue(wire.encode(payload), id)
+  if not pending.reply then
+    pending.waiter = async.running()
+    async.suspend(pending.token, function () pending.waiter = nil end)
+  end
+  return pending.reply
+end
+
+function Hub:online(id: string): boolean
+  if self.closed then return false end
+  local session? = self.sessions[id]
+  return session ~= nil and not session.closed
+end
+
+function Hub:select(id: string?): (Session?, string?)
+  if self.closed then return nil, "relay is closed" end
+  if id and id ~= "" then
+    local session? = self.sessions[id]
+    if session and not session.closed then return session, nil end
+    return nil, "Foundry world is offline"
+  end
+  local selected: Session? = nil
+  for _, session in iteration.pairs(self.sessions) do
+    if not session.closed then
+      if selected then return nil, "multiple worlds are online; specify clientId" end
+      selected = session
+    end
+  end
+  if not selected then return nil, "no Foundry worlds are online" end
+  return selected, nil
+end
+
+local function event_channel(kind: string): string?
+  if kind == "chat-event" then return "chat-events" end
+  if kind == "roll-data" then return "roll-events" end
+  if kind == "hook-event" then return "hooks" end
+  if kind == "combat-event" then return "combat-events" end
+  if kind == "actor-event" then return "actor-events" end
+  if kind == "scene-event" then return "scene-events" end
+  return nil
+end
+
+local function Hub:receive(session: Session, text: string)
+  local message = wire.object(text)
+  local kind = wire.text(message, "type")
+  if kind == "ping" then
+    session:enqueue("{\"type\":\"pong\"}", nil)
+    return
+  end
+  local channel? = event_channel(kind)
+  if channel then
+    local changed = false
+    for i = 1, #self.subscribers do
+      local subscriber? = self.subscribers[i]
+      if subscriber and not subscriber.closed and subscriber.client_id == session.id and subscriber.channel == channel then
+        if subscriber.queued >= 128 then
+          subscriber.closed = true
+          subscriber.finish()
+          changed = true
+        elseif subscriber.publish(text) then
+          subscriber.queued = subscriber.queued + 1
+        end
+      end
+    end
+    if changed then self:notify_subscriptions(session.id, channel) end
+    return
+  end
+  local id = wire.text(message, "requestId")
+  local pending? = session.pending[id]
+  if pending and kind == pending.action .. "-result" then
+    local status = 200
+    if message["error"] ~= nil then status = 400 end
+    pending:complete(Reply(status, text))
+  end
+end
+
+local function Hub:subscription_count(id: string, channel: string): integer
+  local count = 0
+  for i = 1, #self.subscribers do
+    local subscriber? = self.subscribers[i]
+    if subscriber and not subscriber.closed and subscriber.client_id == id and subscriber.channel == channel then count = count + 1 end
+  end
+  return count
+end
+
+local function Hub:notify_subscriptions(id: string, channel: string)
+  local session? = self.sessions[id]
+  if session and not session.closed then
+    local payload: {string: value} = { ["type"] = "event-subscription-update",
+      ["channel"] = channel, ["count"] = self:subscription_count(id, channel) }
+    session:enqueue(wire.encode(payload), nil)
+  end
+end
+
+local function Hub:notify_all_subscriptions(id: string)
+  local channels: const {string} = {"chat-events", "roll-events", "hooks",
+                                   "combat-events", "actor-events", "scene-events"}
+  for index = 1, #channels do self:notify_subscriptions(id, channels[index]) end
+end
+
+function Hub:subscribe(id: string, channel: string): Subscriber
+  if self.closed then raise "relay is closed" end
+  local publish: (function (string): (boolean))? = nil
+  local finish: (function (): (boolean))? = nil
+  local source = async.BufferedSubscription<|string, string|>(function (p, _fail, f)
+    publish = p
+    finish = f
+    return async.SubscriptionActions<|string|>(function () end, function (_drain) end)
+  end)
+  local subscriber = Subscriber(id, channel, source, publish, finish, 0, false)
+  self.subscribers[#self.subscribers + 1] = subscriber
+  do
+    self:notify_subscriptions(id, channel)
+  catch
+    -- The caller cannot own cleanup until subscribe returns successfully.
+    do self:unsubscribe(subscriber) catch end
+    raise
+  end
+  return subscriber
+end
+
+function Hub:unsubscribe(subscriber: Subscriber)
+  subscriber.closed = true
+  subscriber.finish()
+  for i = 1, #self.subscribers do
+    if self.subscribers[i] == subscriber then
+      for next = i + 1, #self.subscribers do self.subscribers[next - 1] = self.subscribers[next] end
+      self.subscribers[#self.subscribers] = nil
+      break
+    end
+  end
+  subscriber.source:close()
+  self:notify_subscriptions(subscriber.client_id, subscriber.channel)
+end
+
+function Subscriber:next(): string?
+  case self.source:next()
+  when item(text) then
+    self.queued = self.queued - 1
+    return text
+  else return nil
+  end
+end
+
+function Hub:run(id: string, connection: websocket.Connection)
+  if self.closed then return end
+  local session = Session(id, connection, self.maximum)
+  local old? = self.sessions[id]
+  self.sessions[id] = session
+  defer do
+    if self.sessions[id] == session then self.sessions[id] = nil end
+    session:retire()
+    session.outbox:close()
+  end
+  if old then old:replace() end
+  -- Register the session before this write yields, and finish the auth frame
+  -- before starting the sole data writer. Revocation can now abort admission.
+  connection:write(websocket.TEXT, "{\"type\":\"auth-success\"}")
+  if session.closed then return end
+  local writer = async.run<|nil, value|>(session:write_loop)
+  local heartbeat = async.run<|nil, value|>(function (): nil return session:heartbeat_loop(self.heartbeat) end)
+  defer do
+    session:retire()
+    drain(heartbeat)
+    drain(writer)
+    session.outbox:close()
+  end
+  -- The module retains active channels across reconnect; explicit zero counts
+  -- clear stale hooks as well as enabling channels with surviving SSE readers.
+  self:notify_all_subscriptions(id)
+  while not session.closed do
+    local kind?, data? = connection:read()
+    if not kind then break end
+    if kind ~= websocket.TEXT then raise "Foundry protocol requires text messages" end
+    self:receive(session, data)
+  end
+end
+
+function Hub:disconnect(id: string)
+  local session? = self.sessions[id]
+  if session then session:close() end
+end
+
+function Hub:close()
+  if self.closed then return end
+  self.closed = true
+  for _, session in iteration.pairs(self.sessions) do session:close() end
+  for i = 1, #self.subscribers do
+    local subscriber? = self.subscribers[i]
+    if subscriber then subscriber.closed = true; subscriber.finish() end
+  end
+end

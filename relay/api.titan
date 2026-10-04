@@ -1,0 +1,499 @@
+-- REST declarations adapt the reference Go relay's single-user protocol.
+local router = import "relay.router"
+local wire = import "relay.wire"
+local strings = import "string"
+
+record Param
+  const name: string
+  const kind: string
+  const sources: string
+  const required: boolean
+end
+
+record Endpoint
+  const key: string
+  const method: string
+  const path: string
+  const action: string
+  const params: {Param}
+  const timeout_ms: integer
+  const special: string
+end
+
+record Reply
+  const status: integer
+  const body: string
+  const content_type: string
+  const headers: {string: string}
+end
+
+local const catalog: {Endpoint}?
+
+function definitions(): {Endpoint}
+  local snapshot: {Endpoint} = {}
+  for index = 1, #catalog do snapshot[index] = catalog[index] end
+  return snapshot
+end
+
+function routes(): {router.Route}
+  local result: {router.Route} = {}
+  for index = 1, #catalog do
+    local endpoint = catalog[index]
+    result[index] = router.Route(endpoint.method, endpoint.path, endpoint.key)
+  end
+  return result
+end
+
+function endpoint_for(key: string): Endpoint?
+  for index = 1, #catalog do
+    local endpoint = catalog[index]
+    if endpoint.key == key then return endpoint end
+  end
+  return nil
+end
+
+local function Param:read(match: router.Match, body: {string: value}): (value, boolean)
+  for index = 1, #self.sources do
+    local source = strings.sub(self.sources, index, index)
+    if source == "b" then
+      local candidate? = body[self.name]
+      if candidate ~= nil then return candidate, false end
+    elseif source == "q" then
+      local candidate? = match.query[self.name]
+      if candidate ~= nil and candidate ~= "" then return candidate, true end
+    elseif source == "p" then
+      local candidate? = match.params[self.name]
+      if candidate ~= nil then return candidate, false end
+    end
+  end
+  return nil, false
+end
+
+local function Param:coerce(candidate: value, from_query: boolean): value
+  if self.kind == "value" then return candidate end
+  if self.kind == "string" then
+    if candidate is string then return candidate end
+  elseif self.kind == "boolean" then
+    -- `value is boolean` asks about truthiness conversion, not the JSON tag.
+    if candidate == true or candidate == false then return candidate end
+    if candidate is string then
+      local text: string = candidate
+      text = strings.lower(text)
+      if text == "true" then return true end
+      if text == "false" then return false end
+    end
+  elseif self.kind == "number" then
+    local number = candidate
+    if candidate is string then number = wire.decode(candidate) end
+    if number is float then return number end
+  elseif self.kind == "array" then
+    local array = candidate
+    if candidate is string then array = wire.decode(candidate) end
+    if array is {value} then return array end
+  elseif self.kind == "object" then
+    local object = candidate
+    if from_query and candidate is string then object = wire.decode(candidate) end
+    if object is {string: value} then return object end
+  end
+  raise "'" .. self.name .. "' must be a valid " .. self.kind
+catch
+  -- Syntax errors from query JSON become ordinary parameter errors.
+  raise "'" .. self.name .. "' must be a valid " .. self.kind
+end
+
+local function any_present(payload: {string: value}, names: {string}): boolean
+  for index = 1, #names do
+    if payload[names[index]] ~= nil then return true end
+  end
+  return false
+end
+
+local function require_any(payload: {string: value}, names: {string}, message: string)
+  if not any_present(payload, names) then raise message end
+end
+
+local function validate(endpoint: Endpoint, payload: {string: value})
+  local action = endpoint.action
+  if action == "search" then
+    require_any(payload, {"query", "filter"}, "'query' or 'filter' is required")
+  elseif action == "select" then
+    require_any(payload, {"uuids", "name", "data", "all"},
+      "At least one of 'uuids', 'name', 'data', or 'all' is required")
+  elseif action == "get-user" or action == "update-user" or action == "delete-user" then
+    require_any(payload, {"id", "name"}, "At least one of 'id' or 'name' is required")
+  elseif action == "get-scene" then
+    require_any(payload, {"sceneId", "name", "active", "viewed", "all"},
+      "At least one of 'sceneId', 'name', 'active', 'viewed', or 'all' is required")
+  elseif action == "update-scene" then
+    require_any(payload, {"sceneId", "name", "active"},
+      "At least one of 'sceneId', 'name', or 'active' is required")
+  elseif action == "delete-scene" or action == "switch-scene" then
+    require_any(payload, {"sceneId", "name"}, "At least one of 'sceneId' or 'name' is required")
+  elseif action == "sheet-screenshot" then
+    require_any(payload, {"uuid", "selected"}, "Either 'uuid' or 'selected' is required")
+  elseif action == "upload-file" then
+    if wire.text(payload, "path") == "" or wire.text(payload, "filename") == "" then
+      raise "'path' and 'filename' are required"
+    end
+    local file_data = wire.text(payload, "fileData")
+    if strings.sub(file_data, 1, 5) ~= "data:" or not strings.find(file_data, ";base64,") then
+      raise "'fileData' must be a base64 data URL"
+    end
+  end
+end
+
+function build_payload(endpoint: Endpoint, match: router.Match,
+                       body: {string: value}): {string: value}
+  local result: {string: value} = {}
+  for index = 1, #endpoint.params do
+    local param = endpoint.params[index]
+    local candidate, from_query = param:read(match, body)
+    if candidate == nil then
+      if param.required then raise "'" .. param.name .. "' is required" end
+    elseif param.name ~= "clientId" then
+      result[param.name] = param:coerce(candidate, from_query)
+    end
+  end
+  validate(endpoint, result)
+  if endpoint.special == "canvas" then
+    local classes: {string: string} = {
+      ["tokens"] = "Token", ["tiles"] = "Tile", ["drawings"] = "Drawing",
+      ["lights"] = "AmbientLight", ["sounds"] = "AmbientSound", ["notes"] = "Note",
+      ["templates"] = "MeasuredTemplate", ["walls"] = "Wall", ["regions"] = "Region",
+    }
+    local document_type = wire.text(result, "documentType")
+    local class_name? = classes[document_type]
+    if not class_name then raise "Invalid documentType" end
+    result["className"] = class_name
+  elseif endpoint.special == "image" then
+    if result["format"] == nil then result["format"] = "png" end
+    if result["quality"] == nil then result["quality"] = 0.9 end
+    if endpoint.action == "sheet-screenshot" and result["scale"] == nil then
+      result["scale"] = 1.0
+    end
+  elseif endpoint.special == "upload" then
+    if result["source"] == nil then result["source"] = "data" end
+  end
+  if result["data"] == nil then
+    local data: {string: value} = {}
+    result["data"] = data
+  end
+  return result
+end
+
+local const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+function encode_base64(source: string): string
+  local output = strings.writer()
+  local index = 1
+  while index <= #source do
+    local first: integer = strings.byte(source, index)
+    local second = 0
+    local third = 0
+    if index + 1 <= #source then second = strings.byte(source, index + 1) end
+    if index + 2 <= #source then third = strings.byte(source, index + 2) end
+    output:write(strings.sub(alphabet, first // 4 + 1, first // 4 + 1))
+    local digit = (first % 4) * 16 + second // 16
+    output:write(strings.sub(alphabet, digit + 1, digit + 1))
+    if index + 1 <= #source then
+      digit = (second % 16) * 4 + third // 64
+      output:write(strings.sub(alphabet, digit + 1, digit + 1))
+    else
+      output:write("=")
+    end
+    if index + 2 <= #source then
+      digit = third % 64
+      output:write(strings.sub(alphabet, digit + 1, digit + 1))
+    else
+      output:write("=")
+    end
+    index = index + 3
+  end
+  return output:drain()
+end
+
+local function base64_digit(source: string, index: integer): integer
+  local byte: integer = strings.byte(source, index)
+  if byte >= 65 and byte <= 90 then return byte - 65 end
+  if byte >= 97 and byte <= 122 then return byte - 71 end
+  if byte >= 48 and byte <= 57 then return byte + 4 end
+  if byte == 43 then return 62 end
+  if byte == 47 then return 63 end
+  raise "invalid base64 character"
+end
+
+function decode_base64(source: string): string
+  local contents = source
+  if strings.sub(contents, 1, 5) == "data:" then
+    local marker? = strings.find(contents, ";base64,")
+    if not marker then raise "invalid base64 data URL" end
+    contents = strings.sub(contents, marker + 8)
+  end
+  if #contents % 4 ~= 0 then raise "invalid base64 length" end
+  local output = strings.writer()
+  local index = 1
+  while index <= #contents do
+    local a = base64_digit(contents, index)
+    local b = base64_digit(contents, index + 1)
+    local c = strings.sub(contents, index + 2, index + 2)
+    local d = strings.sub(contents, index + 3, index + 3)
+    output:write(strings.char(a * 4 + b // 16))
+    if c == "=" then
+      if d ~= "=" or index + 3 ~= #contents or b % 16 ~= 0 then
+        raise "invalid base64 padding"
+      end
+    else
+      local third = base64_digit(contents, index + 2)
+      output:write(strings.char((b % 16) * 16 + third // 4))
+      if d == "=" then
+        if index + 3 ~= #contents or third % 4 ~= 0 then raise "invalid base64 padding" end
+      else
+        local fourth = base64_digit(contents, index + 3)
+        output:write(strings.char((third % 4) * 64 + fourth))
+      end
+    end
+    index = index + 4
+  end
+  return output:drain()
+end
+
+local function safe_header(source: string, fallback: string): string
+  for index = 1, #source do
+    local byte: integer = strings.byte(source, index)
+    if byte < 32 or byte > 126 then return fallback end
+  end
+  if source == "" then return fallback end
+  return source
+end
+
+local function quoted_filename(source: string): string
+  local output = strings.writer()
+  for index = 1, #source do
+    local byte: integer = strings.byte(source, index)
+    if byte < 32 or byte > 126 or byte == 34 or byte == 92 then
+      output:write("_")
+    else
+      output:write(strings.char(byte))
+    end
+  end
+  return output:drain()
+end
+
+function response(endpoint: Endpoint, result: {string: value}, format: string?): Reply
+  local status = 200
+  if result["error"] ~= nil then status = 400 end
+  local headers: {string: string} = {}
+  if status == 400 then return Reply(status, wire.encode(result), "application/json", headers) end
+  local encoded = ""
+  local content_type = "application/octet-stream"
+  if endpoint.special == "download" and format ~= "base64" then
+    encoded = wire.text(result, "fileData")
+    content_type = safe_header(wire.text(result, "mimeType"), content_type)
+    local filename = wire.text(result, "fileName", wire.text(result, "filename", "file"))
+    headers["Content-Disposition"] = "attachment; filename=\"" .. quoted_filename(filename) .. "\""
+  elseif endpoint.special == "image" and format ~= "base64" then
+    encoded = wire.text(result, "imageData")
+    local nested = result["data"]
+    if encoded == "" and nested is {string: value} then
+      local data: {string: value} = nested
+      encoded = wire.text(data, "imageData")
+    end
+    content_type = safe_header(wire.text(result, "mimeType"), "image/png")
+    local width = result["width"]
+    local height = result["height"]
+    if width is float then headers["X-Image-Width"] = strings.tostring(width) end
+    if height is float then headers["X-Image-Height"] = strings.tostring(height) end
+  end
+  if encoded ~= "" then
+    local binary = decode_base64(encoded)
+    return Reply(status, binary, content_type, headers)
+  end
+  return Reply(status, wire.encode(result), "application/json", {})
+end
+
+do
+  catalog = {
+    Endpoint("GET /get", "GET", "/get", "entity",
+      {Param("clientId", "string", "q", false), Param("uuid", "string", "q", false), Param("selected", "boolean", "qb", false), Param("actor", "boolean", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /create", "POST", "/create", "create",
+      {Param("entityType", "string", "b", true), Param("data", "object", "b", true), Param("clientId", "string", "q", false), Param("folder", "string", "b", false), Param("keepId", "boolean", "bq", false), Param("override", "boolean", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("PUT /update", "PUT", "/update", "update",
+      {Param("data", "object", "b", true), Param("clientId", "string", "q", false), Param("uuid", "string", "q", false), Param("selected", "boolean", "qb", false), Param("actor", "boolean", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("DELETE /delete", "DELETE", "/delete", "delete",
+      {Param("clientId", "string", "q", false), Param("uuid", "string", "q", false), Param("selected", "boolean", "qb", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /give", "POST", "/give", "give",
+      {Param("clientId", "string", "q", false), Param("fromUuid", "string", "b", false), Param("toUuid", "string", "b", false), Param("selected", "boolean", "qb", false), Param("itemUuid", "string", "b", false), Param("itemName", "string", "b", false), Param("quantity", "number", "b", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /remove", "POST", "/remove", "remove",
+      {Param("clientId", "string", "q", false), Param("actorUuid", "string", "b", false), Param("selected", "boolean", "qb", false), Param("itemUuid", "string", "b", false), Param("itemName", "string", "b", false), Param("quantity", "number", "b", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /decrease", "POST", "/decrease", "decrease",
+      {Param("attribute", "string", "b", true), Param("amount", "number", "b", true), Param("clientId", "string", "q", false), Param("uuid", "string", "q", false), Param("selected", "boolean", "qb", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /increase", "POST", "/increase", "increase",
+      {Param("attribute", "string", "b", true), Param("amount", "number", "b", true), Param("clientId", "string", "q", false), Param("uuid", "string", "q", false), Param("selected", "boolean", "qb", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /kill", "POST", "/kill", "kill",
+      {Param("clientId", "string", "q", false), Param("uuid", "string", "q", false), Param("selected", "boolean", "qb", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /search", "GET", "/search", "search",
+      {Param("clientId", "string", "q", false), Param("query", "string", "q", false), Param("filter", "string", "q", false), Param("excludeCompendiums", "boolean", "q", false), Param("limit", "number", "q", false), Param("minified", "boolean", "q", false), Param("ownedByUserId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /rolls", "GET", "/rolls", "rolls",
+      {Param("clientId", "string", "q", false), Param("limit", "number", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /lastroll", "GET", "/lastroll", "last-roll",
+      {Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /roll", "POST", "/roll", "roll",
+      {Param("formula", "string", "b", true), Param("clientId", "string", "q", false), Param("flavor", "string", "b", false), Param("createChatMessage", "boolean", "b", false), Param("speaker", "value", "b", false), Param("whisper", "array", "b", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /encounters", "GET", "/encounters", "encounters",
+      {Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /start-encounter", "POST", "/start-encounter", "start-encounter",
+      {Param("clientId", "string", "q", false), Param("tokens", "array", "b", false), Param("startWithSelected", "boolean", "b", false), Param("startWithPlayers", "boolean", "b", false), Param("rollNPC", "boolean", "b", false), Param("rollAll", "boolean", "b", false), Param("name", "string", "b", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /next-turn", "POST", "/next-turn", "next-turn",
+      {Param("clientId", "string", "q", false), Param("encounter", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /next-round", "POST", "/next-round", "next-round",
+      {Param("clientId", "string", "q", false), Param("encounter", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /last-turn", "POST", "/last-turn", "last-turn",
+      {Param("clientId", "string", "q", false), Param("encounter", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /last-round", "POST", "/last-round", "last-round",
+      {Param("clientId", "string", "q", false), Param("encounter", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /end-encounter", "POST", "/end-encounter", "end-encounter",
+      {Param("clientId", "string", "q", false), Param("encounter", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /add-to-encounter", "POST", "/add-to-encounter", "add-to-encounter",
+      {Param("clientId", "string", "q", false), Param("encounter", "string", "bq", false), Param("selected", "boolean", "qb", false), Param("uuids", "array", "b", false), Param("rollInitiative", "boolean", "b", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /remove-from-encounter", "POST", "/remove-from-encounter", "remove-from-encounter",
+      {Param("clientId", "string", "q", false), Param("encounter", "string", "bq", false), Param("selected", "boolean", "qb", false), Param("uuids", "array", "b", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /macros", "GET", "/macros", "macros",
+      {Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /structure", "GET", "/structure", "structure",
+      {Param("clientId", "string", "q", false), Param("includeEntityData", "boolean", "q", false), Param("path", "string", "q", false), Param("recursive", "boolean", "q", false), Param("recursiveDepth", "number", "q", false), Param("types", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /get-folder", "GET", "/get-folder", "get-folder",
+      {Param("name", "string", "bq", true), Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /create-folder", "POST", "/create-folder", "create-folder",
+      {Param("name", "string", "bq", true), Param("folderType", "string", "bq", true), Param("clientId", "string", "q", false), Param("parentFolderId", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("DELETE /delete-folder", "DELETE", "/delete-folder", "delete-folder",
+      {Param("folderId", "string", "bq", true), Param("clientId", "string", "q", false), Param("deleteAll", "boolean", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /select", "POST", "/select", "select",
+      {Param("clientId", "string", "q", false), Param("uuids", "array", "b", false), Param("name", "string", "b", false), Param("data", "object", "b", false), Param("overwrite", "boolean", "b", false), Param("all", "boolean", "b", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /selected", "GET", "/selected", "selected",
+      {Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /players", "GET", "/players", "players",
+      {Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /users", "GET", "/users", "get-users",
+      {Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /user", "GET", "/user", "get-user",
+      {Param("clientId", "string", "q", false), Param("id", "string", "q", false), Param("name", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /user", "POST", "/user", "create-user",
+      {Param("name", "string", "b", true), Param("clientId", "string", "q", false), Param("role", "number", "b", false), Param("password", "string", "b", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("PUT /user", "PUT", "/user", "update-user",
+      {Param("data", "object", "b", true), Param("clientId", "string", "q", false), Param("id", "string", "bq", false), Param("name", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("DELETE /user", "DELETE", "/user", "delete-user",
+      {Param("clientId", "string", "q", false), Param("id", "string", "q", false), Param("name", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /scene", "GET", "/scene", "get-scene",
+      {Param("clientId", "string", "q", false), Param("sceneId", "string", "q", false), Param("name", "string", "q", false), Param("active", "boolean", "q", false), Param("viewed", "boolean", "q", false), Param("all", "boolean", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /scene/image/raw", "GET", "/scene/image/raw", "scene-raw-image",
+      {Param("clientId", "string", "q", false), Param("sceneId", "string", "bq", false), Param("active", "boolean", "bq", false), Param("userId", "string", "qb", false)}, 30000, ""),
+    Endpoint("POST /scene", "POST", "/scene", "create-scene",
+      {Param("data", "object", "b", true), Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 30000, ""),
+    Endpoint("PUT /scene", "PUT", "/scene", "update-scene",
+      {Param("data", "object", "b", true), Param("clientId", "string", "q", false), Param("sceneId", "string", "bq", false), Param("name", "string", "bq", false), Param("active", "boolean", "bq", false), Param("userId", "string", "qb", false)}, 30000, ""),
+    Endpoint("DELETE /scene", "DELETE", "/scene", "delete-scene",
+      {Param("clientId", "string", "q", false), Param("sceneId", "string", "q", false), Param("name", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /switch-scene", "POST", "/switch-scene", "switch-scene",
+      {Param("clientId", "string", "q", false), Param("sceneId", "string", "bq", false), Param("name", "string", "bq", false), Param("userId", "string", "qb", false)}, 30000, ""),
+    Endpoint("GET /canvas/:documentType", "GET", "/canvas/:documentType", "get-canvas-documents",
+      {Param("documentType", "string", "p", true), Param("clientId", "string", "q", false), Param("sceneId", "string", "q", false), Param("documentId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, "canvas"),
+    Endpoint("GET /measure-distance", "GET", "/measure-distance", "measure-distance",
+      {Param("clientId", "string", "q", false), Param("originX", "number", "bq", false), Param("originY", "number", "bq", false), Param("targetX", "number", "bq", false), Param("targetY", "number", "bq", false), Param("originUuid", "string", "bq", false), Param("originName", "string", "bq", false), Param("targetUuid", "string", "bq", false), Param("targetName", "string", "bq", false), Param("sceneId", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /canvas/:documentType", "POST", "/canvas/:documentType", "create-canvas-document",
+      {Param("documentType", "string", "p", true), Param("data", "object", "b", true), Param("clientId", "string", "q", false), Param("sceneId", "string", "bq", false), Param("userId", "string", "qb", false)}, 30000, "canvas"),
+    Endpoint("PUT /canvas/:documentType", "PUT", "/canvas/:documentType", "update-canvas-document",
+      {Param("documentType", "string", "p", true), Param("documentId", "string", "bq", true), Param("data", "object", "b", true), Param("clientId", "string", "q", false), Param("sceneId", "string", "bq", false), Param("userId", "string", "qb", false)}, 30000, "canvas"),
+    Endpoint("DELETE /canvas/:documentType", "DELETE", "/canvas/:documentType", "delete-canvas-document",
+      {Param("documentType", "string", "p", true), Param("documentId", "string", "q", true), Param("clientId", "string", "q", false), Param("sceneId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, "canvas"),
+    Endpoint("POST /move-token", "POST", "/move-token", "move-token",
+      {Param("x", "number", "bq", true), Param("y", "number", "bq", true), Param("clientId", "string", "q", false), Param("uuid", "string", "bq", false), Param("name", "string", "bq", false), Param("waypoints", "array", "bq", false), Param("animate", "boolean", "bq", false), Param("sceneId", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /chat", "GET", "/chat", "chat-messages",
+      {Param("clientId", "string", "q", false), Param("limit", "number", "q", false), Param("offset", "number", "q", false), Param("userId", "string", "qb", false), Param("chatType", "number", "q", false), Param("speaker", "value", "q", false)}, 10000, ""),
+    Endpoint("POST /chat", "POST", "/chat", "chat-send",
+      {Param("content", "string", "b", true), Param("clientId", "string", "q", false), Param("whisper", "array", "b", false), Param("speaker", "value", "b", false), Param("alias", "string", "b", false), Param("chatType", "number", "b", false), Param("flavor", "string", "b", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("DELETE /chat/:messageId", "DELETE", "/chat/:messageId", "chat-delete",
+      {Param("messageId", "string", "p", true), Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("DELETE /chat", "DELETE", "/chat", "chat-flush",
+      {Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /effects", "GET", "/effects", "get-effects",
+      {Param("uuid", "string", "bq", true), Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /effects/list", "GET", "/effects/list", "get-status-effects",
+      {Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /effects", "POST", "/effects", "add-effect",
+      {Param("uuid", "string", "bq", true), Param("clientId", "string", "q", false), Param("statusId", "string", "bq", false), Param("effectData", "object", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("DELETE /effects", "DELETE", "/effects", "remove-effect",
+      {Param("uuid", "string", "bq", true), Param("clientId", "string", "q", false), Param("effectId", "string", "bq", false), Param("statusId", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /world-info", "GET", "/world-info", "world-info",
+      {Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /playlists", "GET", "/playlists", "get-playlists",
+      {Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /playlist/play", "POST", "/playlist/play", "playlist-play",
+      {Param("clientId", "string", "q", false), Param("playlistId", "string", "bq", false), Param("playlistName", "string", "bq", false), Param("soundId", "string", "bq", false), Param("soundName", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /playlist/stop", "POST", "/playlist/stop", "playlist-stop",
+      {Param("clientId", "string", "q", false), Param("playlistId", "string", "bq", false), Param("playlistName", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /playlist/next", "POST", "/playlist/next", "playlist-next",
+      {Param("clientId", "string", "q", false), Param("playlistId", "string", "bq", false), Param("playlistName", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /playlist/volume", "POST", "/playlist/volume", "playlist-volume",
+      {Param("volume", "number", "bq", true), Param("clientId", "string", "q", false), Param("playlistId", "string", "bq", false), Param("playlistName", "string", "bq", false), Param("soundId", "string", "bq", false), Param("soundName", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /play-sound", "POST", "/play-sound", "play-sound",
+      {Param("src", "string", "bq", true), Param("clientId", "string", "q", false), Param("volume", "number", "bq", false), Param("loop", "boolean", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /stop-sound", "POST", "/stop-sound", "stop-sound",
+      {Param("clientId", "string", "q", false), Param("src", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /file-system", "GET", "/file-system", "file-system",
+      {Param("clientId", "string", "q", false), Param("path", "string", "q", false), Param("source", "string", "q", false), Param("recursive", "boolean", "q", false), Param("userId", "string", "qb", false)}, 15000, ""),
+    Endpoint("GET /download", "GET", "/download", "download-file",
+      {Param("clientId", "string", "q", false), Param("path", "string", "q", false), Param("source", "string", "q", false), Param("format", "string", "q", false), Param("userId", "string", "qb", false)}, 45000, "download"),
+    Endpoint("POST /macro/:uuid/execute", "POST", "/macro/:uuid/execute", "macro-execute",
+      {Param("uuid", "string", "p", true), Param("clientId", "string", "q", false), Param("args", "object", "b", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /execute-js", "POST", "/execute-js", "execute-js",
+      {Param("clientId", "string", "q", false), Param("script", "string", "b", false), Param("userId", "string", "qb", false)}, 20000, ""),
+    Endpoint("GET /scene/image", "GET", "/scene/image", "scene-screenshot",
+      {Param("sceneId", "string", "q", false), Param("active", "boolean", "q", false), Param("clientId", "string", "q", false), Param("format", "string", "q", false), Param("quality", "number", "q", false), Param("viewport", "boolean", "q", false), Param("width", "number", "q", false), Param("height", "number", "q", false), Param("showGrid", "boolean", "q", false), Param("hideOverlays", "boolean", "q", false), Param("userId", "string", "q", false)}, 30000, "image"),
+    Endpoint("POST /upload", "POST", "/upload", "upload-file",
+      {Param("clientId", "string", "q", false), Param("path", "string", "bq", false), Param("filename", "string", "bq", false), Param("source", "string", "bq", false), Param("mimeType", "string", "bq", false), Param("overwrite", "boolean", "bq", false), Param("fileData", "string", "b", false), Param("userId", "string", "qb", false)}, 30000, "upload"),
+    Endpoint("GET /sheet", "GET", "/sheet", "sheet-screenshot",
+      {Param("uuid", "string", "q", false), Param("selected", "boolean", "q", false), Param("actor", "boolean", "q", false), Param("clientId", "string", "q", false), Param("format", "string", "q", false), Param("quality", "number", "q", false), Param("scale", "number", "q", false), Param("userId", "string", "q", false)}, 20000, "image"),
+    Endpoint("GET /dnd5e/get-actor-details", "GET", "/dnd5e/get-actor-details", "get-actor-details",
+      {Param("actorUuid", "string", "bq", true), Param("details", "array", "bq", true), Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/modify-item-charges", "POST", "/dnd5e/modify-item-charges", "modify-item-charges",
+      {Param("actorUuid", "string", "bq", true), Param("amount", "number", "bq", true), Param("clientId", "string", "q", false), Param("itemUuid", "string", "bq", false), Param("itemName", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/short-rest", "POST", "/dnd5e/short-rest", "short-rest",
+      {Param("clientId", "string", "q", false), Param("actorUuid", "string", "bq", false), Param("selected", "boolean", "qb", false), Param("autoHD", "boolean", "bq", false), Param("autoHDThreshold", "number", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/long-rest", "POST", "/dnd5e/long-rest", "long-rest",
+      {Param("clientId", "string", "q", false), Param("actorUuid", "string", "bq", false), Param("selected", "boolean", "qb", false), Param("newDay", "boolean", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/skill-check", "POST", "/dnd5e/skill-check", "skill-check",
+      {Param("actorUuid", "string", "bq", true), Param("skill", "string", "bq", true), Param("clientId", "string", "q", false), Param("userId", "string", "qb", false), Param("advantage", "boolean", "bq", false), Param("disadvantage", "boolean", "bq", false), Param("bonus", "string", "bq", false), Param("createChatMessage", "boolean", "bq", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/ability-save", "POST", "/dnd5e/ability-save", "ability-save",
+      {Param("actorUuid", "string", "bq", true), Param("ability", "string", "bq", true), Param("clientId", "string", "q", false), Param("userId", "string", "qb", false), Param("advantage", "boolean", "bq", false), Param("disadvantage", "boolean", "bq", false), Param("bonus", "string", "bq", false), Param("createChatMessage", "boolean", "bq", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/ability-check", "POST", "/dnd5e/ability-check", "ability-check",
+      {Param("actorUuid", "string", "bq", true), Param("ability", "string", "bq", true), Param("clientId", "string", "q", false), Param("userId", "string", "qb", false), Param("advantage", "boolean", "bq", false), Param("disadvantage", "boolean", "bq", false), Param("bonus", "string", "bq", false), Param("createChatMessage", "boolean", "bq", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/death-save", "POST", "/dnd5e/death-save", "death-save",
+      {Param("actorUuid", "string", "bq", true), Param("clientId", "string", "q", false), Param("advantage", "boolean", "bq", false), Param("createChatMessage", "boolean", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/modify-experience", "POST", "/dnd5e/modify-experience", "modify-experience",
+      {Param("amount", "number", "bq", true), Param("clientId", "string", "q", false), Param("actorUuid", "string", "bq", false), Param("selected", "boolean", "qb", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("GET /dnd5e/concentration", "GET", "/dnd5e/concentration", "get-concentration",
+      {Param("clientId", "string", "q", false), Param("actorUuid", "string", "bq", false), Param("actorName", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/break-concentration", "POST", "/dnd5e/break-concentration", "break-concentration",
+      {Param("clientId", "string", "q", false), Param("actorUuid", "string", "bq", false), Param("actorName", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/concentration-save", "POST", "/dnd5e/concentration-save", "concentration-save",
+      {Param("damage", "number", "bq", true), Param("clientId", "string", "q", false), Param("actorUuid", "string", "bq", false), Param("actorName", "string", "bq", false), Param("userId", "string", "qb", false), Param("advantage", "boolean", "bq", false), Param("disadvantage", "boolean", "bq", false), Param("bonus", "string", "bq", false), Param("createChatMessage", "boolean", "bq", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/equip-item", "POST", "/dnd5e/equip-item", "equip-item",
+      {Param("equipped", "boolean", "bq", true), Param("clientId", "string", "q", false), Param("actorUuid", "string", "bq", false), Param("actorName", "string", "bq", false), Param("itemUuid", "string", "bq", false), Param("itemName", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/attune-item", "POST", "/dnd5e/attune-item", "attune-item",
+      {Param("attuned", "boolean", "bq", true), Param("clientId", "string", "q", false), Param("actorUuid", "string", "bq", false), Param("actorName", "string", "bq", false), Param("itemUuid", "string", "bq", false), Param("itemName", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/transfer-currency", "POST", "/dnd5e/transfer-currency", "transfer-currency",
+      {Param("currency", "object", "bq", true), Param("clientId", "string", "q", false), Param("sourceActorUuid", "string", "bq", false), Param("sourceActorName", "string", "bq", false), Param("targetActorUuid", "string", "bq", false), Param("targetActorName", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/modify-currency", "POST", "/dnd5e/modify-currency", "modify-currency",
+      {Param("actorUuid", "string", "bq", true), Param("currency", "string", "bq", true), Param("amount", "number", "bq", true), Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/prepare-spell", "POST", "/dnd5e/prepare-spell", "prepare-spell",
+      {Param("actorUuid", "string", "bq", true), Param("spellName", "string", "bq", true), Param("prepared", "boolean", "bq", true), Param("clientId", "string", "q", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/use-ability", "POST", "/dnd5e/use-ability", "use-ability",
+      {Param("actorUuid", "string", "bq", true), Param("clientId", "string", "q", false), Param("abilityUuid", "string", "bq", false), Param("abilityName", "string", "bq", false), Param("targetUuid", "string", "bq", false), Param("targetName", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/use-feature", "POST", "/dnd5e/use-feature", "use-feature",
+      {Param("actorUuid", "string", "bq", true), Param("clientId", "string", "q", false), Param("abilityUuid", "string", "bq", false), Param("abilityName", "string", "bq", false), Param("targetUuid", "string", "bq", false), Param("targetName", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/use-spell", "POST", "/dnd5e/use-spell", "use-spell",
+      {Param("actorUuid", "string", "bq", true), Param("clientId", "string", "q", false), Param("abilityUuid", "string", "bq", false), Param("abilityName", "string", "bq", false), Param("targetUuid", "string", "bq", false), Param("targetName", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+    Endpoint("POST /dnd5e/use-item", "POST", "/dnd5e/use-item", "use-item",
+      {Param("actorUuid", "string", "bq", true), Param("clientId", "string", "q", false), Param("abilityUuid", "string", "bq", false), Param("abilityName", "string", "bq", false), Param("targetUuid", "string", "bq", false), Param("targetName", "string", "bq", false), Param("userId", "string", "qb", false)}, 10000, ""),
+  }
+end

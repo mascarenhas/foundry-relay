@@ -1,0 +1,96 @@
+local test = import "test"
+local os = import "os"
+local fs = import "fs"
+local uv = import "uv"
+local async = import "async"
+local http = import "http"
+local net = import "net"
+local strings = import "string"
+local wire = import "relay.wire"
+local hub = import "relay.hub"
+
+local function consume(stream: os.InputStream): string
+  local output = strings.writer()
+  for chunk in stream:read do output:write(chunk) end
+  return output:drain()
+end
+
+local function stop(process: os.Process)
+  if process:is_running() then process:kill("kill") end
+  process:wait()
+  if process.stdin then process.stdin:close() end
+  if process.stdout then process.stdout:close() end
+  if process.stderr then process.stderr:close() end
+end
+
+local function available_port(): integer
+  local first = 55000 + (os.pid() % 1000)
+  for port = first, first + 99 do
+    do
+      local probe = net.listen("127.0.0.1", port)
+      probe:close()
+      return port
+    catch
+      if error is async.OperationError then
+        local problem = error as async.OperationError
+        if problem.name ~= "EADDRINUSE" then raise end
+      else
+        raise
+      end
+    end
+  end
+  raise "no available port for standalone executable test"
+end
+
+function test_relocated_executable_runs_without_compiler_or_provider(_context: test.Context)
+  local source? = os.getenv("RELAY_TEST_EXECUTABLE")
+  if not source then test.skip("capability: set RELAY_TEST_EXECUTABLE or use make test") end
+  local binary = fs.tmpname()
+  defer fs.unlink(binary)
+  fs.write_file(binary, fs.read_file(source))
+  local chmod = uv.fs_t()
+  defer uv.fs_req_cleanup(chmod)
+  test.assert(uv.fs_chmod(nil, chmod, binary, 448, nil) == 0, "could not make private executable runnable")
+  local database = fs.tmpname()
+  defer fs.unlink(database)
+  local port = available_port()
+  local process = os.spawn(binary, {},
+    os.with_env("FOUNDRY_REST_API_KEY", "process-api-key"),
+    os.with_env("FOUNDRY_PAIRING_CODE", "test42"),
+    os.with_env("RELAY_DATABASE", database),
+    os.with_env("RELAY_HOST", "127.0.0.1"),
+    os.with_env("RELAY_PORT", "" .. port),
+    os.with_env("RELAY_PUBLIC_URL", "ws://127.0.0.1:" .. port .. "/relay"),
+    os.with_env("TITAN_PATH_0_6", "/nonexistent-foundry-relay-provider"),
+    os.with_env("TITAN_ROCKS_ROOT", "/nonexistent-foundry-relay-sdk"),
+    os.with_env("LUA_PATH", ""), os.with_env("LUA_CPATH", ""),
+    os.with_env("PATH", "/nonexistent-foundry-relay-tools"))
+  defer stop(process)
+  local stderr = async.run<|string, value|>(function (): string return consume(process.stderr) end)
+  defer hub.drain(stderr)
+  process.stdin:close()
+  local ready? = process.stdout:read_until("\n", true)
+  test.assert(ready == "Foundry relay listening on 127.0.0.1:" .. port,
+    "relocated static executable failed to start")
+  local health = http.get("http://127.0.0.1:" .. port .. "/health")
+  defer health:close()
+  local health_body = strings.writer()
+  for chunk in health:read do health_body:write(chunk) end
+  test.assert(health.status == 200 and wire.text(wire.object(health_body:drain()), "status") == "ok")
+  local headers = http.headers({http.Header("Content-Type", "application/json")})
+  local paired = http.request("POST", "http://127.0.0.1:" .. port .. "/auth/pair", headers,
+    [[{"code":"TEST42","worldId":"native-process","worldTitle":"Process"}]])
+  defer paired:close()
+  local body = strings.writer()
+  for chunk in paired:read do body:write(chunk) end
+  test.assert(paired.status == 200 and wire.text(wire.object(body:drain()), "clientId") ~= "",
+    "relocated executable did not pair a world")
+  process:kill("term")
+  local exit = process:wait()
+  test.assert(exit.code == 0 and exit.signal == nil, "server failed graceful SIGTERM shutdown")
+  case async.join(stderr)
+  when succeeded(errors) then test.assert(errors == "", "standalone server emitted diagnostics: " .. errors)
+  when failed(failure) then failure:raise()
+  else raise "stderr reader failed"
+  end
+end

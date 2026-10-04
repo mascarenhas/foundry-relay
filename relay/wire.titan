@@ -1,0 +1,38 @@
+local json = import "json"
+
+-- One identity sentinel preserves explicit JSON nulls at the relay boundary.
+local record Null
+end
+
+local const null: Null?
+
+function decode(source: string): value
+  return json.decode(source, nil, json.DecodeOption.null_value(null),
+    json.DecodeOption.max_bytes(16777216), json.DecodeOption.max_depth(64))
+end
+
+function encode(subject: value): string
+  return json.encode(subject, json.EncodeOption.null_value(null),
+    json.EncodeOption.max_bytes(16777216), json.EncodeOption.max_depth(64))
+end
+
+function object(source: string): {string: value}
+  local decoded = decode(source)
+  if not (decoded is {string: value}) then raise "expected a JSON object" end
+  return decoded
+end
+
+function text(object: {string: value}, key: string, fallback: string?): string
+  local item? = object[key]
+  if item is string then return item as string end
+  return fallback or ""
+end
+
+function error_body(message: string): string
+  local body: {string: value} = { ["error"] = message }
+  return encode(body)
+end
+
+do
+  null = Null()
+end

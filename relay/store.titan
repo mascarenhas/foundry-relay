@@ -1,0 +1,309 @@
+local sqlite3 = import "sqlite3"
+local async = import "async"
+local uv = import "uv"
+local os = import "os"
+local strings = import "string"
+
+-- Pairing credentials live in this private database, never in client-list JSON.
+record Client
+  const client_id: string
+  const token: string
+  const world_id: string
+  const world_title: string
+  const server_fingerprint: string
+  const server_origin: string
+  const module_version: string
+  const metadata_json: string
+  const last_seen: integer
+end
+
+local record Waiter
+  const task: async.Task
+  const token: async.ResumeToken
+end
+
+record Store
+  local const path: string
+  local closed: boolean
+  local owner: async.Task?
+  local waiters: {Waiter}
+end
+
+local const client_columns = "client_id, token, world_id, world_title, " ..
+  "server_fingerprint, server_origin, module_version, metadata_json, last_seen"
+
+-- libuv uses the operating system's cryptographically secure random source.
+-- The synchronous form retains no callbacks or borrowed native state.
+function secure_token(bytes: integer?): string
+  local count = bytes or 32
+  if count < 1 or count > 1024 then
+    raise "random token size must be between 1 and 1024 bytes"
+  end
+  local buffer = uv.buf_t.allocate(count)
+  local status = uv.random(nil, nil, buffer, count, 0, nil)
+  if status ~= 0 then raise "secure random source failed: " .. uv.strerror(status) end
+  local alphabet = "0123456789abcdef"
+  local output = strings.writer()
+  for index = 1, count do
+    local byte = buffer:get(index)
+    output:write(strings.sub(alphabet, byte // 16 + 1, byte // 16 + 1))
+    output:write(strings.sub(alphabet, byte % 16 + 1, byte % 16 + 1))
+  end
+  return output:drain()
+end
+
+function same_secret(first: string, second: string): boolean
+  if #first ~= #second then return false end
+  local difference = 0
+  for index = 1, #first do
+    local left: integer = strings.byte(first, index)
+    local right: integer = strings.byte(second, index)
+    difference = difference | (left ~ right)
+  end
+  return difference == 0
+end
+
+local function row_client(row: sqlite3.Row): Client
+  return Client(row:get(1), row:get(2), row:get(3), row:get(4), row:get(5),
+                row:get(6), row:get(7), row:get(8), row:get(9))
+end
+
+local function execute(db: sqlite3.Connection, sql: string, ...: value): integer
+  local statement = db:prepare(sql)
+  defer statement:close()
+  return statement:execute(...)
+end
+
+local function find_client(db: sqlite3.Connection, where: string,
+                           ...: value): Client?
+  local statement = db:prepare("SELECT " .. client_columns ..
+                               " FROM clients WHERE " .. where .. " LIMIT 1")
+  defer statement:close()
+  local cursor = statement:query(...)
+  defer cursor:close()
+  local row? = cursor:fetch()
+  if not row then return nil end
+  return row_client(row)
+end
+
+local function connection(path: string): sqlite3.Connection
+  local db = sqlite3.connect(path)
+  -- Each operation closes its own connection before handing the Store onward.
+  -- The timeout also bounds contention from an external database connection.
+  do
+    local statement = db:prepare("PRAGMA busy_timeout = 5000")
+    defer statement:close()
+    local cursor = statement:query()
+    defer cursor:close()
+  catch
+    db:close()
+    raise
+  end
+  return db
+end
+
+local function Store:connect(): sqlite3.Connection
+  if self.closed then raise "relay store is closed" end
+  return connection(self.path)
+end
+
+local function Store:remove_waiter(waiter: Waiter)
+  for index = 1, #self.waiters do
+    if self.waiters[index] == waiter then
+      for next = index + 1, #self.waiters do
+        self.waiters[next - 1] = self.waiters[next]
+      end
+      self.waiters[#self.waiters] = nil
+      break
+    end
+  end
+end
+
+local function Store:release()
+  if #self.waiters == 0 then self.owner = nil; return end
+  local waiter = self.waiters[1]
+  self:remove_waiter(waiter)
+  -- Reserve ownership before the deferred wake, so a newcomer cannot barge.
+  self.owner = waiter.task
+  waiter.task:resume(waiter.token)
+end
+
+local function Store:acquire()
+  if self.closed then raise "relay store is closed" end
+  async.checkpoint()
+  local current = async.running()
+  if not self.owner then self.owner = current; return end
+  if self.owner == current then raise "recursive relay store operation" end
+  local waiter = Waiter(current, async.ResumeToken("relay.store"))
+  self.waiters[#self.waiters + 1] = waiter
+  local detach = function()
+    self:remove_waiter(waiter)
+    -- Cancellation can arrive after release reserved this Task's ownership
+    -- but before its deferred wake runs. Hand that reservation onward too.
+    if self.owner == current then self:release() end
+  end
+  do
+    async.suspend(waiter.token, detach)
+  catch
+    detach()
+    raise
+  end
+end
+
+function open(path: string): Store
+  if path == "" or path == ":memory:" then
+    raise "relay store requires a persistent database filename"
+  end
+  local db = connection(path)
+  defer db:close()
+  -- Restrict the file before any token is written; SQLite journals inherit its
+  -- permissions. The single-user store intentionally retains stable tokens.
+  local request = uv.fs_t()
+  defer uv.fs_req_cleanup(request)
+  local status = uv.fs_chmod(nil, request, path, 384, nil) -- 0600
+  if status ~= 0 then raise "cannot protect relay database: " .. uv.strerror(status) end
+  execute(db, [[CREATE TABLE IF NOT EXISTS clients (
+    client_id TEXT PRIMARY KEY NOT NULL,
+    token TEXT UNIQUE NOT NULL,
+    world_id TEXT NOT NULL,
+    world_title TEXT NOT NULL,
+    server_fingerprint TEXT NOT NULL,
+    server_origin TEXT NOT NULL,
+    module_version TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    last_seen INTEGER NOT NULL
+  )]])
+  return {path = path, closed = false, owner = nil, waiters = {}}
+end
+
+function Store:pair(world_id: string, world_title: string,
+                     server_fingerprint: string?, server_origin: string?,
+                     existing_client_id: string?): Client
+  if world_id == "" then raise "worldId is required" end
+  local fingerprint = server_fingerprint or ""
+  local origin = server_origin or ""
+  local existing_id = existing_client_id or ""
+  self:acquire()
+  defer self:release()
+  local db = self:connect()
+  defer db:close()
+  -- A writer reservation covers both identity lookup and credential creation,
+  -- so concurrent valid pairings for one world return the same credential.
+  execute(db, "BEGIN IMMEDIATE")
+  local existing: Client?
+  if existing_id ~= "" then
+    existing = find_client(db,
+      "client_id = ? AND world_id = ? AND " ..
+      "(server_origin = '' OR ? = '' OR server_origin = ?)",
+      existing_id, world_id, origin, origin)
+  end
+  if not existing and fingerprint ~= "" then
+    existing = find_client(db,
+      "world_id = ? AND server_fingerprint = ? AND " ..
+      "(server_origin = '' OR ? = '' OR server_origin = ?)",
+      world_id, fingerprint, origin, origin)
+  end
+  if not existing then
+    existing = find_client(db, "world_id = ? AND server_origin = ?", world_id, origin)
+  end
+  local client: Client?
+  if existing then
+    client = Client {
+      client_id = existing.client_id, token = existing.token, world_id = world_id,
+      world_title = world_title ~= "" and world_title or existing.world_title,
+      server_fingerprint = fingerprint ~= "" and fingerprint or existing.server_fingerprint,
+      server_origin = origin ~= "" and origin or existing.server_origin,
+      module_version = existing.module_version, metadata_json = existing.metadata_json,
+      last_seen = os.time()
+    }
+    execute(db, "UPDATE clients SET world_title = ?, server_fingerprint = ?, " ..
+      "server_origin = ?, last_seen = ? WHERE client_id = ?",
+      client.world_title, client.server_fingerprint, client.server_origin,
+      client.last_seen, client.client_id)
+  else
+    client = Client {
+      client_id = secure_token(16), token = secure_token(), world_id = world_id,
+      world_title = world_title, server_fingerprint = fingerprint, server_origin = origin,
+      module_version = "", metadata_json = "{}", last_seen = os.time()
+    }
+    execute(db, "INSERT INTO clients (" .. client_columns .. ") " ..
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      client.client_id, client.token, client.world_id, client.world_title,
+      client.server_fingerprint, client.server_origin, client.module_version,
+      client.metadata_json, client.last_seen)
+  end
+  db:commit()
+  -- Closing an uncommitted connection on error/cancellation rolls back.
+  return client
+end
+
+function Store:get(client_id: string): Client?
+  self:acquire()
+  defer self:release()
+  local db = self:connect()
+  defer db:close()
+  return find_client(db, "client_id = ?", client_id)
+end
+
+function Store:authenticate(client_id: string, token: string): Client?
+  local client? = self:get(client_id)
+  if client and same_secret(client.token, token) then return client end
+  return nil
+end
+
+function Store:update(client_id: string, world_id: string, world_title: string,
+                       module_version: string, metadata_json: string)
+  self:acquire()
+  defer self:release()
+  local db = self:connect()
+  defer db:close()
+  execute(db, "UPDATE clients SET " ..
+    "world_id = CASE WHEN ? = '' THEN world_id ELSE ? END, " ..
+    "world_title = CASE WHEN ? = '' THEN world_title ELSE ? END, " ..
+    "module_version = CASE WHEN ? = '' THEN module_version ELSE ? END, " ..
+    "metadata_json = CASE WHEN ? = '' THEN metadata_json ELSE ? END, " ..
+    "last_seen = ? WHERE client_id = ?",
+    world_id, world_id, world_title, world_title, module_version, module_version,
+    metadata_json, metadata_json, os.time(), client_id)
+end
+
+function Store:list(): {Client}
+  self:acquire()
+  defer self:release()
+  local db = self:connect()
+  defer db:close()
+  local statement = db:prepare("SELECT " .. client_columns ..
+                               " FROM clients ORDER BY world_title, client_id")
+  defer statement:close()
+  local cursor = statement:query()
+  defer cursor:close()
+  local clients: {Client} = {}
+  for row in cursor:fetch do clients[#clients + 1] = row_client(row) end
+  return clients
+end
+
+function Store:remove(client_id: string): boolean
+  self:acquire()
+  defer self:release()
+  local db = self:connect()
+  defer db:close()
+  return execute(db, "DELETE FROM clients WHERE client_id = ?", client_id) == 1
+end
+
+function Store:revoke(token: string): string?
+  self:acquire()
+  defer self:release()
+  local db = self:connect()
+  defer db:close()
+  local client? = find_client(db, "token = ?", token)
+  if not client then return nil end
+  execute(db, "UPDATE clients SET token = ? WHERE client_id = ?",
+          secure_token(), client.client_id)
+  return client.client_id
+end
+
+-- Callers join their request Tasks before closing the Store. Already admitted
+-- operations own independent connections and finish their own native cleanup.
+function Store:close()
+  self.closed = true
+end
