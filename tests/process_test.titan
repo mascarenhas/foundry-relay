@@ -5,6 +5,8 @@ local uv = import "uv"
 local async = import "async"
 local http = import "http"
 local net = import "net"
+local websocket = import "websocket"
+local timer = import "timer"
 local strings = import "string"
 local wire = import "relay.wire"
 local hub = import "relay.hub"
@@ -83,8 +85,42 @@ function test_relocated_executable_runs_without_compiler_or_provider(_context: t
   defer paired:close()
   local body = strings.writer()
   for chunk in paired:read do body:write(chunk) end
-  test.assert(paired.status == 200 and wire.text(wire.object(body:drain()), "clientId") ~= "",
+  local credentials = wire.object(body:drain())
+  test.assert(paired.status == 200 and wire.text(credentials, "clientId") ~= "",
     "relocated executable did not pair a world")
+  local id = wire.text(credentials, "clientId")
+  local world = websocket.connect("ws://127.0.0.1:" .. port .. "/relay?id=" .. id)
+  defer world:close()
+  local auth: {string: value} = {["type"] = "auth", ["token"] = wire.text(credentials, "token")}
+  world:write(websocket.TEXT, wire.encode(auth))
+  for index = 1, 7 do
+    local kind?, contents? = world:read()
+    test.assert(kind == websocket.TEXT)
+    local update = wire.object(contents)
+    if index == 1 then test.assert(wire.text(update, "type") == "auth-success") end
+  end
+  local streaming = http.get("http://127.0.0.1:" .. port .. "/chat/subscribe?clientId=" .. id,
+    http.headers({http.Header("x-api-key", "process-api-key")}))
+  defer streaming:close()
+  test.assert(streaming.status == 200)
+  streaming:read_until("\n\n", true)
+  local _, subscribed? = world:read()
+  test.assert(wire.object(subscribed)["count"] == 1)
+  streaming:close() -- The next event must retire this committed HTTP stream.
+  local sending = async.run<|nil, value|>(function (): nil
+    for index = 1, 128 do
+      world:write(websocket.TEXT, [[{"type":"chat-event","data":{"eventType":"update","id":"scratch"}}]])
+      timer.sleep(0)
+    end
+    return nil
+  end)
+  defer hub.drain(sending)
+  local _, unsubscribed? = world:read()
+  local removed = wire.object(unsubscribed)
+  test.assert(wire.text(removed, "channel") == "chat-events" and removed["count"] == 0,
+    "closed SSE client retained its subscription")
+  test.assert(async.join(sending):has_succeeded(), "SSE event producer did not finish")
+  world:shutdown(1000, "process regression complete", 1000)
   process:kill("term")
   local exit = process:wait()
   test.assert(exit.code == 0 and exit.signal == nil, "server failed graceful SIGTERM shutdown")

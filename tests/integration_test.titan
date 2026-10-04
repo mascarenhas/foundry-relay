@@ -537,3 +537,34 @@ function test_sse_subscription_update_and_event_data(_context: test.Context)
     fixture.instance.worlds:close()
   end)
 end
+
+function test_sse_client_disconnect_retires_subscription(_context: test.Context)
+  with_relay(function(fixture)
+    local credentials = pair(fixture, "world")
+    local world = dial(fixture, credentials)
+    defer world:close()
+    local response = http.get("http://127.0.0.1:" .. fixture.port .. "/chat/subscribe?clientId=" .. credentials.id,
+      http.headers({http.Header("x-api-key", api_key)}))
+    defer response:close()
+    test.assert(response.status == 200)
+    response:read_until("\n\n", true)
+    test.assert(message(world)["count"] == 1)
+    response:close()
+    local sending = async.run<|nil, value|>(function (): nil
+      for index = 1, 128 do
+        world:write(websocket.TEXT, [[{"type":"chat-event","data":{"eventType":"update","id":"scratch"}}]])
+        timer.sleep(0)
+      end
+      return nil
+    end)
+    defer hub.drain(sending)
+    local removed = message(world)
+    test.assert(wire.text(removed, "channel") == "chat-events" and removed["count"] == 0,
+      "closed SSE client retained its subscription")
+    test.assert(async.join(sending):has_succeeded(), "SSE event producer did not finish")
+    local counts: {string: integer} = {}
+    local replacement = dial(fixture, credentials, counts)
+    defer replacement:close()
+    test.assert(counts["chat-events"] == 0, "reconnect retained the disconnected HTTP subscriber")
+  end)
+end

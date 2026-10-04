@@ -293,7 +293,11 @@ function Server:handle(request: http.Request, response: http.Response)
 catch
   -- Validation failures are request-local; never serialize internal traces or
   -- credentials into HTTP errors. Network failures after commit close the stream.
-  router.error_response(response, 400, "invalid request")
+  do
+    router.error_response(response, 400, "invalid request")
+  catch
+    response:abort()
+  end
 end
 
 function Server:start()

@@ -6,7 +6,7 @@ The server and tests are Titan. On POSIX, application modules and the Titan stan
 
 ## Build and test
 
-Use a prepared Titan installation containing `http`, `websocket`, `sqlite3`, `json`, and `peg`. This project was developed against Titan's `codex/issue-193-websocket` branch, commit `cdf8f330777a608f1aeeaea87ebe17632bd70922`, on Linux x86_64.
+Use a prepared Titan installation containing `http`, `websocket`, `sqlite3`, `json`, and `peg`, including the HTTP `Response:abort()` API. This project was validated against Titan's `codex/foundry-relay-build-docs` branch, commit `dc3f3e99`, stacked on the WebSocket implementation, on Linux x86_64 and the local Windows x64 VM.
 
 ```sh
 export PATH=/path/to/titan-prefix/bin:$PATH
@@ -51,7 +51,7 @@ Set an exact Foundry origin if using a different hostname or port. An absent Ori
 
 1. Open the Foundry world as a GM with the REST API module enabled.
 2. Set the module relay URL to `ws://127.0.0.1:3010/relay` (or the configured public URL).
-3. Choose the pairing-code flow and enter your `FOUNDRY_PAIRING_CODE`.
+3. Choose **Enter Code** in the module connection dialog and enter your `FOUNDRY_PAIRING_CODE`. The default **Pair** button uses the upstream browser-approval flow, which this relay does not implement.
 4. Repeat in additional worlds with the same code.
 
 The module posts to `/auth/pair`; the relay returns a distinct `clientId` and cryptographically random token for each world/server identity. The module stores that token and sends it in its first WebSocket message, never in the URL. Credentials survive relay restarts. Re-pairing an existing world retains its identity and credential. Module self-unpair revokes its token while retaining the registered world; re-pairing then returns a fresh token.
@@ -68,7 +68,7 @@ See [the API catalog](docs/api.md) for all 91 forwarding declarations and [routi
 
 Six authenticated SSE endpoints forward chat, roll, hook, combat, actor, and scene events. Each subscriber has a 128-event queue; a slow subscriber is retired when it fills. Streams send a 15-second keepalive and keep their subscription across a world reconnect. Foundry receives per-channel subscriber counts so it can enable and disable its hooks. Stream data is the inner Foundry event data; event names follow the corresponding channel and `eventType`. Upstream's per-subscriber event filters and consumer `/ws/api` transport are outside this implementation.
 
-The relay serializes output per world, correlates replies by world, action, and request ID, and permits concurrent REST requests. A forwarding deadline returns `408`; a world disconnect settles pending requests with `503`. A timed-out request may already have reached Foundry and performed a mutation; the relay does not retry it. The output queue is bounded, while Titan's underlying network receive buffering retains its current stdlib behavior. The HTTP API has no public accepted-request/response abort operation, so process shutdown is not guaranteed to be bounded if a client permanently stalls while sending a request body or reading a response. The HTTP idle deadline covers waiting for the next request headers.
+The relay serializes output per world, correlates replies by world, action, and request ID, and permits concurrent REST requests. A forwarding deadline returns `408`; a world disconnect settles pending requests with `503`. A timed-out request may already have reached Foundry and performed a mutation; the relay does not retry it. The output queue is bounded, while Titan's underlying network receive buffering retains its current stdlib behavior. Failed HTTP responses are aborted, including disconnected SSE streams. Shutdown does not currently track and abort every accepted HTTP exchange, so it is not guaranteed to be bounded if a client permanently stalls while sending a request body or reading a response. The HTTP idle deadline covers waiting for the next request headers.
 
 ## Windows build
 
