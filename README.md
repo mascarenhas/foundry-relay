@@ -6,7 +6,7 @@ The server and tests are Titan. On POSIX, application modules and the Titan stan
 
 ## Build and test
 
-Use a prepared Titan installation containing `http`, `websocket`, `sqlite3`, `json`, and `peg`, including the HTTP `Response:abort()` API. This project was validated against Titan's `codex/foundry-relay-build-docs` branch, commit `dc3f3e99`, stacked on the WebSocket implementation, on Linux x86_64 and the local Windows x64 VM.
+Use a prepared Titan installation containing `http`, `websocket`, `sqlite3`, `json`, and `peg`, including the HTTP `Response:abort()` API. This project was validated against Titan's `codex/foundry-relay-build-docs` branch, commit `4987078d`, stacked on the WebSocket implementation, on Linux x86_64 and the local Windows x64 VM.
 
 ```sh
 export PATH=/path/to/titan-prefix/bin:$PATH

@@ -2,9 +2,12 @@
 
 Validated on 2026-10-04 against Titan's WebSocket implementation plus the HTTP
 response-abort change, represented by `codex/foundry-relay-build-docs` at
-`dc3f3e99`. The isolated SDK rebuilds used the same compiler/runtime inputs as
+`4987078d`. The isolated SDK rebuilds used the same compiler/runtime inputs as
 `cdf8f330777a608f1aeeaea87ebe17632bd70922`, with the two changed HTTP source
-files; source receipts record their exact hashes.
+files; source receipts record their exact hashes. The follow-up from
+`dc3f3e99` to `4987078d` only refreshes the pinned public metadata fixture;
+compiled inputs and delivered artifacts are unchanged. Its focused metadata
+check passed across all 22 standard providers.
 
 ## Linux x86_64
 
@@ -89,8 +92,8 @@ verified to fail with the old cleanup order and pass with the final code.
 
 ## Live Foundry validation
 
-The user paired the running world manually because automated browser control
-remained unavailable. Live relay API checks ran against Foundry **14.368**, REST
+The user paired the running world manually while automated browser control was
+unavailable. Live relay API checks ran against Foundry **14.368**, REST
 API module **3.4.1**, and the `dark-sun` world using the `wwn` system. The module's
 source map also informed the protocol adapter.
 
@@ -117,6 +120,36 @@ test suite and runner are Titan. The user confirmed that the local world is for
 testing and authorized stopping without restoring its module settings. The
 temporary Foundry and relay processes were stopped, and the temporary API-key
 file and SQLite credentials database were removed.
+
+A subsequent live UI pass used Computer Use in Chrome against the same local
+test world. The module paired through **Enter Code** with the reusable code,
+then connected after reloading. A REST-created JournalEntry appeared in the
+Journal sidebar with an embedded Unicode HTML text page. Updating its title
+and its page by UUID through REST changed the already-open journal window,
+including the rendered Unicode body, without reopening it.
+
+An inactive, non-navigation scratch Scene appeared in the Scenes sidebar. Its
+name was edited and saved in Foundry's configuration UI while a pre-established
+`/hooks/subscribe` stream listened. The received `updateScene` matched the exact
+Scene ID, scratch nonce, and saved name; REST readback agreed and still showed
+`active: false` and `navigation: false`. The active Scene remained
+`Seedhouse` (`Y21NIRCmWfGc7sYN`) in the before/after world-info snapshots.
+
+Each scratch root document was deleted separately through REST. Foundry removed
+the Scene and Journal from filtered sidebar lists and closed the open journal
+window. Direct `/get` requests confirmed absence of both root documents and the
+embedded page:
+
+- `JournalEntry.R2RUQiRYFia6B2xR`
+- `JournalEntry.R2RUQiRYFia6B2xR.JournalEntryPage.ysr9YQSD4O2UpWbo`
+- `Scene.AHRIvlxDp7SfVBhW`
+
+The UI receipt, SSE event, screenshots, accessibility readbacks, and ephemeral
+validation driver are retained under ignored `build/live-foundry-ui/`. The
+plan and driver were independently reviewed. The temporary browser tab and
+Foundry/relay processes were closed, both local ports were checked closed, and
+the temporary API-key file and SQLite credentials database were removed. Relay
+stderr was empty.
 
 Failed committed HTTP streams are now aborted. The README's remaining shutdown
 limitation is that the relay does not track and abort every accepted HTTP
