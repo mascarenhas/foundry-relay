@@ -2,7 +2,7 @@ local sqlite3 = import "sqlite3"
 local async = import "async"
 local uv = import "uv"
 local os = import "os"
-local strings = import "string"
+local string = import "string"
 
 -- Pairing credentials live in this private database, never in client-list JSON.
 record Client
@@ -42,12 +42,9 @@ function secure_token(bytes: integer?): string
   local buffer = uv.buf_t.allocate(count)
   local status = uv.random(nil, nil, buffer, count, 0, nil)
   if status ~= 0 then raise "secure random source failed: " .. uv.strerror(status) end
-  local alphabet = "0123456789abcdef"
-  local output = strings.writer()
+  local output = string.writer()
   for index = 1, count do
-    local byte = buffer:get(index)
-    output:write(strings.sub(alphabet, byte // 16 + 1, byte // 16 + 1))
-    output:write(strings.sub(alphabet, byte % 16 + 1, byte % 16 + 1))
+    output:write(string.format("%02x", buffer:get(index)))
   end
   return output:drain()
 end
@@ -56,8 +53,8 @@ function same_secret(first: string, second: string): boolean
   if #first ~= #second then return false end
   local difference = 0
   for index = 1, #first do
-    local left: integer = strings.byte(first, index)
-    local right: integer = strings.byte(second, index)
+    local left: integer = string.byte(first, index)
+    local right: integer = string.byte(second, index)
     difference = difference | (left ~ right)
   end
   return difference == 0

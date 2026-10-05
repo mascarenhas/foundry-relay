@@ -2,7 +2,7 @@ local http = import "http"
 local websocket = import "websocket"
 local async = import "async"
 local timer = import "timer"
-local strings = import "string"
+local string = import "string"
 local iteration = import "iteration"
 local os = import "os"
 local config = import "relay.config"
@@ -22,7 +22,7 @@ record Server
 end
 
 local function body(request: http.Request): string
-  local output = strings.writer()
+  local output = string.writer()
   local length = 0
   for chunk in request:read do
     length = length + #chunk
@@ -35,8 +35,8 @@ end
 local function json_body(request: http.Request): {string: value}
   local source = body(request)
   if source == "" then return {} end
-  local content_type = strings.lower(request.headers:get("Content-Type") or "")
-  if strings.sub(content_type, 1, 16) ~= "application/json" then
+  local content_type = string.lower(request.headers:get("Content-Type") or "")
+  if string.sub(content_type, 1, 16) ~= "application/json" then
     raise "request body must use application/json"
   end
   return wire.object(source)
@@ -172,14 +172,14 @@ local function sse_name(channel: string, data: {string: value}): string
   if channel == "actor-events" then prefix = "actor" end
   if channel == "scene-events" then prefix = "scene" end
   local name = prefix .. "-" .. event_type
-  if strings.find(name, "\n") or strings.find(name, "\r") then return prefix end
+  if string.find(name, "\n") or string.find(name, "\r") then return prefix end
   return name
 end
 
 local function Server:stream(response: http.Response, match: router.Match)
   local session?, problem? = self.worlds:select(match.query["clientId"])
   if not session then router.error_response(response, 503, problem); return end
-  local channel = strings.sub(match.action, 5)
+  local channel = string.sub(match.action, 5)
   local subscriber = self.worlds:subscribe(session.id, channel)
   defer self.worlds:unsubscribe(subscriber)
   response:set_header("Content-Type", "text/event-stream")
@@ -202,7 +202,7 @@ local function Server:stream(response: http.Response, match: router.Match)
         local data: {string: value} = envelope
         if envelope["data"] is {string: value} then data = envelope["data"] as {string: value} end
         local name = sse_name(channel, data)
-        if strings.find(name, "\n") or strings.find(name, "\r") then name = "event" end
+        if string.find(name, "\n") or string.find(name, "\r") then name = "event" end
         response:write("event: " .. name .. "\ndata: " .. wire.encode(data) .. "\n\n")
         reading = nil
       else return
@@ -216,7 +216,7 @@ local function Server:forward(request: http.Request, response: http.Response, ma
   local endpoint = api.endpoint_for(match.action)
   local data: {string: value} = {}
   local content_type = request.headers:get("Content-Type") or "application/octet-stream"
-  if endpoint.special == "upload" and strings.sub(strings.lower(content_type), 1, 16) ~= "application/json" then
+  if endpoint.special == "upload" and string.sub(string.lower(content_type), 1, 16) ~= "application/json" then
     -- Binary upload metadata comes from the declared query parameters.
     data["fileData"] = "data:" .. content_type .. ";base64," .. api.encode_base64(body(request))
   else
@@ -288,7 +288,7 @@ function Server:handle(request: http.Request, response: http.Response)
     router.json_response(response, 200, "{\"success\":true}")
     return
   end
-  if strings.sub(match.action, 1, 4) == "sse:" then self:stream(response, match); return end
+  if string.sub(match.action, 1, 4) == "sse:" then self:stream(response, match); return end
   self:forward(request, response, match)
 catch
   -- Validation failures are request-local; never serialize internal traces or

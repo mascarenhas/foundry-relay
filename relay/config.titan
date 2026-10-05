@@ -1,6 +1,6 @@
 local os = import "os"
 local math = import "math"
-local strings = import "string"
+local string = import "string"
 local url = import "url"
 
 record Config
@@ -33,13 +33,10 @@ end
 
 function load(): Config
   local key = required("FOUNDRY_REST_API_KEY")
-  local code = strings.upper(required("FOUNDRY_PAIRING_CODE"))
+  local code = string.upper(required("FOUNDRY_PAIRING_CODE"))
   if #code ~= 6 then raise "FOUNDRY_PAIRING_CODE must contain exactly six characters" end
-  for index = 1, #code do
-    local byte: integer = strings.byte(code, index)
-    if (byte < 48 or byte > 57) and (byte < 65 or byte > 90) then
-      raise "FOUNDRY_PAIRING_CODE must contain only letters and digits"
-    end
+  if not string.match(code, "^[A-Z0-9]{6}$") then
+    raise "FOUNDRY_PAIRING_CODE must contain only letters and digits"
   end
   local host = os.getenv("RELAY_HOST") or "127.0.0.1"
   local port = number("RELAY_PORT", 3010, 65535)
@@ -54,13 +51,8 @@ function load(): Config
   local origin_text = os.getenv("RELAY_ALLOWED_ORIGINS") or
     "http://127.0.0.1:30000,http://localhost:30000"
   local origins: {string} = {}
-  local start = 1
-  while start <= #origin_text do
-    local comma? = strings.find(origin_text, ",", start)
-    local finish = comma or (#origin_text + 1)
-    local origin = strings.sub(origin_text, start, finish - 1)
-    if origin ~= "" then origins[#origins + 1] = origin end
-    start = finish + 1
+  for o in string.split(origin_text, ",") do
+    if o ~= "" then origins[#origins + 1] = o end
   end
   return Config { host = host, port = port, api_key = key, pairing_code = code,
     database = os.getenv("RELAY_DATABASE") or "relay.sqlite3", public_url = public_url,
@@ -76,8 +68,8 @@ function secret_equal(left: string, right: string): boolean
   local maximum = #left
   if #right > maximum then maximum = #right end
   for i = 1, maximum do
-    local a = strings.byte(left, i) or 0
-    local b = strings.byte(right, i) or 0
+    local a = string.byte(left, i) or 0
+    local b = string.byte(right, i) or 0
     different = different | (a ~ b)
   end
   return different == 0

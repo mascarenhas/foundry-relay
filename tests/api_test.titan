@@ -2,7 +2,7 @@ local test = import "test"
 local api = import "relay.api.titan"
 local router = import "relay.router"
 local wire = import "relay.wire"
-local strings = import "string"
+local string = import "string"
 
 local function payload(method: string, target: string, body: string): {string: value}
   local routes = router.Router(api.routes())
@@ -58,6 +58,12 @@ function test_parameter_source_precedence(_context: test.Context)
   local result = payload("POST", "/move-token?x=20&y=30&userId=query", '{"x":10,"y":11,"userId":"body"}')
   test.assert(result["x"] == 10 and result["y"] == 11, "body/query precedence changed")
   test.assert(result["userId"] == "query", "query/body precedence changed")
+end
+
+function test_empty_query_falls_back_to_body(_context: test.Context)
+  local result = payload("GET", "/get?selected=&userId=", '{"selected":false,"userId":"body"}')
+  test.assert(result["selected"] == false and result["userId"] == "body",
+              "empty query values shadowed present body values")
 end
 
 function test_protocol_fields_are_owned_by_hub(_context: test.Context)
@@ -124,7 +130,7 @@ function test_invalid_parameter_types(context: test.Context)
 end
 
 function test_base64_binary_roundtrip(context: test.Context)
-  local variants: {string} = {"", "f", "fo", "foo", "foob", "fooba", "foobar", strings.char(0, 255, 1, 254, 2)}
+  local variants: {string} = {"", "f", "fo", "foo", "foob", "fooba", "foobar", string.char(0, 255, 1, 254, 2)}
   for index = 1, #variants do
     local original = variants[index]
     context:run("bytes_" .. #original .. "_case_" .. index, function(_child: test.Context)
@@ -151,7 +157,7 @@ function test_download_binary_and_base64_modes(_context: test.Context)
   local endpoint = api.endpoint_for("GET /download")
   local result = wire.object('{"type":"download-file-result","requestId":"x","success":true,"fileData":"data:text/plain;base64,AAH/","filename":"test.bin","mimeType":"application/octet-stream"}')
   local binary = api.response(endpoint, result)
-  test.assert(binary.status == 200 and binary.body == strings.char(0, 1, 255))
+  test.assert(binary.status == 200 and binary.body == string.char(0, 1, 255))
   test.assert(binary.headers["Content-Disposition"] == 'attachment; filename="test.bin"')
   local encoded = api.response(endpoint, result, "base64")
   test.assert(encoded.content_type == "application/json" and encoded.body == wire.encode(result))
@@ -183,6 +189,41 @@ function test_untrusted_binary_headers_are_safe(_context: test.Context)
   local result = wire.object('{"fileData":"eA==","filename":"evil\\\"\\r\\nX: injected","mimeType":"image/png\\r\\nX: injected"}')
   local reply = api.response(api.endpoint_for("GET /download"), result)
   test.assert(reply.content_type == "application/octet-stream")
-  test.assert(not strings.find(reply.headers["Content-Disposition"], "\r"))
-  test.assert(not strings.find(reply.headers["Content-Disposition"], "\n"))
+  test.assert(not string.find(reply.headers["Content-Disposition"], "\r"))
+  test.assert(not string.find(reply.headers["Content-Disposition"], "\n"))
+end
+
+function test_binary_header_ascii_boundaries(context: test.Context)
+  context:run("printable_ascii", function(_child: test.Context)
+    test.assert(api.safe_header(" ~", "fallback") == " ~",
+                "printable ASCII boundaries were rejected")
+  end)
+  context:run("empty", function(_child: test.Context)
+    test.assert(api.safe_header("", "fallback") == "fallback")
+  end)
+  context:run("controls", function(_child: test.Context)
+    test.assert(api.safe_header("type/" .. string.char(0, 9, 10, 13, 31, 127), "fallback") == "fallback",
+                "header control bytes were accepted")
+  end)
+  context:run("high_bytes", function(_child: test.Context)
+    test.assert(api.safe_header("type/" .. string.char(128, 255), "fallback") == "fallback",
+                "header high bytes were accepted")
+  end)
+end
+
+function test_download_filename_sanitization(context: test.Context)
+  context:run("unsafe_bytes", function(_child: test.Context)
+    local result: {string: value} = {
+      ["fileData"] = "eA==", ["filename"] = "safe \"\\\0\t\r\né~",
+      ["mimeType"] = "text/plain" }
+    local reply = api.response(api.endpoint_for("GET /download"), result)
+    test.assert(reply.headers["Content-Disposition"] == 'attachment; filename="safe ________~"',
+                "filename sanitization changed bytewise replacement or printable boundaries")
+  end)
+  context:run("empty", function(_child: test.Context)
+    local result: {string: value} = { ["fileData"] = "eA==", ["filename"] = "" }
+    local reply = api.response(api.endpoint_for("GET /download"), result)
+    test.assert(reply.headers["Content-Disposition"] == 'attachment; filename=""',
+                "empty filenames were given replacement bytes")
+  end)
 end

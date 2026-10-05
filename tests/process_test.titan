@@ -7,12 +7,12 @@ local http = import "http"
 local net = import "net"
 local websocket = import "websocket"
 local timer = import "timer"
-local strings = import "string"
+local string = import "string"
 local wire = import "relay.wire"
 local hub = import "relay.hub"
 
 local function consume(stream: os.InputStream): string
-  local output = strings.writer()
+  local output = string.writer()
   for chunk in stream:read do output:write(chunk) end
   return output:drain()
 end
@@ -76,14 +76,14 @@ function test_relocated_executable_runs_without_compiler_or_provider(_context: t
     "relocated static executable failed to start")
   local health = http.get("http://127.0.0.1:" .. port .. "/health")
   defer health:close()
-  local health_body = strings.writer()
+  local health_body = string.writer()
   for chunk in health:read do health_body:write(chunk) end
   test.assert(health.status == 200 and wire.text(wire.object(health_body:drain()), "status") == "ok")
   local headers = http.headers({http.Header("Content-Type", "application/json")})
   local paired = http.request("POST", "http://127.0.0.1:" .. port .. "/auth/pair", headers,
     [[{"code":"TEST42","worldId":"native-process","worldTitle":"Process"}]])
   defer paired:close()
-  local body = strings.writer()
+  local body = string.writer()
   for chunk in paired:read do body:write(chunk) end
   local credentials = wire.object(body:drain())
   test.assert(paired.status == 200 and wire.text(credentials, "clientId") ~= "",
