@@ -6,7 +6,7 @@ The server and tests are Titan. On POSIX, application modules and the Titan stan
 
 ## Build and test
 
-Use a prepared Titan installation containing `http`, `websocket`, `sqlite3`, `json`, and `peg`, including the HTTP `Response:abort()` API. This project was validated against Titan's `codex/foundry-relay-build-docs` branch, commit `4987078d`, stacked on the WebSocket implementation, on Linux x86_64 and the local Windows x64 VM.
+Use a prepared Titan installation containing `http`, `websocket`, `sqlite3`, `json`, and `peg`, including the HTTP `Response:abort()` API. [TITAN_REVISION](TITAN_REVISION) records the Titan commit selected for the production line-coverage workflow. Earlier Linux x86_64 and local Windows x64 validation used commit `4987078d`; those historical checks are recorded in [validation](docs/validation.md).
 
 ```sh
 export PATH=/path/to/titan-prefix/bin:$PATH
@@ -36,6 +36,10 @@ the SDK, compiler flags, OpenSSL mode, or source inventory takes effect on the
 next invocation. `make test` rebuilds both the application and test runner.
 
 The test runner's source-owned `titan.test` support makes its standard-provider imports use the installed image. `make test` sets `TITAN_PATH_0_6` from the compiler prefix; override `TITAN_STDLIB=/absolute/path/lib/titan/0.6` if needed. The production executable embeds the standard provider and needs no such setting. `TITANC=/absolute/path/bin/titanc` selects a compiler. On a restricted development host, set `CCACHE_DIR` to a writable location; `TITAN_PROBE_CACHE_DISABLE=1` is useful after a failed sandboxed native-header probe.
+
+For production executable-line coverage using the existing Titan test suite,
+see [the coverage workflow](docs/coverage.md). It retains all eight production
+modules and collects the test runner and relay executable separately.
 
 ## Run
 

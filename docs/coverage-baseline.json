@@ -1,0 +1,141 @@
+{
+  "version": 1,
+  "metric": "titan-executable-lines",
+  "application_production_revision": "47c6029c7b04ba01b2d785a39d34596b006dac5e",
+  "titan_revision": "8609cfb17a00e50a6b752009cf1ce9d52362f265",
+  "skills_revision": "df1e7837ab0869d98c853f252d6572a0cdde0503",
+  "lua_revision": "025bfc35df0885656de347fb7a7c377e90042a75",
+  "platform": {
+    "machine": "x86_64",
+    "system": "Linux"
+  },
+  "sdk_profile": "validation",
+  "toolchain": {
+    "gcc": "16.2.1",
+    "gcov": "16.2.1",
+    "target": "x86_64-redhat-linux",
+    "gcovr": "8.4",
+    "system_openssl": "3.5.9"
+  },
+  "complete": true,
+  "tests_passed": true,
+  "lines_covered": 1140,
+  "lines_total": 1209,
+  "line_percent": 94.29280397022333,
+  "sources": [
+    {
+      "file": "main.titan",
+      "module": "main",
+      "sha256": "929610ddf45752563f56e222a89b6ee2cd990f8c2fdf5015a9038884ea6ed3f6",
+      "lines_covered": 15,
+      "lines_total": 19,
+      "zero_lines": 4
+    },
+    {
+      "file": "relay/api.titan",
+      "module": "relay.api",
+      "sha256": "e647f1c8d4af055c856a8a76abd38571b0230bcbc12c32f47ac50b68c778c1ea",
+      "lines_covered": 359,
+      "lines_total": 371,
+      "zero_lines": 12
+    },
+    {
+      "file": "relay/config.titan",
+      "module": "relay.config",
+      "sha256": "1b9a597bc8a6bd9f22b82ba87b55672d8e0f8681713de614c8bed7211fbb70b1",
+      "lines_covered": 37,
+      "lines_total": 40,
+      "zero_lines": 3
+    },
+    {
+      "file": "relay/hub.titan",
+      "module": "relay.hub",
+      "sha256": "75fa726ba47d0393a5ac93abb63b5c9de620679f601b276ce496489eade1676e",
+      "lines_covered": 199,
+      "lines_total": 205,
+      "zero_lines": 6
+    },
+    {
+      "file": "relay/router.titan",
+      "module": "relay.router",
+      "sha256": "1bf4849369ae9c7337fc60847bba44eaadd2987f0a99a960f6436b584173d1ad",
+      "lines_covered": 182,
+      "lines_total": 183,
+      "zero_lines": 1
+    },
+    {
+      "file": "relay/server.titan",
+      "module": "relay.server",
+      "sha256": "d3ea31a89f659f9ca1772a90e66e8365bf89b9c8782cea1de655cd5505aaa017",
+      "lines_covered": 179,
+      "lines_total": 219,
+      "zero_lines": 40
+    },
+    {
+      "file": "relay/store.titan",
+      "module": "relay.store",
+      "sha256": "6c8c3d390ddaac1c3805985d783ecc21faacac7e6a83ffeec84c487dfcac229a",
+      "lines_covered": 155,
+      "lines_total": 158,
+      "zero_lines": 3
+    },
+    {
+      "file": "relay/wire.titan",
+      "module": "relay.wire",
+      "sha256": "bef0859180cf254db868d0dc5b1e5f590349869e6ce3426beabc522f50292572",
+      "lines_covered": 14,
+      "lines_total": 14,
+      "zero_lines": 0
+    }
+  ],
+  "runs": [
+    {
+      "version": 2,
+      "run_id": "b9295a5798f9442bb72c857e900f55fe",
+      "manifest_id": "9c962d703bb1e3b2fb0eb3abdc1fecb51ab66920f66cc71523024d885ce61877",
+      "started": "2026-10-09T08:21:30.849652+00:00",
+      "ended": "2026-10-09T08:21:36.325511+00:00",
+      "state": "complete",
+      "exit_status": 0,
+      "process_ownership": "posix-process-group-v1",
+      "process_group_empty_confirmed": true,
+      "group_retirement_requested": false,
+      "selected": 235,
+      "passed": 235,
+      "expected_public_cases": 81,
+      "counter_files": 8
+    },
+    {
+      "version": 2,
+      "run_id": "b3f4b50ebb5e4b34911f9b9da40bbff4",
+      "manifest_id": "987e781916d5644a83ec667e2b69de23668a51ceca52a9a6dcf35df6c8b2ef87",
+      "started": "2026-10-09T08:21:36.743607+00:00",
+      "ended": "2026-10-09T08:21:37.609877+00:00",
+      "state": "complete",
+      "exit_status": 0,
+      "process_ownership": "posix-process-group-v1",
+      "process_group_empty_confirmed": true,
+      "group_retirement_requested": false,
+      "selected": 1,
+      "passed": 1,
+      "expected_public_cases": 1,
+      "counter_files": 8
+    }
+  ],
+  "evidence": {
+    "directory": "/tmp/foundry-coverage-8609cfb-ItqegQ/measurement-r1",
+    "sdk_provenance": "/tmp/foundry-coverage-8609cfb-ItqegQ/sdk-provenance.json",
+    "sdk_provenance_sha256": "5ae07b3b811f4bc7c3dda04b6d32c3b537d3f18375d6cf5051f6ecc47d44d3ac",
+    "summary_sha256": "14af28e87cc205088f128591767da952555e8a03325c7c6ee0d06f91aebe97b0",
+    "normalized_lines_sha256": "054712aa84dc95d47153b604e5ab8a393fce3bfb605725d6ba6a5194a5cb177b",
+    "lcov_sha256": "f8fc2ca061f5f270845a54a2da097529d585a01b76edbe9be21fba8b76a66850",
+    "helper_sha256": "09057e42b8a91bbe3262df30a32b5739c7393d1d5a829b146f15be3127a4be8e",
+    "compiler_files_verified_against_pin": 88
+  },
+  "limitations": [
+    "Linux x86_64 only; no Windows or macOS coverage",
+    "O0/no-LTO executable lines; not branch, expression, function, or behavior coverage",
+    "No live Foundry world or Codecov upload",
+    "Snapshot only; retain original sealed evidence for validation/re-reporting"
+  ]
+}
