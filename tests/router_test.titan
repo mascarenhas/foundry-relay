@@ -1,7 +1,7 @@
 local router = import "relay.router"
 local test = import "test"
 local json = import "json"
-local strings = import "string"
+local string = import "string"
 
 function test_parameter_routes(_context: test.Context)
   local routes = router.Router({router.Route("GET", "/api/worlds/:world/actors/:id", "actor")})
@@ -43,7 +43,7 @@ function test_not_found_and_method_not_allowed(_context: test.Context)
 end
 
 function test_query_values_preserve_duplicates(_context: test.Context)
-  local parsed = router.parse_target("/relay?world=Polis+Sector&tag=a&tag=b&empty=&flag&data=a%3Db%26c")
+  local parsed = router.parse_target("/relay?&world=Polis+Sector&tag=a&&tag=b&empty=&flag&data=a%3Db%26c&")
   test.assert(parsed.path == "/relay")
   test.assert(parsed.query["world"] == "Polis Sector")
   test.assert(parsed.query["tag"] == "a")
@@ -51,6 +51,25 @@ function test_query_values_preserve_duplicates(_context: test.Context)
   test.assert(parsed.query_values["tag"][2] == "b")
   test.assert(parsed.query["empty"] == "" and parsed.query["flag"] == "")
   test.assert(parsed.query["data"] == "a=b&c")
+  test.assert(parsed.query[""] == nil, "empty query fields became a parameter")
+end
+
+function test_empty_query_fields_count_toward_limit(_context: test.Context)
+  local maximum = router.parse_target("/?tag=value" .. string.rep("&", 255))
+  test.assert(maximum.query["tag"] == "value", "256 query fields were rejected")
+  local routes = router.Router({router.Route("GET", "/", "root")})
+  local excess = routes:match("GET", "/?bad=%" .. string.rep("&", 256))
+  test.assert(excess.status == 400 and excess.error == "too many query parameters",
+              "empty fields did not count before query decoding")
+end
+
+function test_target_segments_preserve_empty_boundaries(_context: test.Context)
+  test.assert(#router.parse_target("/").segments == 0)
+  local parsed = router.parse_target("//first//last/")
+  test.assert(#parsed.segments == 5, "empty path segments disappeared")
+  test.assert(parsed.segments[1] == "" and parsed.segments[2] == "first" and
+              parsed.segments[3] == "" and parsed.segments[4] == "last" and
+              parsed.segments[5] == "", "empty path segment positions changed")
 end
 
 function test_decoding_distinguishes_path_plus(_context: test.Context)
@@ -77,8 +96,8 @@ function test_rejects_malformed_target(context: test.Context)
   malformed_case(context, "absolute_form", "http://example.com/")
   malformed_case(context, "fragment", "/#bad")
   malformed_case(context, "control", "/bad\n")
-  malformed_case(context, "target_limit", "/" .. strings.rep("a", 16384))
-  malformed_case(context, "query_limit", "/?" .. strings.rep("x=1&", 256) .. "x=1")
+  malformed_case(context, "target_limit", "/" .. string.rep("a", 16384))
+  malformed_case(context, "query_limit", "/?" .. string.rep("x=1&", 256) .. "x=1")
 end
 
 local function invalid_route_case(context: test.Context, name: string, pattern: string)
@@ -171,8 +190,8 @@ function test_route_parser_labeled_diagnostics(context: test.Context)
   diagnostic_case(context, "control", "/a\n", "control_character", 3)
   diagnostic_case(context, "duplicate_parameter", "/:id/:id", "duplicate_parameter", 6)
   diagnostic_case(context, "duplicate_wildcard", "/:wildcard/*", "duplicate_parameter", 12)
-  diagnostic_case(context, "route_byte_limit", "/" .. strings.rep("a", 1024), "route_limit", 1025)
-  diagnostic_case(context, "route_part_limit", "/" .. strings.rep("a/", 64) .. "a", "route_limit", 130)
+  diagnostic_case(context, "route_byte_limit", "/" .. string.rep("a", 1024), "route_limit", 1025)
+  diagnostic_case(context, "route_part_limit", "/" .. string.rep("a/", 64) .. "a", "route_limit", 130)
   diagnostic_case(context, "unicode_byte_position", "/🌑/*/tail", "wildcard_not_terminal", 8)
 end
 
@@ -210,10 +229,10 @@ function test_route_constructor_requires_method_and_action(context: test.Context
 end
 
 function test_route_limits_accept_their_boundaries(_context: test.Context)
-  local maximum_bytes = "/" .. strings.rep("a", 1023)
+  local maximum_bytes = "/" .. string.rep("a", 1023)
   local routes = router.Router({router.Route("GET", maximum_bytes, "maximum_bytes")})
   test.assert(routes:match("GET", maximum_bytes).status == 200)
-  local maximum_parts = "/" .. strings.rep("/", 63)
+  local maximum_parts = "/" .. string.rep("/", 63)
   local parts?, problem? = router.parse_route(maximum_parts)
   test.assert(problem == nil and #parts == 64)
   local separators = router.Router({router.Route("GET", maximum_parts, "maximum_parts")})

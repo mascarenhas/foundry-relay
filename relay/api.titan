@@ -1,7 +1,7 @@
 -- REST declarations adapt the reference Go relay's single-user protocol.
 local router = import "relay.router"
 local wire = import "relay.wire"
-local strings = import "string"
+local string = import "string"
 
 record Param
   const name: string
@@ -53,8 +53,7 @@ function endpoint_for(key: string): Endpoint?
 end
 
 local function Param:read(match: router.Match, body: {string: value}): (value, boolean)
-  for index = 1, #self.sources do
-    local source = strings.sub(self.sources, index, index)
+  for source in string.split(self.sources) do
     if source == "b" then
       local candidate? = body[self.name]
       if candidate ~= nil then return candidate, false end
@@ -78,7 +77,7 @@ local function Param:coerce(candidate: value, from_query: boolean): value
     if candidate == true or candidate == false then return candidate end
     if candidate is string then
       local text: string = candidate
-      text = strings.lower(text)
+      text = string.lower(text)
       if text == "true" then return true end
       if text == "false" then return false end
     end
@@ -136,7 +135,7 @@ local function validate(endpoint: Endpoint, payload: {string: value})
       raise "'path' and 'filename' are required"
     end
     local file_data = wire.text(payload, "fileData")
-    if strings.sub(file_data, 1, 5) ~= "data:" or not strings.find(file_data, ";base64,") then
+    if string.sub(file_data, 1, 5) ~= "data:" or not string.find(file_data, ";base64,") then
       raise "'fileData' must be a base64 data URL"
     end
   end
@@ -184,26 +183,26 @@ end
 local const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
 function encode_base64(source: string): string
-  local output = strings.writer()
+  local output = string.writer()
   local index = 1
   while index <= #source do
-    local first: integer = strings.byte(source, index)
+    local first: integer = string.byte(source, index)
     local second = 0
     local third = 0
-    if index + 1 <= #source then second = strings.byte(source, index + 1) end
-    if index + 2 <= #source then third = strings.byte(source, index + 2) end
-    output:write(strings.sub(alphabet, first // 4 + 1, first // 4 + 1))
+    if index + 1 <= #source then second = string.byte(source, index + 1) end
+    if index + 2 <= #source then third = string.byte(source, index + 2) end
+    output:write(string.sub(alphabet, first // 4 + 1, first // 4 + 1))
     local digit = (first % 4) * 16 + second // 16
-    output:write(strings.sub(alphabet, digit + 1, digit + 1))
+    output:write(string.sub(alphabet, digit + 1, digit + 1))
     if index + 1 <= #source then
       digit = (second % 16) * 4 + third // 64
-      output:write(strings.sub(alphabet, digit + 1, digit + 1))
+      output:write(string.sub(alphabet, digit + 1, digit + 1))
     else
       output:write("=")
     end
     if index + 2 <= #source then
       digit = third % 64
-      output:write(strings.sub(alphabet, digit + 1, digit + 1))
+      output:write(string.sub(alphabet, digit + 1, digit + 1))
     else
       output:write("=")
     end
@@ -213,7 +212,7 @@ function encode_base64(source: string): string
 end
 
 local function base64_digit(source: string, index: integer): integer
-  local byte: integer = strings.byte(source, index)
+  local byte: integer = string.byte(source, index)
   if byte >= 65 and byte <= 90 then return byte - 65 end
   if byte >= 97 and byte <= 122 then return byte - 71 end
   if byte >= 48 and byte <= 57 then return byte + 4 end
@@ -224,32 +223,32 @@ end
 
 function decode_base64(source: string): string
   local contents = source
-  if strings.sub(contents, 1, 5) == "data:" then
-    local marker? = strings.find(contents, ";base64,")
+  if string.sub(contents, 1, 5) == "data:" then
+    local marker? = string.find(contents, ";base64,")
     if not marker then raise "invalid base64 data URL" end
-    contents = strings.sub(contents, marker + 8)
+    contents = string.sub(contents, marker + 8)
   end
   if #contents % 4 ~= 0 then raise "invalid base64 length" end
-  local output = strings.writer()
+  local output = string.writer()
   local index = 1
   while index <= #contents do
     local a = base64_digit(contents, index)
     local b = base64_digit(contents, index + 1)
-    local c = strings.sub(contents, index + 2, index + 2)
-    local d = strings.sub(contents, index + 3, index + 3)
-    output:write(strings.char(a * 4 + b // 16))
+    local c = string.sub(contents, index + 2, index + 2)
+    local d = string.sub(contents, index + 3, index + 3)
+    output:write(string.char(a * 4 + b // 16))
     if c == "=" then
       if d ~= "=" or index + 3 ~= #contents or b % 16 ~= 0 then
         raise "invalid base64 padding"
       end
     else
       local third = base64_digit(contents, index + 2)
-      output:write(strings.char((b % 16) * 16 + third // 4))
+      output:write(string.char((b % 16) * 16 + third // 4))
       if d == "=" then
         if index + 3 ~= #contents or third % 4 ~= 0 then raise "invalid base64 padding" end
       else
         local fourth = base64_digit(contents, index + 3)
-        output:write(strings.char((third % 4) * 64 + fourth))
+        output:write(string.char((third % 4) * 64 + fourth))
       end
     end
     index = index + 4
@@ -258,25 +257,12 @@ function decode_base64(source: string): string
 end
 
 local function safe_header(source: string, fallback: string): string
-  for index = 1, #source do
-    local byte: integer = strings.byte(source, index)
-    if byte < 32 or byte > 126 then return fallback end
-  end
-  if source == "" then return fallback end
+  if source == "" or string.match(source, "[^ -~]") then return fallback end
   return source
 end
 
 local function quoted_filename(source: string): string
-  local output = strings.writer()
-  for index = 1, #source do
-    local byte: integer = strings.byte(source, index)
-    if byte < 32 or byte > 126 or byte == 34 or byte == 92 then
-      output:write("_")
-    else
-      output:write(strings.char(byte))
-    end
-  end
-  return output:drain()
+  return string.gsub(source, [=[[^ -~]|["\\]]=], function (_match) return "_" end)
 end
 
 function response(endpoint: Endpoint, result: {string: value}, format: string?): Reply
@@ -301,8 +287,8 @@ function response(endpoint: Endpoint, result: {string: value}, format: string?):
     content_type = safe_header(wire.text(result, "mimeType"), "image/png")
     local width = result["width"]
     local height = result["height"]
-    if width is float then headers["X-Image-Width"] = strings.tostring(width) end
-    if height is float then headers["X-Image-Height"] = strings.tostring(height) end
+    if width is float then headers["X-Image-Width"] = string.tostring(width) end
+    if height is float then headers["X-Image-Height"] = string.tostring(height) end
   end
   if encoded ~= "" then
     local binary = decode_base64(encoded)

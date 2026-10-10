@@ -6,7 +6,7 @@ local http = import "http"
 local websocket = import "websocket"
 local fs = import "fs"
 local os = import "os"
-local strings = import "string"
+local string = import "string"
 local server = import "relay.server"
 local config = import "relay.config"
 local hub = import "relay.hub.titan"
@@ -85,7 +85,7 @@ local function with_relay(body: function(Fixture): ())
 end
 
 local function read_all(reader: http.ClientResponse): string
-  local output = strings.writer()
+  local output = string.writer()
   for chunk in reader:read do output:write(chunk) end
   return output:drain()
 end
@@ -352,7 +352,7 @@ function test_pairing_code_supports_two_worlds_and_explicit_routing(_context: te
     local listing = get(fixture, "/clients")
     local clients: {value} = wire.decode(listing.body)
     test.assert(#clients == 2)
-    test.assert(not strings.find(listing.body, first_credentials.token), "client listing exposed pairing token")
+    test.assert(not string.find(listing.body, first_credentials.token), "client listing exposed pairing token")
     local pending = request(fixture, "/world-info?clientId=" .. second_credentials.id)
     defer hub.drain(pending)
     local incoming = message(second)
@@ -476,7 +476,7 @@ function test_large_json_round_trip_uses_fragmented_websocket_messages(_context:
   with_relay(function(fixture)
     local world = dial(fixture, pair(fixture, "world"))
     defer world:close()
-    local content = strings.rep("🌑 quoted\" slash\\ newline\n", 4096)
+    local content = string.rep("🌑 quoted\" slash\\ newline\n", 4096)
     local payload: {string: value} = {["content"] = content}
     local pending = async.run<|Reply, value|>(function (): Reply
       return call(fixture, "POST", "/chat", wire.encode(payload), api_key)
@@ -518,7 +518,7 @@ function test_sse_subscription_update_and_event_data(_context: test.Context)
     defer response:close()
     test.assert(response.status == 200 and response.headers:get("Content-Type") == "text/event-stream")
     local connected = response:read_until("\n\n", true)
-    test.assert(strings.sub(connected, 1, 17) == "event: connected\n")
+    test.assert(string.sub(connected, 1, 17) == "event: connected\n")
     local subscription = message(world)
     test.assert(wire.text(subscription, "type") == "event-subscription-update")
     test.assert(wire.text(subscription, "channel") == "chat-events")
@@ -527,10 +527,10 @@ function test_sse_subscription_update_and_event_data(_context: test.Context)
     local event: {string: value} = {["type"] = "chat-event", ["data"] = event_data}
     world:write(websocket.TEXT, wire.encode(event))
     local received = response:read_until("\n\n", true)
-    test.assert(strings.sub(received, 1, 19) == "event: chat-update\n")
-    local data_start? = strings.find(received, "data: ")
+    test.assert(string.sub(received, 1, 19) == "event: chat-update\n")
+    local data_start? = string.find(received, "data: ")
     test.assert(data_start ~= nil)
-    local decoded = wire.object(strings.sub(received, data_start + 6))
+    local decoded = wire.object(string.sub(received, data_start + 6))
     test.assert(wire.text(decoded, "id") == "mock-message")
     test.assert(wire.text(decoded, "content") == "line one\nline two")
     -- Finish the subscriber before releasing its HTTP stream; no idle write is needed.

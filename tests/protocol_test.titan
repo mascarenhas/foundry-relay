@@ -4,7 +4,7 @@ local config = import "relay.config"
 local hub = import "relay.hub.titan"
 local async = import "async"
 local timer = import "timer"
-local strings = import "string"
+local string = import "string"
 
 function test_nulls_and_nested_arrays_round_trip(_context: test.Context)
   local source = [[{"a":[1,null,null],"b":null,"c":{"d":null}}]]
@@ -77,7 +77,7 @@ function test_late_reply_stores_result_before_wait_registration(_context: test.C
 end
 
 function test_large_json_response_preserves_multibyte_text(_context: test.Context)
-  local text = strings.rep("世界🚀\n", 20000)
+  local text = string.rep("世界🚀\n", 20000)
   local object: {string: value} = { ["text"] = text }
   test.assert(wire.text(wire.object(wire.encode(object)), "text") == text)
 end

@@ -6,7 +6,7 @@ The server and tests are Titan. On POSIX, application modules and the Titan stan
 
 ## Build and test
 
-Use a prepared Titan installation containing `http`, `websocket`, `sqlite3`, `json`, and `peg`, including the HTTP `Response:abort()` API. This project was validated against Titan's `codex/foundry-relay-build-docs` branch, commit `4987078d`, stacked on the WebSocket implementation, on Linux x86_64 and the local Windows x64 VM.
+Use a prepared Titan installation containing `http`, `websocket`, `sqlite3`, `json`, and `peg`, including the HTTP `Response:abort()` API. [TITAN_REVISION](TITAN_REVISION) records the Titan commit selected for the production line-coverage workflow. Earlier Linux x86_64 and local Windows x64 validation used commit `4987078d`; those historical checks are recorded in [validation](docs/validation.md).
 
 ```sh
 export PATH=/path/to/titan-prefix/bin:$PATH
@@ -15,9 +15,34 @@ make test
 make test TEST_ARGS="--filter='^tests[.]integration_test'"
 ```
 
+The POSIX build defaults to `OPENSSL_MODE=system`, matching Titan's default SDK.
+Install OpenSSL 3.0 or newer development files and `pkg-config`; the build adds
+`pkg-config --cflags --libs openssl` to the corresponding compiler and linker
+inputs while preserving caller-supplied `TITAN_EXTRA_CPPFLAGS` and
+`TITAN_EXTRA_LDFLAGS`. Set `PKG_CONFIG=/path/to/pkg-config` if needed. The
+resulting executable embeds Titan's standard provider and uses the system
+OpenSSL libraries at runtime.
+
+When the installed Titan SDK was built with bundled OpenSSL, use
+`make OPENSSL_MODE=bundled` and `make test OPENSSL_MODE=bundled`. This mode uses
+the OpenSSL objects already carried by the SDK and does not invoke `pkg-config`.
+`OPENSSL_MODE` must match the installed SDK; it does not rebuild or reconfigure
+that SDK.
+
 `build/foundry-relay` is the server. `build/relay-tests` is one native `titan.test` runner containing routing, storage, API, protocol, integration, and executable tests. Build sources are staged separately under `build/app-src` and `build/test-src`: Titan generates C beside its source files, and test mode changes the standard-provider selection. Separate trees prevent builds from overwriting each other's objects.
 
+Each build recreates its staged source tree and compiles it afresh, so changing
+the SDK, compiler flags, OpenSSL mode, or source inventory takes effect on the
+next invocation. `make test` rebuilds both the application and test runner.
+
 The test runner's source-owned `titan.test` support makes its standard-provider imports use the installed image. `make test` sets `TITAN_PATH_0_6` from the compiler prefix; override `TITAN_STDLIB=/absolute/path/lib/titan/0.6` if needed. The production executable embeds the standard provider and needs no such setting. `TITANC=/absolute/path/bin/titanc` selects a compiler. On a restricted development host, set `CCACHE_DIR` to a writable location; `TITAN_PROBE_CACHE_DISABLE=1` is useful after a failed sandboxed native-header probe.
+
+`make coverage` runs the full Titan suite with native executable-line coverage,
+including the covered relay child launched by the process test. It combines
+both images' results across all eight production modules, retaining zero-hit
+lines. See [the coverage workflow](docs/coverage.md) for the prepared SDK,
+matching GCC/gcov, Python and gcovr requirements, separate build/run targets,
+and reports under `build/coverage-report`.
 
 ## Run
 

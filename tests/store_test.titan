@@ -1,7 +1,7 @@
 local test = import "test"
 local fs = import "fs"
 local os = import "os"
-local strings = import "string"
+local string = import "string"
 local async = import "async"
 local timer = import "timer"
 local store = import "relay.store.titan"
@@ -221,7 +221,7 @@ function test_secure_token_and_secret_comparison(_context: test.Context)
               "random token has the wrong byte length")
   test.assert(token ~= second, "independent OS random tokens unexpectedly repeated")
   for index = 1, #token do
-    local found? = strings.find("0123456789abcdef", strings.sub(token, index, index))
+    local found? = string.find("0123456789abcdef", string.sub(token, index, index))
     test.assert(found ~= nil, "random token is not lowercase hex")
   end
   test.assert(store.same_secret(token, token) and not store.same_secret(token, second) and

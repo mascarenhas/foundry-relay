@@ -1,5 +1,5 @@
 -- Declarative routes are checked at construction, and matched in declaration order.
-local strings = import "string"
+local string = import "string"
 local http = import "http"
 local json = import "json"
 local peg = import "peg"
@@ -76,21 +76,6 @@ record Router
   local const routes: {Route}
 end
 
-local function split(subject: string, delimiter: string): {string}
-  local result: {string} = {}
-  local first = 1
-  while true do
-    local at? = strings.find(subject, delimiter, first)
-    if not at then
-      result[#result + 1] = strings.sub(subject, first)
-      return result
-    end
-    result[#result + 1] = strings.sub(subject, first, at - 1)
-    first = at + #delimiter
-  end
-  return result
-end
-
 local function hex_digit(byte: integer): integer?
   if byte >= 48 and byte <= 57 then return byte - 48 end
   if byte >= 65 and byte <= 70 then return byte - 55 end
@@ -100,18 +85,18 @@ end
 
 -- Decode each path segment independently: an encoded slash stays within its segment.
 function percent_decode(subject: string, plus_as_space: boolean?): string
-  local result = strings.writer()
+  local result = string.writer()
   local index = 1
   while index <= #subject do
-    local byte: integer = strings.byte(subject, index)
+    local byte: integer = string.byte(subject, index)
     if byte == 37 then
       if index + 2 > #subject then raise "incomplete percent escape" end
-      local high? = hex_digit(strings.byte(subject, index + 1))
-      local low? = hex_digit(strings.byte(subject, index + 2))
+      local high? = hex_digit(string.byte(subject, index + 1))
+      local low? = hex_digit(string.byte(subject, index + 2))
       if high == nil or low == nil then raise "invalid percent escape" end
       local decoded = high * 16 + low
       if decoded == 0 then raise "NUL is not allowed in a request target" end
-      result:write(strings.char(decoded))
+      result:write(string.char(decoded))
       index = index + 3
     elseif plus_as_space and byte == 43 then
       result:write(" ")
@@ -120,7 +105,7 @@ function percent_decode(subject: string, plus_as_space: boolean?): string
       if byte == 0 or byte < 32 or byte == 127 then
         raise "control character in request target"
       end
-      result:write(strings.char(byte))
+      result:write(string.char(byte))
       index = index + 1
     end
   end
@@ -130,36 +115,36 @@ end
 -- Query maps expose the first value; query_values retains all occurrences in wire order.
 function parse_target(target: string): Target
   if #target > max_target_bytes then raise "request target is too long" end
-  if strings.sub(target, 1, 1) ~= "/" then raise "request target must begin with /" end
-  if strings.find(target, "#") then raise "request target cannot contain a fragment" end
-  local separator? = strings.find(target, "?")
+  if string.sub(target, 1, 1) ~= "/" then raise "request target must begin with /" end
+  if string.find(target, "#") then raise "request target cannot contain a fragment" end
+  local separator? = string.find(target, "?")
   local path = target
   local query_source = ""
   if separator then
-    path = strings.sub(target, 1, separator - 1)
-    query_source = strings.sub(target, separator + 1)
+    path = string.sub(target, 1, separator - 1)
+    query_source = string.sub(target, separator + 1)
   end
   local segments: {string} = {}
   if path ~= "/" then
-    local raw = split(strings.sub(path, 2), "/")
-    for index = 1, #raw do
-      segments[index] = percent_decode(raw[index])
+    for segment in string.split(string.sub(path, 2), "/") do
+      segments[#segments + 1] = percent_decode(segment)
     end
   end
   local query: {string: string} = {}
   local query_values: {string: {string}} = {}
   if query_source ~= "" then
-    local fields = split(query_source, "&")
+    local fields: {string} = {}
+    for field in string.split(query_source, "&") do fields[#fields + 1] = field end
     if #fields > max_query_fields then raise "too many query parameters" end
     for index = 1, #fields do
       local field = fields[index]
       if field ~= "" then
-        local equals? = strings.find(field, "=")
+        local equals? = string.find(field, "=")
         local key = field
         local contents = ""
         if equals then
-          key = strings.sub(field, 1, equals - 1)
-          contents = strings.sub(field, equals + 1)
+          key = string.sub(field, 1, equals - 1)
+          contents = string.sub(field, equals + 1)
         end
         key = percent_decode(key, true)
         contents = percent_decode(contents, true)
@@ -231,13 +216,13 @@ local function literal_matcher(text: string): peg.Pattern
   local decoded = percent_decode(text)
   local result = peg.succeed()
   for index = 1, #decoded do
-    local byte: integer = strings.byte(decoded, index)
-    local high = strings.sub(hex_alphabet, byte // 16 + 1, byte // 16 + 1)
-    local low = strings.sub(hex_alphabet, byte % 16 + 1, byte % 16 + 1)
-    local escaped = peg.sequence(peg.literal("%"), peg.set(high .. strings.lower(high)),
-      peg.set(low .. strings.lower(low)))
+    local byte: integer = string.byte(decoded, index)
+    local high = string.sub(hex_alphabet, byte // 16 + 1, byte // 16 + 1)
+    local low = string.sub(hex_alphabet, byte % 16 + 1, byte % 16 + 1)
+    local escaped = peg.sequence(peg.literal("%"), peg.set(high .. string.lower(high)),
+      peg.set(low .. string.lower(low)))
     local unit = escaped
-    if byte ~= 47 and byte ~= 37 then unit = peg.choice(peg.literal(strings.char(byte)), escaped) end
+    if byte ~= 47 and byte ~= 37 then unit = peg.choice(peg.literal(string.char(byte)), escaped) end
     result = peg.sequence(result, unit)
   end
   return result
@@ -330,7 +315,7 @@ function error_response(response: http.Response, status: integer, message: strin
 end
 
 function allow_header(methods: {string}): string
-  local result = strings.writer()
+  local result = string.writer()
   for index = 1, #methods do
     if index > 1 then result:write(", ") end
     result:write(methods[index])
