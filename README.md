@@ -37,9 +37,12 @@ next invocation. `make test` rebuilds both the application and test runner.
 
 The test runner's source-owned `titan.test` support makes its standard-provider imports use the installed image. `make test` sets `TITAN_PATH_0_6` from the compiler prefix; override `TITAN_STDLIB=/absolute/path/lib/titan/0.6` if needed. The production executable embeds the standard provider and needs no such setting. `TITANC=/absolute/path/bin/titanc` selects a compiler. On a restricted development host, set `CCACHE_DIR` to a writable location; `TITAN_PROBE_CACHE_DISABLE=1` is useful after a failed sandboxed native-header probe.
 
-For production executable-line coverage using the existing Titan test suite,
-see [the coverage workflow](docs/coverage.md). It retains all eight production
-modules and collects the test runner and relay executable separately.
+`make coverage` runs the full Titan suite with native executable-line coverage,
+including the covered relay child launched by the process test. It combines
+both images' results across all eight production modules, retaining zero-hit
+lines. See [the coverage workflow](docs/coverage.md) for the prepared SDK,
+matching GCC/gcov, Python and gcovr requirements, separate build/run targets,
+and reports under `build/coverage-report`.
 
 ## Run
 

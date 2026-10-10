@@ -1,13 +1,15 @@
 {
-  "version": 1,
+  "version": 2,
   "metric": "titan-executable-lines",
+  "collection": "direct-test-and-child-with-external-gcovr-merge",
   "application_production_revision": "47c6029c7b04ba01b2d785a39d34596b006dac5e",
-  "titan_revision": "8609cfb17a00e50a6b752009cf1ce9d52362f265",
-  "skills_revision": "df1e7837ab0869d98c853f252d6572a0cdde0503",
+  "application_workflow_parent": "c2b94a6f66e779b3ac33d569b4a382dedccf342a",
+  "titan_revision": "0bcdaeb8bc25bdd863cc39853f1af90ce178f503",
+  "skills_revision": "69f596353059a41c6402decc48a58402b99c434d",
   "lua_revision": "025bfc35df0885656de347fb7a7c377e90042a75",
   "platform": {
-    "machine": "x86_64",
-    "system": "Linux"
+    "system": "Linux",
+    "machine": "x86_64"
   },
   "sdk_profile": "validation",
   "toolchain": {
@@ -17,11 +19,16 @@
     "gcovr": "8.4",
     "system_openssl": "3.5.9"
   },
-  "complete": true,
-  "tests_passed": true,
+  "tests": {
+    "selected": 235,
+    "passed": 235,
+    "skipped": 0,
+    "public_cases": 81,
+    "unfiltered": true,
+    "repeated_direct_execution_passed": true
+  },
   "lines_covered": 1140,
   "lines_total": 1209,
-  "line_percent": 94.29280397022333,
   "sources": [
     {
       "file": "main.titan",
@@ -88,54 +95,47 @@
       "zero_lines": 0
     }
   ],
-  "runs": [
-    {
-      "version": 2,
-      "run_id": "b9295a5798f9442bb72c857e900f55fe",
-      "manifest_id": "9c962d703bb1e3b2fb0eb3abdc1fecb51ab66920f66cc71523024d885ce61877",
-      "started": "2026-10-09T08:21:30.849652+00:00",
-      "ended": "2026-10-09T08:21:36.325511+00:00",
-      "state": "complete",
-      "exit_status": 0,
-      "process_ownership": "posix-process-group-v1",
-      "process_group_empty_confirmed": true,
-      "group_retirement_requested": false,
-      "selected": 235,
-      "passed": 235,
-      "expected_public_cases": 81,
-      "counter_files": 8
-    },
-    {
-      "version": 2,
-      "run_id": "b3f4b50ebb5e4b34911f9b9da40bbff4",
-      "manifest_id": "987e781916d5644a83ec667e2b69de23668a51ceca52a9a6dcf35df6c8b2ef87",
-      "started": "2026-10-09T08:21:36.743607+00:00",
-      "ended": "2026-10-09T08:21:37.609877+00:00",
-      "state": "complete",
-      "exit_status": 0,
-      "process_ownership": "posix-process-group-v1",
-      "process_group_empty_confirmed": true,
-      "group_retirement_requested": false,
-      "selected": 1,
-      "passed": 1,
-      "expected_public_cases": 1,
-      "counter_files": 8
-    }
-  ],
+  "collection_details": {
+    "runner_production_lines_covered": 1096,
+    "child_production_lines_covered": 752,
+    "child_additional_covered_lines": 44,
+    "main_runner_lines_covered": 0,
+    "main_child_lines_covered": 15,
+    "zero_hit_lines": 69,
+    "sdk_test_support_excluded_from_combined_report": true
+  },
+  "comparison": {
+    "baseline_revision": "c2b94a6f66e779b3ac33d569b4a382dedccf342a",
+    "all_source_hashes_unchanged": true,
+    "all_executable_line_identities_and_covered_status_unchanged": true
+  },
   "evidence": {
-    "directory": "/tmp/foundry-coverage-8609cfb-ItqegQ/measurement-r1",
-    "sdk_provenance": "/tmp/foundry-coverage-8609cfb-ItqegQ/sdk-provenance.json",
-    "sdk_provenance_sha256": "5ae07b3b811f4bc7c3dda04b6d32c3b537d3f18375d6cf5051f6ecc47d44d3ac",
-    "summary_sha256": "14af28e87cc205088f128591767da952555e8a03325c7c6ee0d06f91aebe97b0",
-    "normalized_lines_sha256": "054712aa84dc95d47153b604e5ab8a393fce3bfb605725d6ba6a5194a5cb177b",
-    "lcov_sha256": "f8fc2ca061f5f270845a54a2da097529d585a01b76edbe9be21fba8b76a66850",
-    "helper_sha256": "09057e42b8a91bbe3262df30a32b5739c7393d1d5a829b146f15be3127a4be8e",
-    "compiler_files_verified_against_pin": 88
+    "directory": "build/coverage-report-0bcdaeb8",
+    "compiler_files_verified_against_pin": 82,
+    "sdk_provenance_sha256": "63428f6d9c4018ddd5319a8466ec97403cc423895f849b8d56a875039ce4cb91",
+    "normalized_lines_sha256": "b9f8c09c1f519f358a4f13f1bab59c667ec34b0f56a0029b236c1100492a14d7",
+    "lcov_sha256": "a0b7ced484c7918fb15d115be146e998b1a067be329797a3f350f2c0c3a170cc",
+    "helper_sha256": "ff345dfc6d2d925a3c2a2bf8acd11af9a3efdf504aa35971fc9ff1323826bb15"
   },
   "limitations": [
     "Linux x86_64 only; no Windows or macOS coverage",
-    "O0/no-LTO executable lines; not branch, expression, function, or behavior coverage",
-    "No live Foundry world or Codecov upload",
-    "Snapshot only; retain original sealed evidence for validation/re-reporting"
-  ]
+    "O0/no-LTO executable lines; not branch, expression, function, or behavior completeness",
+    "No live Foundry world, Codecov upload, or CI dispatch",
+    "Local report/provenance snapshot; rerunning requires rebuilding the covered images"
+  ],
+  "line_percent": 94.29280397022333,
+  "validation": {
+    "accepted_coverage_runs": 2,
+    "ordinary_tests_after_coverage": {
+      "selected": 235,
+      "passed": 235,
+      "skipped": 0,
+      "build_profile": "production"
+    },
+    "coverage_cleanup_before_ordinary_build": false,
+    "all_1163_sdk_files_unchanged": true,
+    "all_14_titan_sources_unchanged": true,
+    "independent_reviews_passed": 2,
+    "temporary_sdk_and_build_tree_removed": true
+  }
 }
