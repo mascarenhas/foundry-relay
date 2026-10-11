@@ -1,0 +1,38 @@
+local test = import "test"
+local store = import "relay.store"
+local foundry = import "relay.foundry_session"
+
+local function paired(id: string, world: string, origin: string): store.Client
+  return store.Client(id, "synthetic-token", world, "Test World", "fingerprint",
+    origin, "3.4.1", "{}", 0)
+end
+
+function test_existing_pairing_requires_world_and_origin(_context: test.Context)
+  local selected = foundry.existing_client({
+    paired("other-world", "other", "https://example.test"),
+    paired("other-origin", "sandbox", "https://other.test"),
+    paired("expected", "sandbox", "https://example.test") },
+    "sandbox", "https://example.test")
+  test.assert(selected.client_id == "expected")
+end
+
+function test_missing_pairing_is_not_created(_context: test.Context)
+  local rejected = false
+  do foundry.existing_client({}, "sandbox", "https://example.test")
+  catch
+    rejected = true
+    test.assert(error == "No existing pairing matches the spike world")
+  end
+  test.assert(rejected)
+end
+
+function test_ambiguous_pairing_is_rejected(_context: test.Context)
+  local rejected = false
+  do foundry.existing_client({paired("one", "sandbox", "https://example.test"),
+    paired("two", "sandbox", "https://example.test")}, "sandbox", "https://example.test")
+  catch
+    rejected = true
+    test.assert(error == "Multiple existing pairings match the spike world")
+  end
+  test.assert(rejected)
+end

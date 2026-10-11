@@ -1,0 +1,295 @@
+-- Owns one disposable Chrome profile and its process. Foundry URL, login,
+-- cookie, and pairing policy belong to the caller.
+local async = import "async"
+local fs = import "fs"
+local iteration = import "iteration"
+local os = import "os"
+local string = import "string"
+local timer = import "timer"
+local uv = import "uv"
+local websocket = import "websocket"
+local cdp = import "relay.cdp"
+local hub = import "relay.hub"
+
+local record Failure
+  const message: string
+end
+
+record Browser
+  local const directory: string
+  local process: os.Process?
+  local connection: cdp.Connection?
+  local debugging_endpoint: string?
+  local target_session: string
+  local output: async.Task<|nil, value|>?
+  local diagnostics: async.Task<|nil, value|>?
+  local retirement: async.Task<|async.Error?, value|>?
+  local closed: boolean
+end
+
+local function remove_profile(path: string)
+  local entry? = fs.lstat(path)
+  if not entry then return end
+  if entry.kind == "directory" then
+    for _, name in iteration.ipairs(fs.list(path)) do remove_profile(path .. "/" .. name) end
+    fs.rmdir(path)
+  else
+    -- In particular, unlink profile symlinks without traversing their targets.
+    fs.unlink(path)
+  end
+end
+
+local function new_profile(parent: string): string
+  local request = uv.fs_t()
+  defer uv.fs_req_cleanup(request)
+  if uv.fs_mkdtemp(nil, request, parent .. "/foundry-cdp-XXXXXX", nil) < 0 then
+    raise Failure("Browser profile creation failed")
+  end
+  local directory? = uv.fs_get_path(request)
+  if not directory then raise Failure("Browser profile creation failed") end
+  return directory
+end
+
+local function discard(stream: os.InputStream): nil
+  for _chunk in stream:read do end
+  return nil
+catch
+  -- Chrome diagnostics and page data must never become relay logs or errors.
+  return nil
+end
+
+local function remaining(deadline: integer): integer
+  local milliseconds = (deadline - uv.hrtime()) // 1000000
+  if milliseconds < 1 then raise Failure("Browser startup timed out") end
+  return milliseconds
+end
+
+local function endpoint(contents: string): string
+  local newline? = string.find(contents, "\n", 1)
+  if not newline or newline < 2 or newline > 6 then
+    raise Failure("Invalid browser debugging endpoint")
+  end
+  local port = 0
+  for index = 1, newline - 1 do
+    local digit: integer = string.byte(contents, index)
+    if digit < 48 or digit > 57 then raise Failure("Invalid browser debugging endpoint") end
+    port = port * 10 + digit - 48
+  end
+  if port < 1 or port > 65535 then raise Failure("Invalid browser debugging endpoint") end
+  local path = string.sub(contents, newline + 1)
+  if string.sub(path, -1) == "\n" then path = string.sub(path, 1, -2) end
+  local prefix = "/devtools/browser/"
+  if string.sub(path, 1, #prefix) ~= prefix or #path <= #prefix then
+    raise Failure("Invalid browser debugging endpoint")
+  end
+  for index = #prefix + 1, #path do
+    local byte: integer = string.byte(path, index)
+    local allowed = byte == 45
+    if byte >= 48 and byte <= 57 then allowed = true end
+    if byte >= 65 and byte <= 90 then allowed = true end
+    if byte >= 97 and byte <= 122 then allowed = true end
+    if not allowed then raise Failure("Invalid browser debugging endpoint") end
+  end
+  return "ws://127.0.0.1:" .. port .. path
+end
+
+local function Browser:initialize(executable: string, headless: boolean, deadline: integer)
+  local args = {
+    "--user-data-dir=" .. self.directory,
+    "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
+    "--no-first-run", "--no-default-browser-check", "about:blank" }
+  if headless then args[#args + 1] = "--headless=new" end
+  -- Retain desktop/DBus integration while withholding relay REST secrets.
+  -- SpawnOption overrides cannot remove variables; empty values are used.
+  self.process = os.spawn(executable, args,
+    os.with_env("FOUNDRY_REST_API_KEY", ""), os.with_env("FOUNDRY_PAIRING_CODE", ""))
+  if self.process.stdin then self.process.stdin:close() end
+  self.output = async.run<|nil, value|>(function (): nil return discard(self.process.stdout) end)
+  self.diagnostics = async.run<|nil, value|>(function (): nil return discard(self.process.stderr) end)
+  local address = self.directory .. "/DevToolsActivePort"
+  local location: string? = nil
+  while not location do
+    remaining(deadline)
+    if not self.process:is_running() then raise Failure("Browser exited during startup") end
+    local file? = fs.lstat(address)
+    if file then
+      if file.kind ~= "file" or file.size > 1024 then
+        raise Failure("Invalid browser debugging endpoint")
+      end
+      location = endpoint(fs.read_file(address))
+    else
+      timer.sleep(20)
+    end
+  end
+  self.debugging_endpoint = location
+  self.connection = cdp.Connection(websocket.connect(location,
+    websocket.DialOptions { handshake_timeout = remaining(deadline) }))
+  -- An owned off-the-record context keeps cookies and page storage in memory.
+  -- It also avoids waiting for the desktop key store to open a persistent
+  -- cookie database, without changing Chrome's encryption configuration.
+  local context = self.connection:call("Target.createBrowserContext",
+    {["disposeOnDetach"] = true}, nil, remaining(deadline))
+  if not (context["browserContextId"] is string) or context["browserContextId"] == "" then
+    raise Failure("Invalid browser context")
+  end
+  local context_id: string = context["browserContextId"]
+  local target = self.connection:call("Target.createTarget",
+    {["url"] = "about:blank", ["browserContextId"] = context_id}, nil,
+    remaining(deadline))
+  if not (target["targetId"] is string) or target["targetId"] == "" then
+    raise Failure("Invalid browser target")
+  end
+  local attached = self.connection:call("Target.attachToTarget",
+    {["targetId"] = target["targetId"], ["flatten"] = true}, nil, remaining(deadline))
+  if not (attached["sessionId"] is string) or attached["sessionId"] == "" then
+    raise Failure("Invalid browser session")
+  end
+  self.target_session = attached["sessionId"]
+  -- Activate page instrumentation before callers register navigation preloads.
+  -- Chrome can accept addScriptToEvaluateOnNewDocument without activating it.
+  self.connection:call("Page.enable", {}, self.target_session, remaining(deadline))
+end
+
+local function signal(process: os.Process, name: string)
+  if not process:is_running() then return end
+  do process:kill(name)
+  catch
+    if process:is_running() then raise "Browser process signaling failed" end
+  end
+end
+
+local function cleanup_stage(action: function (): ()): boolean
+  action()
+  return true
+catch
+  return false
+end
+
+local function Browser:retire(): async.Error?
+  local failed = false
+  local requested_exit = false
+  if self.connection then
+    -- An idle transport can request graceful exit. A busy or disconnected
+    -- transport fails immediately or at this short command deadline.
+    requested_exit = cleanup_stage(function () self.connection:call("Browser.close", {}, nil, 250) end)
+    if not cleanup_stage(function () self.connection:abort() end) then failed = true end
+  end
+  if not requested_exit and self.debugging_endpoint then
+    -- Retain only the endpoint read from this owned private profile. A fresh
+    -- browser-level transport can still request exit after a timed-out command
+    -- has aborted the original transport, including through a Flatpak launcher.
+    requested_exit = cleanup_stage(function ()
+      local recovery = cdp.Connection(websocket.connect(self.debugging_endpoint,
+        websocket.DialOptions { handshake_timeout = 500 }))
+      defer recovery:close()
+      recovery:call("Browser.close", {}, nil, 250)
+    end)
+  end
+  if self.process then
+    if requested_exit then
+      -- Give the browser and its launcher time to flush and exit naturally.
+      -- Immediately signaling a Flatpak launcher can interrupt that shutdown
+      -- while Chrome still writes to its disposable profile.
+      if not cleanup_stage(function ()
+        local deadline = uv.hrtime() + 2000000000
+        while self.process:is_running() and uv.hrtime() < deadline do timer.sleep(20) end
+      end) then failed = true end
+    end
+    local escalation = async.run<|nil, value|>(function (): nil
+      timer.sleep(500)
+      if not cleanup_stage(function () signal(self.process, "kill") end) then failed = true end
+      return nil
+    end)
+    defer hub.drain(escalation)
+    if not cleanup_stage(function () signal(self.process, "term") end) then failed = true end
+    if not cleanup_stage(function () self.process:wait() end) then
+      failed = true
+      -- A failed wait must not suppress the remaining termination attempt.
+      cleanup_stage(function () signal(self.process, "kill"); self.process:wait() end)
+    end
+    if not cleanup_stage(function () if self.process.stdin then self.process.stdin:close() end end) then failed = true end
+    if not cleanup_stage(function () if self.process.stdout then self.process.stdout:close() end end) then failed = true end
+    if not cleanup_stage(function () if self.process.stderr then self.process.stderr:close() end end) then failed = true end
+  end
+  if not cleanup_stage(function () if self.output then hub.drain(self.output) end end) then failed = true end
+  if not cleanup_stage(function () if self.diagnostics then hub.drain(self.diagnostics) end end) then failed = true end
+  local retain_profile = false
+  if self.process and self.process:is_running() then retain_profile = true end
+  if self.debugging_endpoint and not requested_exit then retain_profile = true end
+  if retain_profile then
+    -- A reaped Flatpak launcher alone does not prove its Chrome instance has
+    -- exited. Without a confirmed browser-level exit request, retain the
+    -- profile and surface cleanup failure for explicit owned-instance recovery.
+    failed = true
+  elseif not cleanup_stage(function () remove_profile(self.directory) end) then failed = true
+  end
+  if failed then return async.Error("Browser cleanup failed", "") end
+  return nil
+catch
+  -- Never expose operating-system diagnostics containing profile or page data.
+  return async.Error("Browser cleanup failed", "")
+end
+
+function Browser:close()
+  if not self.retirement then
+    self.closed = true
+    -- This normal Task performs yielding cleanup even when the caller has
+    -- pending cancellation. It must be created before Runtime shutdown.
+    self.retirement = async.run<|async.Error?, value|>(function (): async.Error?
+      return self:retire()
+    end)
+  end
+  local remove: (function (): ())? = nil
+  defer if remove then remove() end
+  async.await_cleanup<|nil, nil|>(function (resolve, _reject, _fatal)
+    if self.retirement:status():has_finished() then resolve(nil)
+    else remove = self.retirement:add_terminal_listener(function (_status) resolve(nil) end)
+    end
+  end)
+  case self.retirement:status()
+  when succeeded(failure) then if failure then failure:raise() end
+  when failed(failure) then failure:raise()
+  else raise "Browser cleanup did not complete"
+  end
+end
+
+function Browser:cdp(): cdp.Connection
+  if self.closed or not self.connection then raise "Browser is closed" end
+  return self.connection
+end
+
+function Browser:session(): string
+  if self.closed or self.target_session == "" then raise "Browser is closed" end
+  return self.target_session
+end
+
+function Browser:profile(): string
+  return self.directory
+end
+
+function Browser:running(): boolean
+  return not self.closed and self.process ~= nil and self.process:is_running()
+end
+
+function start(executable: string, profile_parent: string, headless: boolean,
+               startup_timeout_ms: integer?): Browser
+  local timeout = startup_timeout_ms or 15000
+  if timeout < 1 then raise "Browser startup timeout must be positive" end
+  if executable == "" or profile_parent == "" then raise "Browser executable and profile parent are required" end
+  local parent = fs.realpath(profile_parent)
+  local browser = Browser { directory = new_profile(parent), process = nil, connection = nil,
+    debugging_endpoint = nil,
+    target_session = "", output = nil, diagnostics = nil, retirement = nil, closed = false }
+  local published = false
+  defer if not published then browser:close() end
+  browser:initialize(executable, headless, uv.hrtime() + timeout * 1000000)
+  published = true
+  return browser
+catch
+  if error == "Browser cleanup failed" then raise end
+  if error is Failure then
+    local failure: Failure = error
+    raise failure.message
+  end
+  raise "Browser startup failed"
+end

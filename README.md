@@ -1,8 +1,12 @@
 # Foundry relay in Titan
 
-A single-user REST-to-WebSocket relay for the Foundry VTT REST API module. It implements the core protocol of [ThreeHats' Go relay](https://github.com/ThreeHats/foundryvtt-rest-api-relay/tree/main/go-relay), with SQLite persistence and an environment API key. There is no dashboard, account system, billing, Redis, or headless browser service.
+A single-user REST-to-WebSocket relay for the Foundry VTT REST API module. It implements the core protocol of [ThreeHats' Go relay](https://github.com/ThreeHats/foundryvtt-rest-api-relay/tree/main/go-relay), with SQLite persistence and an environment API key. There is no dashboard, account system, billing, Redis, or session REST API.
 
 The server and tests are Titan. On POSIX, application modules and the Titan standard provider are linked into the native executable with `--static`. Windows uses an EXE launcher and application DLL with Titan DLL dependencies. The server does not invoke or depend on the Titan compiler at runtime.
+
+An opt-in [headless client spike](docs/headless-spike.md) builds a separate
+executable using native Titan CDP and a disposable Chrome context. Its guide
+records the build instructions, ownership model and current validation limits.
 
 ## Build and test
 
@@ -39,7 +43,7 @@ The test runner's source-owned `titan.test` support makes its standard-provider 
 
 `make coverage` runs the full Titan suite with native executable-line coverage,
 including the covered relay child launched by the process test. It combines
-both images' results across all eight production modules, retaining zero-hit
+both images' results across production modules, retaining zero-hit
 lines. See [the coverage workflow](docs/coverage.md) for the prepared SDK,
 matching GCC/gcov, Python and gcovr requirements, separate build/run targets,
 and reports under `build/coverage-report`.

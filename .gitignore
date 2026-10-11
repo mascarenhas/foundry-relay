@@ -5,6 +5,7 @@
 # Local credentials; example configuration files remain trackable.
 .env
 .env.*
+.world
 !.env.example
 !.env.*.example
 
@@ -14,6 +15,7 @@
 
 # Leftovers from source-tree compiler/test invocations.
 /main
+/headless
 /tests/*_test
 *.o
 *.ffi.h
