@@ -14,7 +14,7 @@ endif
 ROOT := $(abspath .)
 APP_SOURCES := $(wildcard relay/*.titan) main.titan
 SOURCES := $(APP_SOURCES) $(wildcard tests/*.titan)
-TEST_ROOTS := tests.router_test tests.store_test tests.api_test tests.protocol_test tests.integration_test tests.process_test tests.cdp_test tests.browser_test tests.spike_input_test tests.foundry_session_test
+TEST_ROOTS := tests.router_test tests.store_test tests.api_test tests.protocol_test tests.integration_test tests.process_test tests.cdp_test tests.browser_test tests.spike_input_test tests.foundry_session_test tests.session_crypto_test tests.sessions_test tests.session_http_test
 COVERAGE_GCOV ?= $(shell command -v gcov)
 COVERAGE_GCOVR ?= $(shell command -v gcovr)
 COVERAGE_FORMATS ?= html lcov cobertura
@@ -25,7 +25,7 @@ COVERAGE_RENDER = $(if $(filter html,$(COVERAGE_FORMATS)),--html-details build/c
 .PHONY: all test clean check-openssl build/foundry-relay build/relay-tests coverage coverage-build coverage-run headless build/foundry-relay-headless
 all: build/foundry-relay
 
-# Explicit opt-in spike; no browser or fixture dependency in the ordinary main.
+# Retained explicit spike harness; production sessions use the ordinary main.
 headless: build/foundry-relay-headless
 
 build/foundry-relay-headless: $(APP_SOURCES) headless.titan Makefile | check-openssl

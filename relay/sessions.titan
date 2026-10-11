@@ -1,0 +1,307 @@
+-- API-key authentication belongs to Server. This owner keeps handshakes and
+-- browsers in memory; neither passwords nor private keys enter SQLite.
+local async = import "async"
+local iteration = import "iteration"
+local math = import "math"
+local os = import "os"
+local timer = import "timer"
+local uv = import "uv"
+local config = import "relay.config"
+local crypto = import "relay.session_crypto"
+local foundry = import "relay.foundry_session"
+local input = import "relay.spike_input"
+local hub = import "relay.hub"
+local store = import "relay.store"
+local wire = import "relay.wire"
+
+record Error
+  const status: integer
+  const message: string
+end
+
+record Options
+  const executable: string
+  const profile_parent: string
+  const maximum: integer
+  const timeout_ms: integer
+end
+
+-- A narrow resource contract also lets native tests exercise cancellation and
+-- publication failures without starting Chrome or substituting Lua code.
+interface Client
+  metadata: {string: value}
+  function check(worlds: hub.Hub)
+  function close()
+end
+
+local record Handshake
+  const address: string
+  const origin: string
+  const user: string
+  const world: string
+  const nonce: string
+  const expires: integer
+end
+
+record Entry
+  const session_id: string
+  const client_id: string
+  local const address: string
+  local const user: string
+  local const world: string
+  local const started_at: integer
+  local activity: integer
+  local metadata: {string: value}
+  local state: string
+  local published: boolean
+  local entered: boolean
+  local waiter: async.Task?
+  local const wake: async.ResumeToken
+  local worker: async.Task<|nil, value|>?
+end
+
+record Manager
+  local const options: Options
+  local const database: store.Store
+  local const worlds: hub.Hub
+  local const relay_url: string
+  local const origins: {string}
+  local const launcher: function(foundry.Options, string, string, hub.Hub, integer): Client
+  local const instance_id: string
+  local key: crypto.Key?
+  local const handshakes: {string: Handshake}
+  local const entries: {string: Entry}
+  local const reservations: {string: Entry}
+  local closed: boolean
+end
+
+local function number(name: string, fallback: integer, maximum: integer): integer
+  local source? = os.getenv(name)
+  if not source then return fallback end
+  local n? = math.tointeger(source)
+  if not n or n < 1 or n > maximum then raise "Invalid headless session configuration" end
+  return n
+end
+
+function settings(): Options
+  return Options(os.getenv("RELAY_CHROME") or "", os.getenv("RELAY_BROWSER_PROFILES") or "build/browser-profiles",
+    number("RELAY_MAX_SESSIONS", 4, 64), number("RELAY_SESSION_TIMEOUT_MS", 120000, 600000))
+end
+
+function Manager.new(options: Options, database: store.Store, worlds: hub.Hub,
+                     relay_url: string, origins: {string},
+                     launcher: (function(foundry.Options, string, string, hub.Hub, integer): Client)?): Manager
+  if options.maximum < 1 or options.maximum > 64 or options.timeout_ms < 1 or
+     options.timeout_ms > 600000 then raise "Invalid headless session configuration" end
+  local key: crypto.Key? = nil
+  if options.executable ~= "" then key = crypto.generate() end
+  local transferred = false
+  defer if not transferred and key then key:close() end
+  local default_launcher = function(o: foundry.Options, e: string, p: string, h: hub.Hub, t: integer): Client
+    return foundry.start(o, e, p, h, t)
+  end
+  local result: Manager = {options = options, database = database, worlds = worlds,
+    relay_url = relay_url, origins = origins, launcher = launcher or default_launcher,
+    instance_id = store.secure_token(16), key = key, handshakes = {}, entries = {},
+    reservations = {}, closed = false}
+  transferred = true
+  return result
+end
+
+local function Manager:available()
+  if self.closed then raise Error(503, "Session manager is closed") end
+  if not self.key then raise Error(503, "Headless sessions are disabled; configure RELAY_CHROME") end
+end
+
+local function Manager:prune()
+  local now = uv.hrtime()
+  for token, handshake in iteration.pairs(self.handshakes) do
+    if handshake.expires <= now then self.handshakes[token] = nil end
+  end
+end
+
+function Manager:handshake(address: string, user: string, world: string): {string: value}
+  self:available()
+  if #address > 4096 or #user < 1 or #user > 256 or #world > 256 then
+    raise Error(400, "Invalid Foundry URL, username, or world")
+  end
+  -- Input normalizes the origin without interpreting credentials as code. A
+  -- missing world is resolved at start from exactly one existing pairing.
+  local parsed: input.Input? = nil
+  do parsed = input.Input(address, world ~= "" and world or "unspecified", user, "")
+  catch raise Error(400, "Invalid Foundry URL")
+  end
+  local allowed = false
+  for index = 1, #self.origins do if self.origins[index] == parsed.origin then allowed = true end end
+  if not allowed then raise Error(403, "Foundry origin is not allowed") end
+  self:prune()
+  local count = 0
+  for _token, _handshake in iteration.pairs(self.handshakes) do count = count + 1 end
+  if count >= 32 then raise Error(429, "Too many pending session handshakes") end
+  local token = store.secure_token()
+  local nonce = store.secure_token(16)
+  self.handshakes[token] = Handshake(address, parsed.origin, user, world, nonce, uv.hrtime() + 300000000000)
+  return {["token"] = token, ["publicKey"] = self.key.public_key, ["nonce"] = nonce,
+    ["instanceId"] = self.instance_id, ["foundryUrl"] = address, ["username"] = user,
+    ["expires"] = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time() + 300)}
+end
+
+local function Entry:notify()
+  if self.waiter then self.waiter:resume(self.wake) end
+end
+
+local function Manager:retire(entry: Entry, client: Client?)
+  if self.entries[entry.session_id] ~= entry then return end
+  local failed = entry.state == "cleanup-failed"
+  entry.state = "stopping"
+  if client then
+    do client:close()
+    catch failed = true
+    end
+  end
+  if failed then
+    -- Retain admission when retirement could not be proved. A failed cleanup
+    -- must not admit a second browser for the same world or hide the resource.
+    entry.state = "cleanup-failed"
+    os.stderr:write("Headless session cleanup failed; owned browser may require recovery\n")
+  else
+    entry.state = "stopped"
+    self.entries[entry.session_id] = nil
+    if self.reservations[entry.client_id] == entry then self.reservations[entry.client_id] = nil end
+  end
+  entry:notify()
+end
+
+function Manager:begin(data: {string: value}): Entry
+  self:available()
+  local token = wire.text(data, "handshakeToken")
+  local handshake? = self.handshakes[token]
+  -- Consume before decoding/decrypting, including every unsuccessful attempt.
+  self.handshakes[token] = nil
+  if not handshake or handshake.expires <= uv.hrtime() then raise Error(400, "Invalid or expired handshake token") end
+  local credentials: {string: value}? = nil
+  do credentials = wire.object(self.key:decrypt(wire.text(data, "encryptedPassword")))
+  catch raise Error(400, "Invalid encrypted credentials")
+  end
+  if not (credentials["password"] is string) or not (credentials["nonce"] is string) then
+    raise Error(400, "Invalid encrypted credentials")
+  end
+  if not config.secret_equal(credentials["nonce"], handshake.nonce) then raise Error(401, "Nonce mismatch") end
+  if data["captureBrowserConsole"] ~= nil and data["captureBrowserConsole"] ~= "" then
+    raise Error(400, "Browser console capture is not supported")
+  end
+  local world = wire.text(data, "worldName")
+  if world == "" then world = handshake.world end
+  if #world > 256 then raise Error(400, "Invalid world name") end
+  local selected: store.Client? = nil
+  local clients = self.database:list()
+  do selected = foundry.existing_client(clients, world, handshake.origin)
+  catch raise Error(400, "A unique existing pairing is required for this Foundry world and origin")
+  end
+  self:available() -- Store operations can suspend while shutdown begins.
+  if self.reservations[selected.client_id] or self.worlds:online(selected.client_id) then
+    raise Error(409, "The paired world already has an active or starting session")
+  end
+  local count = 0
+  for _id, _entry in iteration.pairs(self.entries) do count = count + 1 end
+  if count >= self.options.maximum then raise Error(429, "Headless session limit reached") end
+  local entry = Entry(store.secure_token(16), selected.client_id, handshake.address,
+    handshake.user, selected.world_id, os.time() * 1000, os.time() * 1000, {},
+    "starting", false, false, nil, async.ResumeToken("relay.sessions.ready"), nil)
+  -- Reserve synchronously before creating the controller or yielding again.
+  self.entries[entry.session_id] = entry
+  self.reservations[entry.client_id] = entry
+  local pending: foundry.Options? = foundry.Options(handshake.address, handshake.origin,
+    selected.world_id, handshake.user, credentials["password"], selected, self.relay_url)
+  entry.worker = async.run<|nil, value|>(function (): nil
+    entry.entered = true
+    local client: Client? = nil
+    defer self:retire(entry, client)
+    do
+      client = self.launcher(pending, self.options.executable, self.options.profile_parent,
+        self.worlds, self.options.timeout_ms)
+      pending = nil
+      if self.closed then return nil end
+      entry.metadata = client.metadata
+      entry.state = "active"
+      entry:notify()
+      while true do
+        timer.sleep(1000)
+        client:check(self.worlds)
+      end
+    catch
+      pending = nil
+      if error == "Browser cleanup failed" then entry.state = "cleanup-failed" end
+      return nil
+    end
+    return nil
+  end)
+  return entry
+end
+
+function Manager:ready(entry: Entry)
+  if entry.state == "starting" then
+    entry.waiter = async.running()
+    defer entry.waiter = nil
+    async.suspend(entry.wake)
+  end
+  if self.closed then raise Error(503, "Session manager is closed") end
+  if entry.state ~= "active" then raise Error(408, "Failed to start headless Foundry session") end
+end
+
+function Manager:publish(entry: Entry)
+  if self.closed or entry.state ~= "active" then raise Error(503, "Headless session is no longer active") end
+  entry.published = true
+end
+
+function Manager:discard(entry: Entry)
+  if entry.state == "stopped" then return end
+  if not entry.published then
+    entry.state = entry.state == "cleanup-failed" and "cleanup-failed" or "stopping"
+    if entry.worker then hub.drain(entry.worker) end
+    if not entry.entered then self:retire(entry, nil) end
+  end
+end
+
+function Manager:finish(id: string)
+  local entry? = self.entries[id]
+  if not entry then raise Error(404, "Session not found") end
+  if entry.state ~= "cleanup-failed" then entry.state = "stopping" end
+  if entry.worker then hub.drain(entry.worker) end
+  if not entry.entered then self:retire(entry, nil) end
+  if entry.state == "cleanup-failed" then raise Error(503, "Headless session cleanup failed") end
+end
+
+function Manager:list(): {string: value}
+  local active: {value} = {}
+  for _id, entry in iteration.pairs(self.entries) do
+    if entry.state == "active" and entry.published then
+      local item: {string: value} = {["sessionId"] = entry.session_id, ["clientId"] = entry.client_id,
+        ["foundryUrl"] = entry.address, ["username"] = entry.user, ["worldName"] = entry.world,
+        ["startedAt"] = entry.started_at, ["lastActivity"] = entry.activity}
+      for key, content in iteration.pairs(entry.metadata) do item[key] = content end
+      active[#active + 1] = item
+    end
+  end
+  return {["activeSessions"] = active}
+end
+
+function Manager:close()
+  if self.closed then return end
+  self.closed = true
+  for token, _handshake in iteration.pairs(self.handshakes) do self.handshakes[token] = nil end
+  local admitted: {Entry} = {}
+  for _id, entry in iteration.pairs(self.entries) do
+    admitted[#admitted + 1] = entry
+    if entry.worker then entry.worker:cancel() end
+  end
+  for index = 1, #admitted do
+    local worker? = admitted[index].worker
+    if worker then hub.drain(worker) end
+    if not admitted[index].entered then self:retire(admitted[index], nil) end
+  end
+  if self.key then self.key:close(); self.key = nil end
+  for index = 1, #admitted do
+    if admitted[index].state == "cleanup-failed" then raise Error(503, "Headless session cleanup failed") end
+  end
+end

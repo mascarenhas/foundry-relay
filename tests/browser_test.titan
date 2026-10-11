@@ -4,6 +4,7 @@ local fs = import "fs"
 local http = import "http"
 local iteration = import "iteration"
 local math = import "math"
+local net = import "net"
 local os = import "os"
 local string = import "string"
 local timer = import "timer"
@@ -12,6 +13,60 @@ local websocket = import "websocket"
 local browser = import "relay.browser.titan"
 local hub = import "relay.hub"
 local wire = import "relay.wire"
+
+local function debugging_listener_refused(port: integer): boolean
+  local probe = async.run<|boolean, value|>(function(): boolean
+    do
+      local connection = net.connect("127.0.0.1", port)
+      connection:close()
+      return false
+    catch
+      if error is async.OperationError then
+        local problem: async.OperationError = error
+        return problem.name == "ECONNREFUSED"
+      end
+      return false
+    end
+  end)
+  defer hub.drain(probe)
+  local deadline = async.run<|nil, value|>(function(): nil
+    timer.sleep(1000)
+    probe:cancel()
+    return nil
+  end)
+  defer hub.drain(deadline)
+  case async.join(probe)
+  when succeeded(refused) then return refused
+  else return false
+  end
+end
+
+function test_installed_chromium_owned_lifetime(context: test.Context)
+  local executable = os.getenv("RELAY_TEST_CHROME") or ""
+  local parent = os.getenv("RELAY_TEST_BROWSER_PROFILES") or ""
+  if executable == "" or parent == "" then
+    test.skip("capability: set RELAY_TEST_CHROME and RELAY_TEST_BROWSER_PROFILES for installed Chromium")
+  end
+  for index = 1, 2 do
+    context:run(index == 1 and "normal_close" or "aborted_transport_recovery", function(_child)
+      local instance = browser.start(executable, parent, true, 15000)
+      defer instance:close()
+      local profile = instance:profile()
+      local endpoint = fs.read_file(profile .. "/DevToolsActivePort")
+      local newline? = string.find(endpoint, "\n", 1)
+      test.assert(newline ~= nil)
+      local port? = math.tointeger(string.sub(endpoint, 1, newline - 1))
+      test.assert(port ~= nil)
+      test.assert(instance:running() and fs.lstat(profile) ~= nil)
+      test.assert(instance:cdp():evaluate("6 * 7", instance:session(), 5000) == 42)
+      if index == 2 then instance:cdp():abort() end
+      instance:close()
+      test.assert(not instance:running() and fs.lstat(profile) == nil,
+        "Installed Chromium retained its owned process or profile")
+      test.assert(debugging_listener_refused(port), "Installed Chromium retained its debugging listener")
+    end)
+  end
+end
 
 local record Fixture
   const directory: string

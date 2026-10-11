@@ -11,6 +11,7 @@ local server = import "relay.server"
 local config = import "relay.config"
 local hub = import "relay.hub.titan"
 local wire = import "relay.wire"
+local sessions = import "relay.sessions"
 
 local const api_key = "integration-api-key"
 local const pairing_code = "123ABC"
@@ -47,7 +48,7 @@ local function start(database: string, timeout: integer): Fixture
       database = database, public_url = "ws://127.0.0.1:" .. port .. "/relay",
       origins = {"http://127.0.0.1:30000"}, request_timeout = timeout,
       heartbeat = 60000, auth_timeout = 1000, max_pending = 16 }
-    local instance = server.Server(settings)
+    local instance = server.Server(settings, sessions.Options("", "/unused", 4, 120000))
     local failure: async.Error? = nil
     do
       -- DNS resolution can suspend before binding; await the public startup
@@ -566,5 +567,39 @@ function test_sse_client_disconnect_retires_subscription(_context: test.Context)
     local replacement = dial(fixture, credentials, counts)
     defer replacement:close()
     test.assert(counts["chat-events"] == 0, "reconnect retained the disconnected HTTP subscriber")
+  end)
+end
+
+function test_session_routes_share_rest_authentication(_context: test.Context)
+  with_relay(function(fixture)
+    test.assert(call(fixture, "POST", "/session-handshake").status == 401)
+    test.assert(call(fixture, "POST", "/start-session", "{}").status == 401)
+    test.assert(call(fixture, "DELETE", "/end-session?sessionId=missing").status == 401)
+    test.assert(call(fixture, "GET", "/session").status == 401)
+    local listed = get(fixture, "/session")
+    test.assert(listed.status == 200)
+    local data = wire.object(listed.body)
+    local active: {value} = data["activeSessions"]
+    test.assert(#active == 0)
+    test.assert(call(fixture, "DELETE", "/end-session", "{}", api_key).status == 400)
+    test.assert(call(fixture, "DELETE", "/end-session", "{\"sessionId\":\"missing\"}", api_key).status == 404)
+    local headers = http.headers({http.Header("x-api-key", api_key),
+      http.Header("x-foundry-url", "http://127.0.0.1:30000"), http.Header("x-username", "GM")})
+    local response = http.request("POST", "http://127.0.0.1:" .. fixture.port .. "/session-handshake", headers)
+    defer response:close()
+    test.assert(response.status == 503 and response.headers:get("Cache-Control") == "no-store")
+    read_all(response)
+  end)
+end
+
+function test_session_headers_are_allowed_by_cors(_context: test.Context)
+  with_relay(function(fixture)
+    local headers = http.headers({http.Header("Origin", "http://127.0.0.1:30000")})
+    local response = http.request("OPTIONS", "http://127.0.0.1:" .. fixture.port .. "/session-handshake", headers)
+    defer response:close()
+    test.assert(response.status == 204)
+    local allowed = response.headers:get("Access-Control-Allow-Headers") or ""
+    test.assert(string.find(allowed, "X-Foundry-Url") ~= nil)
+    test.assert(string.find(allowed, "X-Username") ~= nil and string.find(allowed, "X-World-Name") ~= nil)
   end)
 end

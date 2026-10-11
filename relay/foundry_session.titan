@@ -1,4 +1,4 @@
--- The spike's Foundry-specific policy; Browser/CDP have no world configuration.
+-- Foundry login and existing-pairing policy; caller inputs are ordinary data.
 local browser = import "relay.browser"
 local hub = import "relay.hub"
 local store = import "relay.store"
@@ -18,7 +18,9 @@ end
 
 record Session
   local const browser: browser.Browser
-  local const client_id: string
+  local const relay: hub.Session
+  const client_id: string
+  const metadata: {string: value}
 end
 
 function existing_client(clients: {store.Client}, world: string,
@@ -26,13 +28,48 @@ function existing_client(clients: {store.Client}, world: string,
   local selected: store.Client? = nil
   for index = 1, #clients do
     local client = clients[index]
-    if client.world_id == world and client.server_origin == origin then
-      if selected then raise "Multiple existing pairings match the spike world" end
+    if client.server_origin == origin and
+        (world == "" or client.world_id == world or client.world_title == world) then
+      if selected then raise "Multiple existing pairings match the Foundry world" end
       selected = client
     end
   end
-  if not selected then raise "No existing pairing matches the spike world" end
+  if not selected then raise "No existing pairing matches the Foundry world" end
   return selected
+end
+
+local function remaining(deadline: integer, maximum: integer): integer
+  local milliseconds = (deadline - uv.hrtime()) // 1000000
+  if milliseconds < 1 then raise "Foundry readiness timed out" end
+  if milliseconds > maximum then return maximum end
+  return milliseconds
+end
+
+local function session_metadata(response: hub.Reply, world: string): {string: value}
+  if response.status ~= 200 then raise "Foundry readiness request failed" end
+  local envelope = wire.object(response.body)
+  local payload? = envelope["data"]
+  if not (payload is {string: value}) then raise "Invalid Foundry world information" end
+  local data: {string: value} = payload
+  local world_data? = data["world"]
+  local system_data? = data["system"]
+  if not (world_data is {string: value}) or not (system_data is {string: value}) then
+    raise "Invalid Foundry world information"
+  end
+  local foundry_world: {string: value} = world_data
+  local system: {string: value} = system_data
+  if wire.text(foundry_world, "id") ~= world then raise "Foundry loaded a different world" end
+  -- Exclude modules, users, document contents, and protocol identifiers.
+  return { ["worldId"] = world, ["worldTitle"] = wire.text(foundry_world, "title"),
+    ["foundryVersion"] = wire.text(data, "foundryVersion"),
+    ["systemId"] = wire.text(system, "id"), ["systemTitle"] = wire.text(system, "title"),
+    ["systemVersion"] = wire.text(system, "version") }
+end
+
+local function owns_connection(worlds: hub.Hub, client_id: string,
+                               expected: hub.Session): boolean
+  local current?, _problem? = worlds:select(client_id)
+  return current == expected
 end
 
 -- Runs in each new document, only on the configured Foundry origin. It waits
@@ -87,7 +124,7 @@ local function binding_script(options: Options): string
   })()]=]
 end
 
-local function page_state(instance: browser.Browser): string
+local function page_state(instance: browser.Browser, timeout_ms: integer): string
   local value = instance:cdp():evaluate([=[(() => {
     const phase=globalThis.__titanFoundrySpike?.phase;
     if (phase === 'authenticated' &&
@@ -97,12 +134,12 @@ local function page_state(instance: browser.Browser): string
     if (document.querySelector('form[name="join"]')) return 'join';
     if (document.querySelector('form[name="auth"]')) return 'admin-login';
     return 'waiting';
-  })()]=], instance:session(), 5000)
+  })()]=], instance:session(), timeout_ms)
   if not (value is string) then raise "Invalid Foundry readiness response" end
   return value
 end
 
-local function login(instance: browser.Browser, options: Options)
+local function login(instance: browser.Browser, options: Options, timeout_ms: integer)
   local credentials: {string: value} = {
     ["origin"] = options.origin, ["user"] = options.user, ["password"] = options.password }
   local accepted = instance:cdp():evaluate("(() => { const cfg=" .. wire.encode(credentials) .. [=[;
@@ -116,38 +153,50 @@ local function login(instance: browser.Browser, options: Options)
     user.dispatchEvent(new Event('input',{bubbles:true}));
     password.dispatchEvent(new Event('input',{bubbles:true}));
     form.requestSubmit(button); return true;
-  })()]=], instance:session(), 5000)
+  })()]=], instance:session(), timeout_ms)
   if accepted ~= true then raise "Foundry login form is unavailable" end
 end
 
 function start(options: Options, executable: string, profile_parent: string,
                worlds: hub.Hub, timeout_ms: integer?): Session
+  local timeout = timeout_ms or 120000
+  if timeout < 1 or timeout > 2147483647 then raise "Invalid Foundry startup timeout" end
+  local deadline = uv.hrtime() + timeout * 1000000
   if worlds:online(options.client.client_id) then
     raise "The paired world already has an active relay client"
   end
-  local instance = browser.start(executable, profile_parent, true, 15000)
+  local instance = browser.start(executable, profile_parent, true, remaining(deadline, 15000))
   local published = false
   defer if not published then instance:close() end
   local protocol = instance:cdp()
   local attached = instance:session()
   protocol:call("Page.addScriptToEvaluateOnNewDocument",
-    {["source"] = binding_script(options)}, attached)
-  protocol:call("Page.navigate", {["url"] = options.address}, attached, 45000)
-  local deadline = uv.hrtime() + (timeout_ms or 120000) * 1000000
+    {["source"] = binding_script(options)}, attached, remaining(deadline, 10000))
+  if worlds:online(options.client.client_id) then
+    raise "The paired world already has an active relay client"
+  end
+  protocol:call("Page.navigate", {["url"] = options.address}, attached, remaining(deadline, 45000))
   local submitted = false
   while uv.hrtime() < deadline do
     if not instance:running() then raise "Headless browser exited" end
-    local phase = page_state(instance)
+    local phase = page_state(instance, remaining(deadline, 5000))
     if phase == "authenticated" and worlds:online(options.client.client_id) then
       local relay?, _problem? = worlds:select(options.client.client_id)
       if relay then
-        local response = relay:request("world-info", {}, 10000)
-        if response.status ~= 200 then raise "Foundry readiness request failed" end
+        local response = relay:request("world-info", {}, remaining(deadline, 10000))
+        local metadata = session_metadata(response, options.world)
+        if page_state(instance, remaining(deadline, 5000)) ~= "authenticated" or
+            not owns_connection(worlds, options.client.client_id, relay) then
+          raise "Headless Foundry session disconnected"
+        end
+        remaining(deadline, 1)
         published = true
-        return Session(instance, options.client.client_id)
+        return Session(instance, relay, options.client.client_id, metadata)
       end
     elseif phase == "join" then
-      if not submitted then login(instance, options); submitted = true end
+      if not submitted then
+        login(instance, options, remaining(deadline, 5000)); submitted = true
+      end
     elseif phase ~= "waiting" and phase ~= "bound" and phase ~= "authenticated" then
       -- Only our finite phase names leave the page; no DOM or console data.
       if phase == "pairing-mismatch" then raise "Foundry pairing settings do not match" end
@@ -155,14 +204,14 @@ function start(options: Options, executable: string, profile_parent: string,
       if phase == "wrong-user" then raise "Foundry user is not the configured full GM" end
       raise "Foundry requires setup or an active REST API module"
     end
-    timer.sleep(100)
+    timer.sleep(remaining(deadline, 100))
   end
   raise "Foundry readiness timed out"
 end
 
 function Session:check(worlds: hub.Hub)
-  if not self.browser:running() or not worlds:online(self.client_id) or
-     page_state(self.browser) ~= "authenticated" then
+  if not self.browser:running() or page_state(self.browser, 5000) ~= "authenticated" or
+     not owns_connection(worlds, self.client_id, self.relay) then
     raise "Headless Foundry session disconnected"
   end
 end

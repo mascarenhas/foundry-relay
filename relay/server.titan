@@ -11,12 +11,15 @@ local router = import "relay.router"
 local store = import "relay.store"
 local hub = import "relay.hub"
 local api = import "relay.api"
+local sessions = import "relay.sessions"
+local foundry = import "relay.foundry_session"
 
 record Server
   const config: config.Config
   const worlds: hub.Hub
   local const database: store.Store
   local const routes: router.Router
+  local const headless: sessions.Manager
   local listener: http.Server?
   local closed: boolean
 end
@@ -42,7 +45,8 @@ local function json_body(request: http.Request): {string: value}
   return wire.object(source)
 end
 
-function Server.new(settings: config.Config): Server
+function Server.new(settings: config.Config, headless_options: sessions.Options?,
+    launcher: (function(foundry.Options, string, string, hub.Hub, integer): sessions.Client)?): Server
   local declarations = api.routes()
   local local_routes: {router.Route} = {
     router.Route("GET", "/health", "health"),
@@ -52,6 +56,10 @@ function Server.new(settings: config.Config): Server
     router.Route("GET", "/relay", "relay"),
     router.Route("GET", "/clients", "clients"),
     router.Route("DELETE", "/clients/:clientId", "forget"),
+    router.Route("POST", "/session-handshake", "session-handshake"),
+    router.Route("POST", "/start-session", "session-start"),
+    router.Route("DELETE", "/end-session", "session-end"),
+    router.Route("GET", "/session", "session-list"),
     router.Route("GET", "/chat/subscribe", "sse:chat-events"),
     router.Route("GET", "/rolls/subscribe", "sse:roll-events"),
     router.Route("GET", "/hooks/subscribe", "sse:hooks"),
@@ -60,8 +68,50 @@ function Server.new(settings: config.Config): Server
     router.Route("GET", "/scene/subscribe", "sse:scene-events") }
   -- Specific local routes precede the upstream route table.
   for i = 1, #declarations do local_routes[#local_routes + 1] = declarations[i] end
-  return { config = settings, worlds = hub.Hub(settings.max_pending, settings.heartbeat),
-    database = store.open(settings.database), routes = router.Router(local_routes), listener = nil, closed = false }
+  local worlds = hub.Hub(settings.max_pending, settings.heartbeat)
+  local database = store.open(settings.database)
+  local published = false
+  defer if not published then database:close(); worlds:close() end
+  local headless = sessions.Manager(headless_options or sessions.settings(), database, worlds,
+    settings.public_url, settings.origins, launcher)
+  local result: Server = { config = settings, worlds = worlds,
+    database = database, routes = router.Router(local_routes), headless = headless,
+    listener = nil, closed = false }
+  published = true
+  return result
+end
+
+local function single_header(request: http.Request, name: string, required: boolean): string
+  local values = request.headers:values(name)
+  if #values > 1 or (required and (#values ~= 1 or values[1] == "")) then
+    raise sessions.Error(400, "Invalid or missing session header")
+  end
+  return #values == 1 and values[1] or ""
+end
+
+local function Server:session_request(request: http.Request, response: http.Response, match: router.Match)
+  response:set_header("Cache-Control", "no-store")
+  if match.action == "session-handshake" then
+    local result = self.headless:handshake(single_header(request, "x-foundry-url", true),
+      single_header(request, "x-username", true), single_header(request, "x-world-name", false))
+    router.json_response(response, 200, wire.encode(result))
+  elseif match.action == "session-start" then
+    local entry = self.headless:begin(json_body(request))
+    defer self.headless:discard(entry)
+    self.headless:ready(entry)
+    local result: {string: value} = {["success"] = true, ["sessionId"] = entry.session_id,
+      ["clientId"] = entry.client_id}
+    router.json_response(response, 200, wire.encode(result))
+    self.headless:publish(entry)
+  elseif match.action == "session-end" then
+    local id = match.query["sessionId"] or ""
+    if id == "" then id = wire.text(json_body(request), "sessionId") end
+    if id == "" then raise sessions.Error(400, "sessionId is required") end
+    self.headless:finish(id)
+    router.json_response(response, 200, "{\"status\":\"ok\",\"message\":\"Session ended\"}")
+  else
+    router.json_response(response, 200, wire.encode(self.headless:list()))
+  end
 end
 
 local function Server:origin_allowed(request: http.Request): boolean
@@ -257,7 +307,7 @@ function Server:handle(request: http.Request, response: http.Response)
   end
   if request.method == "OPTIONS" then
     response:set_header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-    response:set_header("Access-Control-Allow-Headers", "Content-Type,X-API-Key")
+    response:set_header("Access-Control-Allow-Headers", "Content-Type,X-API-Key,X-Foundry-Url,X-Username,X-World-Name")
     response:set_status(204)
     return
   end
@@ -280,6 +330,7 @@ function Server:handle(request: http.Request, response: http.Response)
     return
   end
   if not self:authorized(request) then router.error_response(response, 401, "invalid API key"); return end
+  if string.sub(match.action, 1, 8) == "session-" then self:session_request(request, response, match); return end
   if match.action == "clients" then self:clients(response); return end
   if match.action == "forget" then
     local id = match.params["clientId"]
@@ -294,7 +345,11 @@ catch
   -- Validation failures are request-local; never serialize internal traces or
   -- credentials into HTTP errors. Network failures after commit close the stream.
   do
-    router.error_response(response, 400, "invalid request")
+    if error is sessions.Error then
+      local problem: sessions.Error = error
+      router.error_response(response, problem.status, problem.message)
+    else router.error_response(response, 400, "invalid request")
+    end
   catch
     response:abort()
   end
@@ -318,6 +373,9 @@ function Server:close()
   if self.closed then return end
   self.closed = true
   if self.listener then self.listener:close() end
-  self.worlds:close()
-  self.database:close()
+  -- Stop controllers before their Hub/Store dependencies. Accepted HTTP
+  -- handlers may still be waiting; the manager closes admission first.
+  defer self.database:close()
+  defer self.worlds:close()
+  self.headless:close()
 end

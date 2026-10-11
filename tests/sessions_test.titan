@@ -1,0 +1,343 @@
+local test = import "test"
+local async = import "async"
+local fs = import "fs"
+local timer = import "timer"
+local uv = import "uv"
+local sessions = import "relay.sessions.titan"
+local foundry = import "relay.foundry_session"
+local store = import "relay.store"
+local hub = import "relay.hub"
+local wire = import "relay.wire"
+local encryption = import "tests.session_crypto_test"
+
+local record Probe
+  started: integer
+  closed: integer
+  startup_ms: integer
+  cleanup_ms: integer
+  fail_start: boolean
+  fail_check: boolean
+  fail_cleanup: boolean
+end
+
+local record Fake
+  const probe: Probe
+  const metadata: {string: value}
+end
+
+function Fake:check(_worlds: hub.Hub)
+  if self.probe.fail_check then raise "private browser diagnostics" end
+end
+
+function Fake:close()
+  self.probe.closed = self.probe.closed + 1
+  -- Real clients shield yielding cleanup from controller cancellation.
+  local cleanup = async.run<|nil, value|>(function (): nil
+    timer.sleep(self.probe.cleanup_ms)
+    return nil
+  end)
+  local remove: (function(): ())? = nil
+  defer if remove then remove() end
+  async.await_cleanup<|nil, nil|>(function(resolve, _reject, _fatal)
+    if cleanup:status():has_finished() then resolve(nil)
+    else remove = cleanup:add_terminal_listener(function(_status) resolve(nil) end)
+    end
+  end)
+  if self.probe.fail_cleanup then raise "private cleanup diagnostic" end
+end
+
+local record Fixture
+  const database: store.Store
+  const path: string
+  const worlds: hub.Hub
+  const manager: sessions.Manager
+  const probe: Probe
+end
+
+local function fixture(maximum: integer?): Fixture
+  local path = fs.tmpname()
+  local database = store.open(path)
+  database:pair("sandbox", "Sandbox", "test-fingerprint", "https://example.test")
+  local worlds = hub.Hub(16, 60000)
+  local probe = Probe(0, 0, 5, 5, false, false, false)
+  local launch = function(options: foundry.Options, _executable: string, _parent: string,
+      _worlds: hub.Hub, _timeout: integer): sessions.Client
+    test.assert(options.world == "sandbox" and options.user == "GM")
+    local client = Fake(probe, {["worldId"] = "sandbox", ["worldTitle"] = "Sandbox"})
+    local transferred = false
+    defer if not transferred then client:close() end
+    probe.started = probe.started + 1
+    timer.sleep(probe.startup_ms)
+    if probe.fail_start then raise "private startup diagnostic" end
+    transferred = true
+    return client
+  end
+  local manager = sessions.Manager(sessions.Options("synthetic-Chrome", "/unused", maximum or 4, 1000),
+    database, worlds, "wss://relay.example.test/relay", {"https://example.test"}, launch)
+  return Fixture(database, path, worlds, manager, probe)
+end
+
+local function Fixture:close()
+  defer fs.unlink(self.path)
+  defer self.database:close()
+  defer self.worlds:close()
+  do self.manager:close()
+  catch
+    -- Only the dedicated fail-closed cleanup case deliberately leaves a
+    -- quarantined synthetic client. No native browser resource exists here.
+    test.assert(self.probe.fail_cleanup)
+  end
+end
+
+local function expect_error(operation: function(): (), status: integer)
+  local caught = false
+  do operation()
+  catch
+    caught = true
+    test.assert(error is sessions.Error, "unsanitized session failure")
+    local failure: sessions.Error = error
+    test.assert(failure.status == status, "wrong session status")
+  end
+  test.assert(caught, "session operation unexpectedly succeeded")
+end
+
+local function request(manager: sessions.Manager, password: string?, world: string?): {string: value}
+  local handshake = manager:handshake("https://example.test", "GM", world or "sandbox")
+  local credentials: {string: value} = {["password"] = password or "", ["nonce"] = handshake["nonce"]}
+  return {["handshakeToken"] = handshake["token"],
+    ["encryptedPassword"] = encryption.encrypt(handshake["publicKey"], wire.encode(credentials))}
+end
+
+local function count(manager: sessions.Manager): integer
+  local list = manager:list()
+  local active: {value} = list["activeSessions"]
+  return #active
+end
+
+function test_start_list_end_and_pairing_preservation(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  local original = fixture.database:list()[1]
+  local entry = fixture.manager:begin(request(fixture.manager, "unicode-密碼"))
+  test.assert(count(fixture.manager) == 0, "unpublished browser appeared in GET/session")
+  fixture.manager:ready(entry)
+  test.assert(count(fixture.manager) == 0)
+  fixture.manager:publish(entry)
+  local response = fixture.manager:list()
+  local active: {value} = response["activeSessions"]
+  local item: {string: value} = active[1]
+  test.assert(item["clientId"] == original.client_id and item["worldId"] == "sandbox")
+  test.assert(item["sessionId"] == entry.session_id and item["username"] == "GM")
+  test.assert(item["password"] == nil and item["token"] == nil and item["publicKey"] == nil)
+  test.assert((item["startedAt"] as integer) > 1000000000000)
+  fixture.manager:finish(entry.session_id)
+  test.assert(fixture.probe.closed == 1 and count(fixture.manager) == 0)
+  local unchanged = fixture.database:list()[1]
+  test.assert(unchanged.client_id == original.client_id and unchanged.token == original.token)
+  expect_error(function() fixture.manager:finish(entry.session_id) end, 404)
+end
+
+function test_single_use_even_after_invalid_ciphertext(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  local handshake = fixture.manager:handshake("https://example.test", "GM", "sandbox")
+  local data: {string: value} = {["handshakeToken"] = handshake["token"], ["encryptedPassword"] = "malformed"}
+  expect_error(function() fixture.manager:begin(data) end, 400)
+  expect_error(function() fixture.manager:begin(data) end, 400)
+  test.assert(fixture.probe.started == 0)
+end
+
+function test_nonce_and_credential_types_are_checked(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  for index = 1, 3 do
+    local handshake = fixture.manager:handshake("https://example.test", "GM", "sandbox")
+    local credentials: {string: value} = {["password"] = "", ["nonce"] = "wrong"}
+    if index == 2 then credentials["password"] = false; credentials["nonce"] = handshake["nonce"] end
+    if index == 3 then credentials["nonce"] = 42 end
+    local data: {string: value} = {["handshakeToken"] = handshake["token"],
+      ["encryptedPassword"] = encryption.encrypt(handshake["publicKey"], wire.encode(credentials))}
+    expect_error(function() fixture.manager:begin(data) end, index == 1 and 401 or 400)
+  end
+  test.assert(fixture.probe.started == 0)
+end
+
+function test_expiry_and_pending_bound(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  local handshake = fixture.manager:handshake("https://example.test", "GM", "sandbox")
+  local token: string = handshake["token"]
+  local original = fixture.manager.handshakes[token]
+  -- Explicit source access moves the clock boundary without a five-minute
+  -- sleep or a production test hook; expiry is still tested through begin.
+  fixture.manager.handshakes[token] = sessions.Handshake(original.address, original.origin,
+    original.user, original.world, original.nonce, uv.hrtime() - 1)
+  expect_error(function() fixture.manager:begin({["handshakeToken"] = token}) end, 400)
+  for _index = 1, 32 do fixture.manager:handshake("https://example.test", "GM", "sandbox") end
+  expect_error(function() fixture.manager:handshake("https://example.test", "GM", "sandbox") end, 429)
+end
+
+function test_origin_and_missing_pairing_validation(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  expect_error(function() fixture.manager:handshake("https://other.test", "GM", "sandbox") end, 403)
+  expect_error(function() fixture.manager:handshake("file:///tmp/world", "GM", "sandbox") end, 400)
+  expect_error(function() fixture.manager:handshake("https://example.test", "", "sandbox") end, 400)
+  expect_error(function() fixture.manager:begin(request(fixture.manager, "", "missing")) end, 400)
+  test.assert(fixture.probe.started == 0)
+end
+
+function test_reservation_prevents_simultaneous_starts(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  fixture.probe.startup_ms = 100
+  local first = fixture.manager:begin(request(fixture.manager))
+  expect_error(function() fixture.manager:begin(request(fixture.manager)) end, 409)
+  fixture.manager:ready(first)
+  fixture.manager:publish(first)
+  expect_error(function() fixture.manager:begin(request(fixture.manager)) end, 409)
+  fixture.manager:finish(first.session_id)
+  local next = fixture.manager:begin(request(fixture.manager))
+  fixture.manager:ready(next)
+  fixture.manager:discard(next)
+  test.assert(fixture.probe.started == 2 and fixture.probe.closed == 2)
+end
+
+function test_unpublished_result_retires_after_response_failure(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  local entry = fixture.manager:begin(request(fixture.manager))
+  fixture.manager:ready(entry)
+  -- Same discard boundary used by Server when writing the response raises.
+  fixture.manager:discard(entry)
+  test.assert(count(fixture.manager) == 0 and fixture.probe.closed == 1)
+end
+
+function test_request_cancellation_retires_starting_browser(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  fixture.probe.startup_ms = 5000
+  local entry = fixture.manager:begin(request(fixture.manager))
+  local waiting = async.run<|nil, value|>(function(): nil
+    defer fixture.manager:discard(entry)
+    fixture.manager:ready(entry)
+    fixture.manager:publish(entry)
+    return nil
+  end)
+  timer.sleep(10)
+  hub.drain(waiting)
+  test.assert(fixture.probe.closed == 1 and count(fixture.manager) == 0)
+  fixture.probe.startup_ms = 1
+  local next = fixture.manager:begin(request(fixture.manager))
+  fixture.manager:ready(next)
+  fixture.manager:discard(next)
+end
+
+function test_shutdown_drains_start_and_closes_admission(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  fixture.probe.startup_ms = 5000
+  local entry = fixture.manager:begin(request(fixture.manager))
+  timer.sleep(10)
+  fixture.manager:close()
+  test.assert(fixture.probe.closed == 1 and count(fixture.manager) == 0)
+  expect_error(function() fixture.manager:ready(entry) end, 503)
+  expect_error(function() fixture.manager:handshake("https://example.test", "GM", "sandbox") end, 503)
+end
+
+function test_failed_start_is_sanitized_and_releases_reservation(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  fixture.probe.fail_start = true
+  local entry = fixture.manager:begin(request(fixture.manager))
+  expect_error(function() fixture.manager:ready(entry) end, 408)
+  fixture.manager:discard(entry)
+  fixture.probe.fail_start = false
+  local next = fixture.manager:begin(request(fixture.manager))
+  fixture.manager:ready(next)
+  fixture.manager:discard(next)
+  test.assert(fixture.probe.closed == 2)
+end
+
+function test_cleanup_failure_quarantines_world(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  fixture.probe.fail_cleanup = true
+  local entry = fixture.manager:begin(request(fixture.manager))
+  fixture.manager:ready(entry)
+  fixture.manager:publish(entry)
+  expect_error(function() fixture.manager:finish(entry.session_id) end, 503)
+  test.assert(count(fixture.manager) == 0)
+  expect_error(function() fixture.manager:begin(request(fixture.manager)) end, 409)
+end
+
+function test_disconnected_browser_is_automatically_retired(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  local entry = fixture.manager:begin(request(fixture.manager))
+  fixture.manager:ready(entry)
+  fixture.manager:publish(entry)
+  fixture.probe.fail_check = true
+  timer.sleep(1100)
+  test.assert(count(fixture.manager) == 0 and fixture.probe.closed == 1)
+end
+
+function test_immediate_end_and_discard_release_queued_admission(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  local first = fixture.manager:begin(request(fixture.manager))
+  fixture.manager:finish(first.session_id)
+  local second = fixture.manager:begin(request(fixture.manager))
+  fixture.manager:discard(second)
+  local third = fixture.manager:begin(request(fixture.manager))
+  fixture.manager:ready(third)
+  fixture.manager:discard(third)
+  test.assert(count(fixture.manager) == 0)
+  test.assert(fixture.probe.started == fixture.probe.closed)
+end
+
+function test_empty_world_override_preserves_handshake_world(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  fixture.database:pair("other-world", "Other", "other", "https://example.test")
+  local data = request(fixture.manager)
+  data["worldName"] = ""
+  local entry = fixture.manager:begin(data)
+  fixture.manager:ready(entry)
+  fixture.manager:discard(entry)
+  test.assert(fixture.probe.closed == 1)
+end
+
+function test_capacity_counts_other_worlds_and_world_override(_context: test.Context)
+  local fixture = fixture(1)
+  defer fixture:close()
+  fixture.database:pair("other-world", "Other", "other", "https://example.test")
+  local first = fixture.manager:begin(request(fixture.manager))
+  fixture.manager:ready(first)
+  fixture.manager:publish(first)
+  local data = request(fixture.manager)
+  data["worldName"] = "other-world"
+  expect_error(function() fixture.manager:begin(data) end, 429)
+  fixture.manager:finish(first.session_id)
+  data = request(fixture.manager)
+  data["worldName"] = "other-world"
+  local second = fixture.manager:begin(data)
+  test.assert(second.world == "other-world")
+  fixture.manager:finish(second.session_id)
+  test.assert(fixture.probe.started == fixture.probe.closed)
+end
+
+function test_stale_unpublished_discard_cannot_release_successor(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  local first_data = request(fixture.manager)
+  local second_data = request(fixture.manager)
+  local third_data = request(fixture.manager)
+  local first = fixture.manager:begin(first_data)
+  fixture.manager:finish(first.session_id)
+  local second = fixture.manager:begin(second_data)
+  fixture.manager:discard(first)
+  expect_error(function() fixture.manager:begin(third_data) end, 409)
+  fixture.manager:ready(second)
+  fixture.manager:discard(second)
+end

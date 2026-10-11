@@ -7,11 +7,10 @@ owns Chrome, its temporary profile, output drains and shutdown. The Foundry
 session policy takes explicit options; it does not depend on a particular world
 or on a production configuration file.
 
-The ordinary `foundry-relay` entry point and its REST routes remain unchanged.
-This spike does **not** implement the upstream
-[session API](https://foundryrestapi.com/docs/api/session): its RSA handshake,
-encrypted start payload, session registry and HTTP lifecycle endpoints remain
-future work. A local fixture substitutes for caller-supplied session inputs
+The original spike uses a local fixture in place of caller-supplied inputs.
+The ordinary relay now implements the [session API](sessions.md), including
+the RSA handshake, encrypted start payload, registry, and HTTP lifecycle.
+This retained harness uses its explicit fixture inputs
 only during this experiment.
 
 ## Build and run

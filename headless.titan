@@ -1,4 +1,4 @@
--- Explicit local spike entry point. The ordinary relay executable is unchanged.
+-- Retained explicit spike harness; production sessions use the REST API.
 local async = import "async"
 local os = import "os"
 local timer = import "timer"
