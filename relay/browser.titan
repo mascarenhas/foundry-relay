@@ -93,6 +93,18 @@ local function endpoint(contents: string): string
   return "ws://127.0.0.1:" .. port .. path
 end
 
+local function read_endpoint(address: string): string?
+  return fs.read_file(address)
+catch
+  if error is async.OperationError then
+    local problem: async.OperationError = error
+    -- Chromium's Windows publisher can expose the file while holding its
+    -- exclusive write handle. Only that busy open means "not ready yet".
+    if problem.name == "EBUSY" and problem.operation == "fs.open" then return nil end
+  end
+  raise
+end
+
 local function Browser:initialize(executable: string, headless: boolean, deadline: integer)
   local args = {
     "--user-data-dir=" .. self.directory,
@@ -116,9 +128,13 @@ local function Browser:initialize(executable: string, headless: boolean, deadlin
       if file.kind ~= "file" or file.size > 1024 then
         raise Failure("Invalid browser debugging endpoint")
       end
-      location = endpoint(fs.read_file(address))
-    else
-      timer.sleep(20)
+      local contents? = read_endpoint(address)
+      if contents ~= nil then location = endpoint(contents) end
+    end
+    if not location then
+      local delay = remaining(deadline)
+      if delay > 20 then delay = 20 end
+      timer.sleep(delay)
     end
   end
   self.debugging_endpoint = location

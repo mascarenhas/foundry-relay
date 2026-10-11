@@ -526,3 +526,60 @@ function test_debug_endpoint_requires_local_browser_path(_context: test.Context)
   expect_failure(function () browser.endpoint("9222\n/devtools/browser/token?secret=value\n") end,
     "Invalid browser debugging endpoint")
 end
+
+function test_endpoint_read_preserves_unrelated_open_errors(_context: test.Context)
+  local address = fs.tmpname()
+  fs.unlink(address)
+  local caught = false
+  do
+    browser.read_endpoint(address)
+  catch
+    caught = true
+    test.assert(error is async.OperationError, "Endpoint read lost its native error")
+    local problem: async.OperationError = error
+    test.assert(problem.name == "ENOENT" and problem.operation == "fs.open",
+      "Endpoint read hid an unrelated open failure")
+  end
+  test.assert(caught, "Missing endpoint file was treated as a busy publisher")
+end
+
+local function close_descriptor(descriptor: integer)
+  local request = uv.fs_t()
+  defer uv.fs_req_cleanup(request)
+  test.assert(uv.fs_close(nil, request, descriptor) == 0, "Could not close endpoint writer")
+end
+
+function test_windows_endpoint_treats_exclusive_publisher_as_pending(_context: test.Context)
+  if os.getenv("OS") ~= "Windows_NT" then
+    test.skip("platform: exclusive Windows file sharing")
+  end
+  local address = fs.tmpname()
+  defer fs.unlink(address)
+  local contents = "9222\n/devtools/browser/owned-endpoint\n"
+  fs.write_file(address, contents)
+  local request = uv.fs_t()
+  defer uv.fs_req_cleanup(request)
+  test.assert(uv.FS_O_EXLOCK ~= nil and uv.FS_O_EXLOCK ~= 0,
+    "Windows exclusive sharing flag is unavailable")
+  local descriptor = uv.fs_open(nil, request, address,
+    uv.FS_O_WRONLY | uv.FS_O_EXLOCK, 384, nil)
+  test.assert(descriptor >= 0, "Could not acquire exclusive endpoint writer")
+  defer if descriptor >= 0 then close_descriptor(descriptor) end
+  test.assert(fs.lstat(address) ~= nil, "Exclusive publisher must expose the endpoint file")
+  local busy = false
+  do
+    fs.read_file(address)
+  catch
+    test.assert(error is async.OperationError, "Exclusive writer caused a non-native error")
+    local problem: async.OperationError = error
+    busy = problem.name == "EBUSY" and problem.operation == "fs.open"
+  end
+  test.assert(busy, "Fixture did not reproduce Chromium's busy endpoint open")
+  test.assert(browser.read_endpoint(address) == nil,
+    "Busy endpoint publisher was treated as a startup failure")
+  close_descriptor(descriptor)
+  descriptor = -1
+  local published? = browser.read_endpoint(address)
+  test.assert(published == contents, "Endpoint was not readable after publisher release")
+  test.assert(browser.endpoint(published) == "ws://127.0.0.1:9222/devtools/browser/owned-endpoint")
+end

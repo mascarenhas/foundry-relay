@@ -226,9 +226,10 @@ SQLite retains ordinary world pairings independently of this lifecycle.
 
 ## Validation boundaries
 
-The final Linux executable passed all four endpoints against a live HTTPS
+The Linux session implementation passed all four endpoints against a live HTTPS
 Foundry world, including read-only world requests, a fresh session after ending
-the first, and SIGTERM retirement. The native suite passed 326 cases, including
+the first, and SIGTERM retirement. After the Windows endpoint-file fix, the Linux
+native suite passed 327 cases with one Windows-only fixture skipped, including
 independent crypto interoperability, lifecycle races, loopback HTTP/CDP fixtures,
 and real Chrome retirement. See the [session validation record](session-validation.md)
 for the tested SDK, browser, platform boundaries, and Windows results.
