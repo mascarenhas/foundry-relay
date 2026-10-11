@@ -97,8 +97,8 @@ dependency.
 
 The final 30-file source archive is
 `7296b3e0bd7cd13d909bfff645ab28e536341b5110e17c04b28c738df9696d39`.
-Application/test translation units used `-O0`. The prepared standard provider
-remained unchanged at SHA256
+Application/test translation units used `-O0`. The reused prepared standard
+provider was verified before the fixed build at SHA256
 `f56df0c4e5a4734c7c4e459a8481e2a3fab2dedb3ea36e47a9d4dd97920bcbb1`.
 The independent crypto client was MSYS2 OpenSSL **3.6.5**; the application used
 the SDK's OpenSSL DLLs. Installed Edge was **154.0.4258.53**. These are
@@ -123,6 +123,15 @@ cases cover the surrounding startup and retirement behavior.
 
 The live Foundry REST experiment above ran on Linux; Windows validation used
 native HTTP/CDP fixtures and installed Edge lifecycle checks.
+
+The final per-run cleanup checks passed, but later SSH resets prevented an
+additional global VM rescan and confirmation that two original-source backup
+files were removed. Diagnostic source and generated payloads had already been
+restored/removed, and the negative-control tree was removed before the fixed
+build. The tested application/test payloads remain in the VM's owned
+`foundry-relay-session-api-20261011/source-fixed/build/windows` tree; the VM was
+left running. The sanitized local receipt is
+`build/windows-session-validation-20261011/final-fixed-receipt.json`.
 
 ## Independent review
 
