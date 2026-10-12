@@ -1,13 +1,22 @@
 # Run from an MSYS2 CLANG64 shell with a prepared native Windows Titan SDK.
+# Use a local NTFS checkout distinct from the Unix source/object tree.
 PREFIX ?= /c/Titan/sdk
-TITANC := $(abspath $(PREFIX))/bin/titanc.exe
+TITAN_LUA := $(abspath $(PREFIX))/bin/lua.exe
+TITAN_COMPILER := $(abspath $(PREFIX))/lib/luarocks/rocks-5.5/titan/0.6.0-1/bin/titanc
+TITANC = "$(TITAN_LUA)" "$(WINDOWS_PREFIX)/lib/luarocks/rocks-5.5/titan/0.6.0-1/bin/titanc"
 TITAN_JOBS := 1
 WINDOWS_ROOT := $(shell cygpath -m "$(abspath .)")
 WINDOWS_PREFIX := $(shell cygpath -m "$(abspath $(PREFIX))")
-APP_SOURCES := $(wildcard relay/*.titan) main.titan
-CORE_SOURCES := $(APP_SOURCES) $(wildcard tests/*.titan)
+APP_SOURCES := main.titan $(sort $(wildcard relay/*.titan))
+TEST_SOURCES := $(filter-out tests/process_test.titan,$(sort $(wildcard tests/*.titan)))
+SOURCES := $(APP_SOURCES) $(TEST_SOURCES)
+MODULES := $(SOURCES:.titan=)
+APP_OBJECTS := $(APP_SOURCES:.titan=.o)
+TEST_OBJECTS := $(filter-out main.o,$(SOURCES:.titan=.o))
 CORE_ROOTS := tests.router_test tests.store_test tests.api_test tests.protocol_test tests.integration_test tests.cdp_test tests.browser_test tests.foundry_session_test tests.session_crypto_test tests.sessions_test tests.session_http_test tests.log_test tests.logging_http_test
-RUNTIME_DLLS := lua-5.5.1.dll libuv-1.dll libllhttp-9.4.dll libsqlite3-0.dll libcrypto-3-x64.dll libssl-3-x64.dll
+RUNTIME_DLLS := lua55.dll libuv-1.dll libllhttp-9.4.dll libsqlite3-0.dll libcrypto-3-x64.dll libssl-3-x64.dll
+BUILD_FLAGS := --source-first --incremental
+BUILD_CONFIG := build/windows/config
 
 export CC := clang
 export AR := llvm-ar
@@ -18,40 +27,74 @@ export TITAN_ROCKS_ROOT := $(WINDOWS_PREFIX)
 export TITAN_RUNTIME_PREBUILT := 1
 export TITAN_PROBE_CACHE_DISABLE := 1
 export TITAN_PATH_0_6 := $(WINDOWS_PREFIX)/lib/titan/0.6
-export TITAN_EXTRA_CPPFLAGS := $(TITAN_EXTRA_CPPFLAGS) -DUSING_UV_SHARED=1 -I"$(WINDOWS_PREFIX)/include"
-export TITAN_EXTRA_LDFLAGS := $(TITAN_EXTRA_LDFLAGS) -Wl,--stack,8388608 -L"$(WINDOWS_PREFIX)/lib" -lcrypto
+export TITAN_EXTRA_CPPFLAGS := $(strip $(TITAN_EXTRA_CPPFLAGS) -DUSING_UV_SHARED=1 -I"$(WINDOWS_PREFIX)/include")
+export TITAN_EXTRA_LDFLAGS := $(strip $(TITAN_EXTRA_LDFLAGS) -Wl,--stack,8388608 -L"$(WINDOWS_PREFIX)/lib" -lcrypto)
 
-.PHONY: all core-test-build test clean require-clang64
-all: build/windows/app/bin/foundry-relay.exe
+include Makefile.modules
+
+SDK_LICENSES := $(wildcard $(PREFIX)/share/titan/LICENSE $(PREFIX)/share/titan/THIRD_PARTY_NOTICES.md $(PREFIX)/share/titan/LICENSES/*)
+SDK_INPUTS := $(wildcard $(TITAN_COMPILER) $(TITAN_LUA) $(addprefix $(PREFIX)/bin/,$(RUNTIME_DLLS)) $(PREFIX)/etc/titan/build-profile $(PREFIX)/lib/titan/0.6/* $(PREFIX)/lib/*.a $(PREFIX)/include/*.h $(PREFIX)/include/titan/*.h $(PREFIX)/include/openssl/*.h $(PREFIX)/src/lua-5.5.1/*.h $(PREFIX)/share/lua/5.5/titan-compiler/*.lua $(PREFIX)/share/lua/5.5/titan-compiler/*/*.lua $(PREFIX)/share/lua/5.5/c-parser/*.lua) $(SDK_LICENSES)
+TOOL_INPUTS := $(foreach tool,$(CC) $(AR) $(RANLIB) $(RC),$(shell command -v $(tool) 2>/dev/null))
+BUILD_INPUTS := Makefile.windows Makefile.modules $(BUILD_CONFIG) $(SDK_INPUTS) $(TOOL_INPUTS)
+shell_quote = '$(subst ','"'"',$(1))'
+APP_PAYLOAD := build/windows/app/bin/foundry-relay.exe build/windows/app/lib/titan/0.6/main.dll build/windows/app/lib/titan/0.6/titan.dll $(addprefix build/windows/app/bin/,$(RUNTIME_DLLS)) build/windows/app/THIRD_PARTY_NOTICES.md $(patsubst $(PREFIX)/share/titan/%,build/windows/app/licenses/%,$(SDK_LICENSES))
+TEST_PAYLOAD := build/windows/test/bin/relay-tests.exe build/windows/test/lib/titan/0.6/tests/router_test.dll build/windows/test/lib/titan/0.6/titan.dll $(addprefix build/windows/test/bin/,$(RUNTIME_DLLS))
+
+.DELETE_ON_ERROR:
+.PHONY: all core-test-build test clean require-clang64 FORCE
+all: $(APP_PAYLOAD)
 
 require-clang64:
 	test "$(MSYSTEM)" = CLANG64
-	test -f "$(TITANC)" -a -f "$(PREFIX)/lib/titan/0.6/titan.dll"
+	test -f "$(TITAN_LUA)" -a -f "$(TITAN_COMPILER)" -a -f "$(PREFIX)/lib/titan/0.6/titan.dll"
 
-build/windows/app/bin/foundry-relay.exe: $(APP_SOURCES) THIRD_PARTY_NOTICES.md Makefile.windows | require-clang64
-	mkdir -p build/windows/app-src/relay build/windows/app/bin build/windows/app/lib/titan/0.6
-	cp relay/*.titan build/windows/app-src/relay/
-	cp main.titan build/windows/app-src/
+FORCE:
+
+$(BUILD_CONFIG): FORCE | require-clang64
+	@mkdir -p build/windows
+	@printf '%s\n' $(call shell_quote,TITANC=$(TITANC)) $(call shell_quote,PREFIX=$(PREFIX)) \
+		$(call shell_quote,CC=$(CC)) $(call shell_quote,AR=$(AR)) \
+		$(call shell_quote,RANLIB=$(RANLIB)) $(call shell_quote,RC=$(RC)) \
+		$(call shell_quote,BUILD_FLAGS=$(BUILD_FLAGS)) $(call shell_quote,TITAN_BUILD_PROFILE=$(TITAN_BUILD_PROFILE)) \
+		$(call shell_quote,TITAN_EXTRA_CPPFLAGS=$(TITAN_EXTRA_CPPFLAGS)) \
+		$(call shell_quote,TITAN_EXTRA_CFLAGS=$(TITAN_EXTRA_CFLAGS)) \
+		$(call shell_quote,TITAN_EXTRA_LDFLAGS=$(TITAN_EXTRA_LDFLAGS)) \
+		$(call shell_quote,TITAN_NO_LINE_DIRECTIVES=$(TITAN_NO_LINE_DIRECTIVES)) \
+		$(call shell_quote,SOURCES=$(SOURCES)) $(call shell_quote,CORE_ROOTS=$(CORE_ROOTS)) \
+		$(call shell_quote,SDK_INPUTS=$(SDK_INPUTS)) $(call shell_quote,TOOL_INPUTS=$(TOOL_INPUTS)) > "$@.tmp"
+	@if test -r "$@" && cmp -s "$@.tmp" "$@"; then rm "$@.tmp"; else mv "$@.tmp" "$@"; fi
+
+# Both final images reuse these source-adjacent module objects in this NTFS tree.
+define module_rule
+$(1).o $(1).c $(1).ffi.h &: $(1).titan $$(BUILD_INPUTS) \
+	$$(foreach dependency,$$(MODULE_IMPORTS_$(1)),$$(dependency).o $$(dependency).ffi.h)
+	$$(TITANC) $$(BUILD_FLAGS) -j $$(TITAN_JOBS) \
+		$$(if $$(filter tests/%,$(1)),--test) -c $$(subst /,.,$(1))
+endef
+$(foreach module,$(MODULES),$(eval $(call module_rule,$(module))))
+
+$(APP_PAYLOAD) &: $(APP_OBJECTS) THIRD_PARTY_NOTICES.md $(BUILD_INPUTS)
+	mkdir -p build/windows/app/bin build/windows/app/lib/titan/0.6
 	set -e; for name in $(RUNTIME_DLLS); do cp "$(PREFIX)/bin/$$name" build/windows/app/bin/; done
 	cp "$(PREFIX)/lib/titan/0.6/titan.dll" build/windows/app/lib/titan/0.6/
 	cp THIRD_PARTY_NOTICES.md build/windows/app/
+	rm -rf build/windows/app/licenses
 	mkdir -p build/windows/app/licenses
 	cp "$(PREFIX)/share/titan/LICENSE" "$(PREFIX)/share/titan/THIRD_PARTY_NOTICES.md" build/windows/app/licenses/
 	cp -R "$(PREFIX)/share/titan/LICENSES" build/windows/app/licenses/
-	cd build/windows/app && "$(TITANC)" --incremental -j 1 --launcher-name foundry-relay --tree "$(WINDOWS_ROOT)/build/windows/app-src" main
+	cd build/windows/app && $(TITANC) $(BUILD_FLAGS) -j 1 --launcher-name foundry-relay --tree "$(WINDOWS_ROOT)" main
 
-core-test-build: build/windows/test/bin/relay-tests.exe
+core-test-build: $(TEST_PAYLOAD)
 
-build/windows/test/bin/relay-tests.exe: $(CORE_SOURCES) Makefile.windows | require-clang64
-	mkdir -p build/windows/test-src/relay build/windows/test-src/tests build/windows/test/bin build/windows/test/lib/titan/0.6
-	cp relay/*.titan build/windows/test-src/relay/
-	cp tests/*.titan build/windows/test-src/tests/
+$(TEST_PAYLOAD) &: $(TEST_OBJECTS) $(BUILD_INPUTS)
+	mkdir -p build/windows/test/bin build/windows/test/lib/titan/0.6
 	set -e; for name in $(RUNTIME_DLLS); do cp "$(PREFIX)/bin/$$name" build/windows/test/bin/; done
 	cp "$(PREFIX)/lib/titan/0.6/titan.dll" build/windows/test/lib/titan/0.6/
-	cd build/windows/test && "$(TITANC)" --incremental -j 1 --launcher-name relay-tests --test --tree "$(WINDOWS_ROOT)/build/windows/test-src" $(CORE_ROOTS)
+	cd build/windows/test && $(TITANC) $(BUILD_FLAGS) -j 1 --launcher-name relay-tests --test --tree "$(WINDOWS_ROOT)" $(CORE_ROOTS)
 
 test: all core-test-build
 	powershell.exe -NoProfile -NonInteractive -File "$(WINDOWS_ROOT)/scripts/check-windows.ps1" -Application "$(WINDOWS_ROOT)/build/windows/app" -TestPayload "$(WINDOWS_ROOT)/build/windows/test" -ReadObj "$$(cygpath -m "$$(command -v llvm-readobj)")"
 
 clean:
+	rm -f $(foreach module,$(MODULES),$(module).o $(module).c $(module).ffi.h $(module).titan.h)
 	rm -rf build/windows

@@ -39,7 +39,8 @@ make coverage CC=/usr/bin/gcc COVERAGE_GCOV=/usr/bin/gcov \
   COVERAGE_GCOVR=/tmp/foundry-coverage-tools/bin/gcovr
 ```
 
-Use `make coverage-build` to compile separately and `make coverage-run` to run
+Use `make coverage-check` to check the report's test-audit gate,
+`make coverage-build` to compile separately and `make coverage-run` to run
 the existing binaries and report without recompiling. Supply the same SDK and
 tool settings to both commands. `TITANC`, `TITAN_STDLIB`, `TITAN_JOBS` and
 `OPENSSL_MODE` work as for ordinary builds; `TITAN_JOBS` defaults to two.
@@ -62,9 +63,13 @@ The two covered executables and their sources are separate:
 | Relay child | `build/coverage-app-src` | `build/coverage-app-src/main` |
 
 Coverage-generated C, headers and objects live in `.coverage` subdirectories
-inside those stages. Ordinary application and test outputs remain under
-`build/app-src` and `build/test-src`; switching to an ordinary build requires no
-coverage artifact swap. Keep the covered stages at their original absolute
+inside those stages. Ordinary application and test links share the
+uninstrumented objects beside the authored sources; switching to an ordinary
+build requires no coverage artifact swap. Coverage retains two private source
+stages because the running runner and relay child reset and dump counters
+independently. Sharing their
+instrumented objects would also share `.gcda` paths and lose that ownership
+boundary. Keep the covered stages at their original absolute
 paths while executing them, and serialize coverage runs that share those paths.
 
 `coverage-run` always runs the complete suite, ignores `TEST_ARGS`, and clears
@@ -74,8 +79,15 @@ retains its notes, and dumps and reports after successful execution and cleanup.
 The process test launches the covered relay child, exercises startup and
 shutdown, waits for it to exit and joins its output reader. The test runner and
 child therefore collect in separate counter paths during one full suite run.
+For this covered child only, the process test accepts Titan's coverage summary,
+the exact expected report path and gcovr 8.4 progress lines on stdout. Its
+ordinary executable check continues to require empty stdout; application JSON
+logs remain on stderr in both modes.
 A failed test run stops the target before merging. The summary check also
-rejects empty selection, missing public cases, and skipped tests.
+rejects empty selection, missing public cases, and unexpected skips. On Linux,
+it permits exactly the Windows-exclusive-sharing case's platform skip; that
+case remains selected and present in the test log. Missing Chromium capability
+and every other skip still fail collection.
 
 Each image's native report is under its stage's `.coverage/report`. The small
 `scripts/coverage.py` helper checks the staged production sources against the
@@ -98,29 +110,50 @@ Both images measure this complete production inventory:
 ```text
 main
 relay.api
+relay.browser
+relay.cdp
 relay.config
+relay.foundry_session
 relay.hub
+relay.log
 relay.router
 relay.server
+relay.session_crypto
+relay.sessions
 relay.store
 relay.wire
 ```
 
 Titan automatically selects source imports without top-level `test_`
-functions. The full runner requests all six existing test owners and `main` as
+functions. The full runner requests all fourteen existing test owners and `main` as
 an additional source root. The first requested root remains `tests.router_test`,
 which owns the test executable's name. Including `main` retains its executable
 lines even though the test runner does not call the application's entry point;
 the real child supplies its standalone execution hits.
 
-The final report excludes test owners, synthetic support, SDK modules, compiler,
+The final report excludes test owners, SDK modules, compiler,
 Lua and native dependencies. Selection follows the source graph rather than
 scanning the repository. The normalization step checks the complete production
 inventory against `main.titan` and the relay sources, so a missing production
 module or zero-hit file cannot silently shrink the report. Merging sums counts
 by original source line and includes each executable line once in the total.
 
-## Result and limits
+## Incremental build verification
+
+Linux x86_64 validation with the pinned Titan `1f068186` SDK passed all 335
+applicable cases out of 336 selected, including installed Chromium lifecycle
+tests. The sole skip was the Windows-exclusive-sharing platform case. The
+combined current fourteen-file report covered **1,822 of 1,962 executable lines
+(92.86%)**. Both images had identical executable-line inventories.
+
+Coverage left all 28 ordinary module objects, both ordinary executables and the
+build configuration unchanged in bytes and modification times. The subsequent
+ordinary application/test build performed no compilation or linking. Authored
+Titan sources were unchanged by collection. The reports are under
+`build/coverage-report`; validation logs and summaries are under
+`build/incremental-validation`.
+
+## Historical baseline and limits
 
 The native collection run on Linux x86_64 passed **235/235 cases** across all
 six test owners and measured **1,140 of 1,209 executable lines (94.29%)**. The
@@ -147,9 +180,10 @@ sources remained unchanged.
 
 This run used Titan `0bcdaeb8` and skills pin `69f59635`. The
 [baseline snapshot](coverage-baseline.json) records the exact revisions,
-source hashes, tools and evidence. Individual native reports may include
-source-owned SDK test support; the combined report removes that support and
-retains exactly the eight production files above.
+source hashes, tools and evidence. That historical report predates the session
+API and leveled logging; its eight-file inventory and results remain recorded
+in the snapshot. Current collection uses the complete production inventory
+listed above and the ordinary compiled SDK test provider.
 
 The local HTML preview and validation evidence are retained under
 `build/coverage-report-0bcdaeb8`, including individual reports, counters, logs
