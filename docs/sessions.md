@@ -215,8 +215,10 @@ one-second clock resolution; currently both timestamps record admission, and
 Only published active sessions appear in this list.
 
 Ending a session cancels and awaits its controller, closes the owned browser,
-reaps its child, and removes its owned profile. Shutdown does the same before
-closing shared relay resources. Ordinary stop and failed startup preserve the
+reaps its child, removes its owned profile, and closes its captured relay
+connection. Pending requests on that connection return 503; a later replacement
+connection is preserved. Shutdown does the same before closing shared relay
+resources. Ordinary stop and failed startup preserve the
 existing pairing token. If retirement fails, the manager logs a static cleanup
 error and retains the reservation; ending that session returns 503 and another
 start for the same world remains blocked. Unknown session IDs return 404.

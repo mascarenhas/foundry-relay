@@ -1,13 +1,198 @@
 local test = import "test"
 local async = import "async"
 local fs = import "fs"
+local os = import "os"
 local uv = import "uv"
+local browser = import "relay.browser.titan"
 local store = import "relay.store"
 local foundry = import "relay.foundry_session.titan"
 local hub = import "relay.hub.titan"
 local wire = import "relay.wire"
 local browser_fixture = import "tests.browser_test.titan"
 local cdp_fixture = import "tests.cdp_test.titan"
+
+local record RelayFixture
+  const peer: cdp_fixture.Fixture
+  const session: hub.Session
+  local const release: function(boolean): ()
+  local const close_release: function(): ()
+  local closed: boolean
+end
+
+-- Keep the relay transport independent of browser cleanup. Only this channel
+-- releases its peer, so browser exit cannot accidentally satisfy the assertion.
+local function relay_fixture(worlds: hub.Hub): RelayFixture
+  local admit, admitted, close_admitted = async.channel<|hub.Session|>(1)
+  defer close_admitted()
+  local release, released, close_release = async.channel<|boolean|>(1)
+  local transferred = false
+  defer if not transferred then close_release() end
+  local peer = cdp_fixture.fixture(function(stream)
+    local session = hub.Session.new("retirement-world", stream, 8)
+    defer do session:close(); session.outbox:close() end
+    worlds.sessions[session.id] = session
+    admit(session)
+    released()
+  end)
+  defer if not transferred then peer:close() end
+  local session = admitted()
+  transferred = true
+  return RelayFixture(peer, session, release, close_release, false)
+end
+
+local function RelayFixture:close()
+  if self.closed then return end
+  self.closed = true
+  defer self.close_release()
+  defer self.peer:close()
+  self.release(true)
+  self.peer:finish_peer()
+end
+
+local function empty_browser(): browser.Browser
+  local directory = fs.tmpname()
+  fs.unlink(directory)
+  fs.mkdir(directory)
+  -- Exercise the real portable retirement/profile path without a child or CDP
+  -- owner. Process/CDP retirement also has an installed-Chromium case below.
+  return browser.Browser(directory, nil, nil, nil, "", nil, nil, nil, false)
+end
+
+local function pending_request(session: hub.Session): async.Task<|hub.Reply, value|>
+  local requesting = async.run<|hub.Reply, value|>(function(): hub.Reply
+    return session:request("world-info", {}, 60000)
+  end)
+  local transferred = false
+  defer if not transferred then hub.drain(requesting) end
+  -- Dequeuing the request synchronizes with its registered waiter, without a
+  -- timer or scheduler polling. No writer sends it to the held relay peer.
+  case session.outbox:next()
+  when item(_) then
+  else raise "Retirement fixture did not enqueue its pending request"
+  end
+  transferred = true
+  return requesting
+end
+
+local function assert_disconnected(requesting: async.Task<|hub.Reply, value|>)
+  case async.join(requesting)
+  when succeeded(reply) then
+    test.assert(reply.status == 503, "Retirement did not fail the pending relay request")
+  when failed(failure) then failure:raise()
+  else raise "Retirement cancelled the pending relay request"
+  end
+end
+
+local function assert_owned_relay_retirement(instance: browser.Browser)
+  local worlds = hub.Hub(8, 60000)
+  defer worlds:close()
+  local fixture = relay_fixture(worlds)
+  defer fixture:close()
+  local session_owner = foundry.Session(instance, fixture.session, fixture.session.id, {})
+  defer session_owner:close()
+  local requesting = pending_request(fixture.session)
+  defer hub.drain(requesting)
+  test.assert(worlds:online(fixture.session.id) and not fixture.peer.peer:status():has_finished())
+  session_owner:close()
+  test.assert(not worlds:online(fixture.session.id),
+    "Browser retirement left its independent relay session online")
+  test.assert(not fixture.peer.peer:status():has_finished(), "Relay peer was released by browser cleanup")
+  test.assert(not instance:running() and fs.lstat(instance:profile()) == nil,
+    "Relay retirement skipped browser cleanup")
+  assert_disconnected(requesting)
+end
+
+function test_session_close_retires_owned_relay_and_pending_request(_context: test.Context)
+  local instance = empty_browser()
+  defer instance:close()
+  assert_owned_relay_retirement(instance)
+end
+
+function test_session_close_retires_owned_relay_with_installed_chromium(_context: test.Context)
+  local executable = os.getenv("RELAY_TEST_CHROME") or ""
+  local parent = os.getenv("RELAY_TEST_BROWSER_PROFILES") or ""
+  if executable == "" or parent == "" then
+    test.skip("capability: set RELAY_TEST_CHROME and RELAY_TEST_BROWSER_PROFILES for installed Chromium")
+  end
+  local instance = browser.start(executable, parent, true, 15000)
+  defer instance:close()
+  assert_owned_relay_retirement(instance)
+end
+
+function test_session_close_preserves_replacement_connection(_context: test.Context)
+  local worlds = hub.Hub(8, 60000)
+  defer worlds:close()
+  local original = relay_fixture(worlds)
+  defer original:close()
+  local replacement = relay_fixture(worlds)
+  defer replacement:close()
+  local instance = empty_browser()
+  defer instance:close()
+  local session_owner = foundry.Session(instance, original.session, original.session.id, {})
+  session_owner:close()
+  test.assert(original.session.closed, "Retirement left the captured predecessor open")
+  test.assert(worlds:online(replacement.session.id) and
+    foundry.owns_connection(worlds, replacement.session.id, replacement.session),
+    "Retirement closed a replacement connection with the same client ID")
+  test.assert(not replacement.peer.peer:status():has_finished(), "Replacement peer was released")
+end
+
+function test_session_close_runs_both_owners_after_browser_cleanup_failure(_context: test.Context)
+  local worlds = hub.Hub(8, 60000)
+  defer worlds:close()
+  local fixture = relay_fixture(worlds)
+  defer fixture:close()
+  local instance = empty_browser()
+  defer browser.remove_profile(instance:profile())
+  local release, released, close_release = async.channel<|boolean|>(1)
+  defer close_release()
+  local entered, started, close_started = async.channel<|boolean|>(1)
+  defer close_started()
+  local browser_retired = false
+  -- Substitute only the Browser's existing retirement-task boundary: the
+  -- yielding failure is portable and does not depend on filesystem permissions.
+  local retirement = async.run<|async.Error?, value|>(function(): async.Error?
+    released()
+    browser.remove_profile(instance:profile())
+    browser_retired = true
+    return async.Error("Browser cleanup failed", "")
+  end)
+  instance.retirement = retirement
+  defer hub.drain(retirement)
+  local session_owner = foundry.Session(instance, fixture.session, fixture.session.id, {})
+  local requesting = pending_request(fixture.session)
+  defer hub.drain(requesting)
+  local closing = async.run<|value, value|>(function(): value
+    entered(true)
+    session_owner:close()
+    return nil
+  catch return error
+  end)
+  defer hub.drain(closing)
+  local released_cleanup = false
+  local allow_cleanup = function()
+    if not released_cleanup then
+      released_cleanup = true
+      release(true)
+    end
+  end
+  -- Failure assertions must also release the shielded Browser owner before
+  -- draining its caller, which deliberately waits for that owner's retirement.
+  defer allow_cleanup()
+  started()
+  test.assert(worlds:online(fixture.session.id) and not browser_retired,
+    "Relay retirement ran before browser cleanup completed")
+  allow_cleanup()
+  case async.join(closing)
+  when succeeded(failure) then test.assert(failure == "Browser cleanup failed")
+  when failed(failure) then failure:raise()
+  else raise "Owned cleanup was cancelled"
+  end
+  test.assert(browser_retired and not worlds:online(fixture.session.id),
+    "Browser cleanup failure skipped one of the owned resources")
+  test.assert(not fixture.peer.peer:status():has_finished(), "Relay peer was released by browser cleanup")
+  assert_disconnected(requesting)
+end
 
 local function paired(id: string, world: string, origin: string): store.Client
   return store.Client(id, "synthetic-token", world, "Test World", "fingerprint",
