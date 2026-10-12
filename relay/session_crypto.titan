@@ -1,0 +1,112 @@
+-- The session wire contract is RSA-2048 OAEP, SHA-256 for both OAEP and MGF1,
+-- an empty label, and an SPKI PEM public key. Native resources stay private.
+local string = import "string"
+foreign import "openssl/evp.h"
+foreign import "openssl/rsa.h"
+foreign import "openssl/pem.h"
+foreign import "openssl/crypto.h"
+foreign import "openssl/err.h"
+
+interface Key
+  public_key: string
+  function decrypt(encoded: string): string
+  function close()
+end
+
+local record NativeKey
+  local handle: foreign *EVP_PKEY
+  const public_key: string
+end
+
+local function pem(key: foreign *EVP_PKEY): string
+  local bio = ffi.BIO_new(ffi.BIO_s_mem())
+  if not bio then raise "Session encryption is unavailable" end
+  defer ffi.BIO_free(bio)
+  if ffi.PEM_write_bio_PUBKEY(bio, key) ~= 1 then raise "Session encryption is unavailable" end
+  local count: integer = ffi.BIO_ctrl_pending(bio)
+  if count < 1 or count > 4096 then raise "Session encryption is unavailable" end
+  local bytes: owned char[] = foreign char.new_array(count)
+  if ffi.BIO_read(bio, bytes, count) ~= count then raise "Session encryption is unavailable" end
+  return bytes as string
+end
+
+function generate(): Key
+  ffi.ERR_clear_error()
+  defer ffi.ERR_clear_error()
+  local context = ffi.EVP_PKEY_CTX_new_from_name(nil, "RSA", nil)
+  if not context then raise "Session encryption is unavailable" end
+  defer ffi.EVP_PKEY_CTX_free(context)
+  if ffi.EVP_PKEY_keygen_init(context) <= 0 or
+     ffi.EVP_PKEY_CTX_set_rsa_keygen_bits(context, 2048) <= 0 then
+    raise "Session encryption is unavailable"
+  end
+  local handle: foreign *EVP_PKEY = nil
+  if ffi.EVP_PKEY_keygen(context, handle) <= 0 or not handle then
+    if handle then ffi.EVP_PKEY_free(handle) end
+    raise "Session encryption is unavailable"
+  end
+  local transferred = false
+  defer if not transferred then ffi.EVP_PKEY_free(handle) end
+  local result: Key = NativeKey(handle, pem(handle))
+  transferred = true
+  return result
+end
+
+function NativeKey:close()
+  local handle = self.handle
+  self.handle = nil
+  if handle then ffi.EVP_PKEY_free(handle) end
+end
+
+-- Decode only canonical padded standard Base64. RSA-2048 ciphertext is 256
+-- bytes (344 encoded bytes); reject malformed/oversized input before OpenSSL.
+local function decode(source: string): owned unsigned char[]
+  if #source ~= 344 or string.sub(source, -2) ~= "==" then
+    raise "Invalid encrypted credentials"
+  end
+  local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  local result: owned unsigned char[] = foreign unsigned char.new_array(256)
+  local accumulator = 0
+  local bits = 0
+  local output = 0
+  for index = 1, 342 do
+    local position? = string.find(alphabet, string.sub(source, index, index), 1)
+    if not position then raise "Invalid encrypted credentials" end
+    accumulator = (accumulator << 6) | (position - 1)
+    bits = bits + 6
+    if bits >= 8 then
+      bits = bits - 8
+      if output >= 256 then raise "Invalid encrypted credentials" end
+      result[output] = (accumulator >> bits) & 255
+      output = output + 1
+      accumulator = accumulator & ((1 << bits) - 1)
+    end
+  end
+  if output ~= 256 or accumulator ~= 0 then raise "Invalid encrypted credentials" end
+  return result
+end
+
+function NativeKey:decrypt(encoded: string): string
+  if not self.handle then raise "Session encryption is closed" end
+  local ciphertext = decode(encoded)
+  ffi.ERR_clear_error()
+  defer ffi.ERR_clear_error()
+  local context = ffi.EVP_PKEY_CTX_new(self.handle, nil)
+  if not context then raise "Invalid encrypted credentials" end
+  defer ffi.EVP_PKEY_CTX_free(context)
+  if ffi.EVP_PKEY_decrypt_init(context) <= 0 or
+     ffi.EVP_PKEY_CTX_set_rsa_padding(context, ffi.RSA_PKCS1_OAEP_PADDING) <= 0 or
+     ffi.EVP_PKEY_CTX_set_rsa_oaep_md(context, ffi.EVP_sha256()) <= 0 or
+     ffi.EVP_PKEY_CTX_set_rsa_mgf1_md(context, ffi.EVP_sha256()) <= 0 then
+    raise "Invalid encrypted credentials"
+  end
+  local plaintext: owned unsigned char[] = foreign unsigned char.new_array(256)
+  defer ffi.OPENSSL_cleanse(plaintext, 256)
+  local length: foreign size_t = 256
+  if ffi.EVP_PKEY_decrypt(context, plaintext, length, ciphertext, 256) <= 0 then
+    raise "Invalid encrypted credentials"
+  end
+  local count: integer = length
+  if count < 1 or count > 190 then raise "Invalid encrypted credentials" end
+  return string.sub(plaintext as string, 1, count)
+end

@@ -8,21 +8,32 @@ function main(args: {string}): integer
   local settings = config.load()
   local relay = server.Server(settings)
   defer relay:close()
+  relay:start()
+  local shutdown_error: async.Error? = nil
+  local close = function()
+    relay:close()
+  catch
+    shutdown_error = async.Error(error, traceback)
+  end
   local termination = async.run<|nil, value|>(function (): nil
     os.wait_signal("term")
-    relay:close()
+    close()
     return nil
   end)
   defer hub.drain(termination)
   local interrupt = async.run<|nil, value|>(function (): nil
     os.wait_signal("int")
-    relay:close()
+    close()
     return nil
   end)
   defer hub.drain(interrupt)
-  relay:start()
   os.stdout:write("Foundry relay listening on " .. settings.host .. ":" .. settings.port .. "\n")
   relay:serve()
+  -- Listener closure can wake serve before browser retirement completes.
+  -- Await both signal owners and preserve a failed retirement in our exit code.
+  hub.drain(termination)
+  hub.drain(interrupt)
+  if shutdown_error then shutdown_error:raise() end
   return 0
 catch
   os.stderr:write("Foundry relay failed: check configuration and database access\n")

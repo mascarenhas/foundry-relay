@@ -1,0 +1,186 @@
+local test = import "test"
+local async = import "async"
+local fs = import "fs"
+local os = import "os"
+local string = import "string"
+local timer = import "timer"
+local crypto = import "relay.session_crypto"
+local api = import "relay.api"
+local hub = import "relay.hub"
+local wire = import "relay.wire"
+
+local function consume(stream: os.InputStream): string
+  local output = string.writer()
+  for chunk in stream:read do output:write(chunk) end
+  return output:drain()
+end
+
+local function await_cleanup(task: async.Task<|async.Error?, value|>)
+  local remove: (function (): ())? = nil
+  defer if remove then remove() end
+  async.await_cleanup<|nil, nil|>(function (resolve, _reject, _fatal)
+    if task:status():has_finished() then resolve(nil)
+    else remove = task:add_terminal_listener(function (_status) resolve(nil) end)
+    end
+  end)
+  case task:status()
+  when succeeded(failure) then if failure then failure:raise() end
+  when failed(failure) then failure:raise()
+  else raise "OpenSSL child cleanup was cancelled"
+  end
+end
+
+local function stop(process: os.Process)
+  -- Reaping belongs to a fresh Task so cleanup also completes if the calling
+  -- HTTP/lifecycle test was cancelled while waiting for encryption.
+  local cleanup = async.run<|async.Error?, value|>(function (): async.Error?
+    if process:is_running() then process:kill("kill") end
+    process:wait()
+    if process.stdin then process.stdin:close() end
+    if process.stdout then process.stdout:close() end
+    if process.stderr then process.stderr:close() end
+    return nil
+  catch return async.Error(error, traceback)
+  end)
+  await_cleanup(cleanup)
+end
+
+-- Independent client implementation: OpenSSL reads only the returned public
+-- SPKI and plaintext through a pipe. No private key or credential fixture is
+-- written. Public for the native session/HTTP tests that exercise this wire.
+function encrypt(public_key: string, plaintext: string,
+                 oaep_digest: string?, mgf_digest: string?): string
+  local path = fs.tmpname()
+  defer fs.unlink(path)
+  fs.write_file(path, public_key)
+  local process: os.Process? = nil
+  do
+    process = os.spawn(os.getenv("RELAY_TEST_OPENSSL") or "openssl", {
+      "pkeyutl", "-encrypt", "-pubin", "-inkey", path,
+      "-pkeyopt", "rsa_padding_mode:oaep",
+      "-pkeyopt", "rsa_oaep_md:" .. (oaep_digest or "sha256"),
+      "-pkeyopt", "rsa_mgf1_md:" .. (mgf_digest or "sha256") })
+  catch
+    if error is async.OperationError then
+      local failure: async.OperationError = error
+      if failure.name == "ENOENT" then test.skip("capability: OpenSSL CLI is unavailable") end
+    end
+    raise
+  end
+  local child: os.Process = process
+  local output: async.Task<|string, value|>? = nil
+  local errors: async.Task<|string, value|>? = nil
+  local deadline: async.Task<|nil, value|>? = nil
+  defer do
+    defer if deadline then hub.drain(deadline) end
+    defer if output then hub.drain(output) end
+    defer if errors then hub.drain(errors) end
+    stop(child)
+  end
+  output = async.run<|string, value|>(function (): string return consume(child.stdout) end)
+  errors = async.run<|string, value|>(function (): string return consume(child.stderr) end)
+  deadline = async.run<|nil, value|>(function (): nil
+    timer.sleep(5000)
+    if child:is_running() then child:kill("kill") end
+    return nil
+  end)
+  child.stdin:write(plaintext)
+  child.stdin:close()
+  local exit = child:wait()
+  test.assert(exit.code == 0 and exit.signal == nil, "OpenSSL client encryption failed")
+  local ciphertext = ""
+  case async.join(output)
+  when succeeded(bytes) then ciphertext = bytes
+  when failed(failure) then failure:raise()
+  else raise "OpenSSL ciphertext reader was cancelled"
+  end
+  case async.join(errors)
+  when succeeded(text) then test.assert(text == "", "OpenSSL client emitted a diagnostic")
+  when failed(failure) then failure:raise()
+  else raise "OpenSSL diagnostic reader was cancelled"
+  end
+  test.assert(#ciphertext == 256, "OpenSSL returned the wrong RSA ciphertext size")
+  return api.encode_base64(ciphertext)
+end
+
+local function expect_failure(operation: function (): (), expected: string)
+  local caught: value = nil
+  do operation() catch caught = error end
+  test.assert(caught == expected, "Crypto operation returned the wrong sanitized error")
+end
+
+local function credentials(password: string): string
+  return wire.encode({["password"] = password, ["nonce"] = "0123456789abcdef0123456789abcdef"})
+end
+
+function test_openssl_client_unicode_password_round_trip(_context: test.Context)
+  local key = crypto.generate()
+  defer key:close()
+  local plaintext = credentials("Sól ☀ 漢字 \"quoted\" \\ tail ")
+  test.assert(key:decrypt(encrypt(key.public_key, plaintext)) == plaintext,
+    "Native decrypt changed independently encrypted UTF-8 JSON")
+end
+
+function test_openssl_client_empty_password_round_trip(_context: test.Context)
+  local key = crypto.generate()
+  defer key:close()
+  local plaintext = credentials("")
+  test.assert(key:decrypt(encrypt(key.public_key, plaintext)) == plaintext,
+    "An explicitly empty password was rejected or changed")
+end
+
+function test_wrong_oaep_digest_is_rejected_then_key_remains_usable(_context: test.Context)
+  local key = crypto.generate()
+  defer key:close()
+  local plaintext = credentials("synthetic-password")
+  local wrong = encrypt(key.public_key, plaintext, "sha1", "sha256")
+  expect_failure(function () key:decrypt(wrong) end, "Invalid encrypted credentials")
+  test.assert(key:decrypt(encrypt(key.public_key, plaintext)) == plaintext,
+    "An OAEP digest rejection poisoned later decrypts")
+end
+
+function test_wrong_mgf1_digest_is_rejected_then_key_remains_usable(_context: test.Context)
+  local key = crypto.generate()
+  defer key:close()
+  local plaintext = credentials("synthetic-password")
+  local wrong = encrypt(key.public_key, plaintext, "sha256", "sha1")
+  expect_failure(function () key:decrypt(wrong) end, "Invalid encrypted credentials")
+  test.assert(key:decrypt(encrypt(key.public_key, plaintext)) == plaintext,
+    "An MGF1 digest rejection poisoned later decrypts")
+end
+
+local function reject_case(context: test.Context, key: crypto.Key, valid: string,
+                           name: string, malformed: string)
+  context:run(name, function (_child: test.Context)
+    expect_failure(function () key:decrypt(malformed) end, "Invalid encrypted credentials")
+    test.assert(key:decrypt(valid) == credentials("synthetic-password"),
+      "Malformed input poisoned the reusable key")
+  end)
+end
+
+function test_malformed_ciphertexts_are_rejected_before_valid_reuse(context: test.Context)
+  local key = crypto.generate()
+  context:cleanup(key:close)
+  local valid = encrypt(key.public_key, credentials("synthetic-password"))
+  reject_case(context, key, valid, "empty", "")
+  reject_case(context, key, valid, "truncated", string.sub(valid, 1, #valid - 1))
+  reject_case(context, key, valid, "data_url", "data:application/octet-stream;base64," .. valid)
+  reject_case(context, key, valid, "invalid_alphabet", "!" .. string.sub(valid, 2))
+  reject_case(context, key, valid, "missing_padding", string.sub(valid, 1, #valid - 2) .. "AA")
+  reject_case(context, key, valid, "nonzero_pad_bits", string.sub(valid, 1, #valid - 3) .. "B==")
+  reject_case(context, key, valid, "wrong_ciphertext", string.rep("A", 342) .. "==")
+end
+
+function test_closed_key_rejects_decrypt_and_close_is_idempotent(_context: test.Context)
+  local key = crypto.generate()
+  defer key:close()
+  local encoded = encrypt(key.public_key, credentials("synthetic-password"))
+  key:close()
+  key:close()
+  expect_failure(function () key:decrypt(encoded) end, "Session encryption is closed")
+  -- Closing one owner must not invalidate the OpenSSL provider or another key.
+  local replacement = crypto.generate()
+  defer replacement:close()
+  local plaintext = credentials("")
+  test.assert(replacement:decrypt(encrypt(replacement.public_key, plaintext)) == plaintext)
+end

@@ -1,0 +1,108 @@
+-- The relay's private, single-flight Chrome DevTools Protocol transport.
+local websocket = import "websocket"
+local async = import "async"
+local timer = import "timer"
+local hub = import "relay.hub"
+local wire = import "relay.wire"
+
+local record Failure
+  const message: string
+end
+
+record Connection
+  local const stream: websocket.Connection
+  local next_id: integer
+  local busy: boolean
+  local closed: boolean
+end
+
+function Connection.new(stream: websocket.Connection): Connection
+  return { stream = stream, next_id = 0, busy = false, closed = false }
+end
+
+function Connection:abort()
+  if self.closed then return end
+  self.closed = true
+  self.stream:close()
+end
+
+function Connection:close()
+  self:abort()
+end
+
+local function Connection:exchange(request: string, id: integer,
+                                   session_id: string?): {string: value}
+  self.stream:write(websocket.TEXT, request)
+  while true do
+    local kind?, contents? = self.stream:read()
+    if not kind then raise Failure("CDP connection closed") end
+    if kind ~= websocket.TEXT then raise Failure("Invalid CDP response") end
+    local envelope = wire.object(contents)
+    local reply_id? = envelope["id"]
+    if reply_id ~= nil then
+      if not (reply_id is integer) or reply_id ~= id then
+        raise Failure("Unexpected CDP response")
+      end
+      if session_id ~= nil and envelope["sessionId"] ~= session_id then
+        raise Failure("Unexpected CDP session")
+      end
+      if envelope["error"] ~= nil then raise Failure("CDP command rejected") end
+      if not (envelope["result"] is {string: value}) then
+        raise Failure("Invalid CDP result")
+      end
+      return envelope["result"]
+    end
+    -- Notifications are not queued: the spike observes readiness explicitly.
+    if not (envelope["method"] is string) then raise Failure("Invalid CDP notification") end
+  end
+end
+
+function Connection:call(method: string, params: {string: value},
+                         session_id: string?, timeout_ms: integer?): {string: value}
+  if self.closed then raise "CDP connection closed" end
+  if self.busy then raise "CDP command already in progress" end
+  local timeout = timeout_ms or 10000
+  if timeout < 1 then raise "CDP timeout must be positive" end
+  if method == "" then raise "CDP method is required" end
+  self.next_id = self.next_id + 1
+  local id = self.next_id
+  local envelope: {string: value} = {
+    ["id"] = id, ["method"] = method, ["params"] = params }
+  if session_id then envelope["sessionId"] = session_id end
+  local request = wire.encode(envelope)
+  self.busy = true
+  defer self.busy = false
+  local expired = false
+  local deadline = async.run<|nil, value|>(function (): nil
+    timer.sleep(timeout)
+    expired = true
+    self:abort()
+    return nil
+  end)
+  defer hub.drain(deadline)
+  do
+    return self:exchange(request, id, session_id)
+  catch
+    self:abort()
+    if expired then raise "CDP command timed out" end
+    if error is Failure then
+      local failure: Failure = error
+      raise failure.message
+    end
+    -- Neither remote protocol data nor transport diagnostics may expose
+    -- the evaluated expression, authentication data, or page contents.
+    raise "CDP command failed"
+  end
+end
+
+function Connection:evaluate(expression: string, session_id: string,
+                             timeout_ms: integer?): value
+  local params: {string: value} = {
+    ["expression"] = expression, ["awaitPromise"] = true,
+    ["returnByValue"] = true, ["timeout"] = timeout_ms or 10000 }
+  local response = self:call("Runtime.evaluate", params, session_id, timeout_ms)
+  if response["exceptionDetails"] ~= nil then raise "CDP evaluation failed" end
+  if not (response["result"] is {string: value}) then raise "Invalid CDP evaluation result" end
+  local result: {string: value} = response["result"]
+  return result["value"]
+end

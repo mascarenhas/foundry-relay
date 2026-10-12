@@ -6,7 +6,7 @@ WINDOWS_ROOT := $(shell cygpath -m "$(abspath .)")
 WINDOWS_PREFIX := $(shell cygpath -m "$(abspath $(PREFIX))")
 APP_SOURCES := $(wildcard relay/*.titan) main.titan
 CORE_SOURCES := $(APP_SOURCES) $(wildcard tests/*.titan)
-CORE_ROOTS := tests.router_test tests.store_test tests.api_test tests.protocol_test tests.integration_test
+CORE_ROOTS := tests.router_test tests.store_test tests.api_test tests.protocol_test tests.integration_test tests.cdp_test tests.browser_test tests.spike_input_test tests.foundry_session_test tests.session_crypto_test tests.sessions_test tests.session_http_test
 RUNTIME_DLLS := lua-5.5.1.dll libuv-1.dll libllhttp-9.4.dll libsqlite3-0.dll libcrypto-3-x64.dll libssl-3-x64.dll
 
 export CC := clang
@@ -19,7 +19,7 @@ export TITAN_RUNTIME_PREBUILT := 1
 export TITAN_PROBE_CACHE_DISABLE := 1
 export TITAN_PATH_0_6 := $(WINDOWS_PREFIX)/lib/titan/0.6
 export TITAN_EXTRA_CPPFLAGS := $(TITAN_EXTRA_CPPFLAGS) -DUSING_UV_SHARED=1 -I"$(WINDOWS_PREFIX)/include"
-export TITAN_EXTRA_LDFLAGS := $(TITAN_EXTRA_LDFLAGS) -Wl,--stack,8388608
+export TITAN_EXTRA_LDFLAGS := $(TITAN_EXTRA_LDFLAGS) -Wl,--stack,8388608 -L"$(WINDOWS_PREFIX)/lib" -lcrypto
 
 .PHONY: all core-test-build test clean require-clang64
 all: build/windows/app/bin/foundry-relay.exe

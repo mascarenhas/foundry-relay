@@ -1,0 +1,244 @@
+-- Real HTTP mapping around the native session owner; no Chrome or Foundry login.
+local test = import "test"
+local async = import "async"
+local fs = import "fs"
+local http = import "http"
+local os = import "os"
+local string = import "string"
+local timer = import "timer"
+local config = import "relay.config"
+local foundry = import "relay.foundry_session"
+local hub = import "relay.hub.titan"
+local server = import "relay.server.titan"
+local sessions = import "relay.sessions"
+local store = import "relay.store"
+local wire = import "relay.wire"
+local encryption = import "tests.session_crypto_test"
+
+local const api_key = "session-http-api-key"
+local const origin = "https://session-http.example.test"
+
+local record Probe
+  started: integer
+  closed: integer
+  fail_start: boolean
+  fail_cleanup: boolean
+end
+
+local record Fake
+  const probe: Probe
+  const metadata: {string: value}
+end
+
+function Fake:check(_worlds: hub.Hub)
+end
+
+function Fake:close()
+  self.probe.closed = self.probe.closed + 1
+  if self.probe.fail_cleanup then raise "private synthetic cleanup diagnostic" end
+end
+
+local record Fixture
+  const instance: server.Server
+  const serving: async.Task<|async.Error?, value|>
+  const path: string
+  const port: integer
+  const probe: Probe
+  const paired: store.Client
+end
+
+local record Reply
+  const status: integer
+  const body: {string: value}
+end
+
+local function Fixture:close()
+  defer fs.unlink(self.path)
+  defer hub.drain(self.serving)
+  self.instance:close()
+end
+
+local function fixture(): Fixture
+  local path = fs.tmpname()
+  local transferred = false
+  defer if not transferred then fs.unlink(path) end
+  local owner: server.Server? = nil
+  defer if not transferred and owner then owner:close() end
+  local first_port = 53000 + (os.pid() % 100) * 10
+  for port = first_port, first_port + 9 do
+    local settings = config.Config {
+      host = "127.0.0.1", port = port, api_key = api_key, pairing_code = "HTTP42",
+      database = path, public_url = "ws://127.0.0.1:" .. port .. "/relay",
+      origins = {origin}, request_timeout = 3000, heartbeat = 60000,
+      auth_timeout = 1000, max_pending = 16 }
+    local probe = Probe(0, 0, false, false)
+    local launcher = function(options: foundry.Options, _executable: string, _parent: string,
+        _worlds: hub.Hub, _timeout: integer): sessions.Client
+      test.assert(options.world == "http-world" and options.user == "Synthetic GM" and
+        options.password == "synthetic-密碼", "HTTP mapping changed decrypted session inputs")
+      local client = Fake(probe, {["worldId"] = "http-world", ["worldTitle"] = "HTTP World",
+        ["foundryVersion"] = "14.test", ["systemId"] = "test-system",
+        ["systemTitle"] = "Test System", ["systemVersion"] = "1.0"})
+      local published = false
+      defer if not published then client:close() end
+      probe.started = probe.started + 1
+      timer.sleep(1)
+      if probe.fail_start then raise "private synthetic startup diagnostic" end
+      published = true
+      return client
+    end
+    local instance = server.Server(settings, sessions.Options("fake-Chrome", "/unused", 4, 1000), launcher)
+    owner = instance
+    local failure: async.Error? = nil
+    do instance:start()
+    catch failure = async.Error(error, traceback)
+    end
+    if not failure then
+      local paired = instance.database:pair("http-world", "HTTP World", "http-fingerprint", origin)
+      local serving = async.run<|async.Error?, value|>(function(): async.Error?
+        instance:serve()
+        return nil
+      catch return async.Error(error, traceback)
+      end)
+      transferred = true
+      return Fixture(instance, serving, path, port, probe, paired)
+    end
+    instance:close()
+    owner = nil
+    if failure.error is async.OperationError then
+      local operation: async.OperationError = failure.error
+      if operation.name ~= "EADDRINUSE" then failure:raise() end
+    else failure:raise()
+    end
+  end
+  raise "No loopback port available for session HTTP tests"
+end
+
+local function call(fixture: Fixture, method: string, path: string,
+                    body: {string: value}?, extra: {http.Header}?): Reply
+  local headers = http.headers({http.Header("x-api-key", api_key)})
+  local source: string? = nil
+  if body then headers:add("Content-Type", "application/json"); source = wire.encode(body) end
+  if extra then
+    for index = 1, #extra do headers:add(extra[index].name, extra[index].contents) end
+  end
+  local response = http.request(method, "http://127.0.0.1:" .. fixture.port .. path, headers, source)
+  defer response:close()
+  test.assert(response.headers:get("Cache-Control") == "no-store",
+    "Session HTTP response omitted its no-store policy")
+  local output = string.writer()
+  for chunk in response:read do output:write(chunk) end
+  return Reply(response.status, wire.object(output:drain()))
+end
+
+local function handshake(fixture: Fixture): {string: value}
+  local response = call(fixture, "POST", "/session-handshake", nil, {
+    http.Header("x-foundry-url", origin), http.Header("x-username", "Synthetic GM"),
+    http.Header("x-world-name", "HTTP World") })
+  test.assert(response.status == 200)
+  local body = response.body
+  test.assert(#wire.text(body, "token") == 64 and #wire.text(body, "nonce") == 32)
+  test.assert(wire.text(body, "publicKey") ~= "" and wire.text(body, "instanceId") ~= "")
+  test.assert(body["foundryUrl"] == origin and body["username"] == "Synthetic GM" and
+    wire.text(body, "expires") ~= "")
+  return body
+end
+
+local function start_body(fixture: Fixture): {string: value}
+  local handshake = handshake(fixture)
+  return {["handshakeToken"] = handshake["token"], ["encryptedPassword"] = encryption.encrypt(
+    handshake["publicKey"], wire.encode({["password"] = "synthetic-密碼", ["nonce"] = handshake["nonce"]}))}
+end
+
+local function assert_pairing_unchanged(fixture: Fixture)
+  local clients = fixture.instance.database:list()
+  test.assert(#clients == 1 and clients[1].client_id == fixture.paired.client_id and
+    clients[1].token == fixture.paired.token, "Session HTTP lifecycle changed its persisted pairing")
+end
+
+function test_enabled_http_handshake_start_list_and_end(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  local data = start_body(fixture)
+  local started = call(fixture, "POST", "/start-session", data)
+  test.assert(started.status == 200 and started.body["success"] == true)
+  local id = wire.text(started.body, "sessionId")
+  test.assert(id ~= "" and started.body["clientId"] == fixture.paired.client_id)
+  test.assert(call(fixture, "POST", "/start-session", data).status == 400,
+    "HTTP replay reused a consumed handshake")
+  test.assert(call(fixture, "POST", "/start-session", start_body(fixture)).status == 409)
+  local listed = call(fixture, "GET", "/session")
+  local active: {value} = listed.body["activeSessions"]
+  test.assert(listed.status == 200 and #active == 1)
+  local entry: {string: value} = active[1]
+  test.assert(entry["sessionId"] == id and entry["clientId"] == fixture.paired.client_id and
+    entry["worldName"] == "http-world" and entry["worldTitle"] == "HTTP World" and
+    entry["systemId"] == "test-system" and entry["foundryVersion"] == "14.test")
+  test.assert(entry["password"] == nil and entry["token"] == nil and entry["publicKey"] == nil)
+  local ended = call(fixture, "DELETE", "/end-session", {["sessionId"] = id})
+  test.assert(ended.status == 200 and ended.body["status"] == "ok" and
+    ended.body["message"] == "Session ended")
+  local empty = call(fixture, "GET", "/session")
+  local remaining: {value} = empty.body["activeSessions"]
+  test.assert(#remaining == 0 and fixture.probe.started == 1 and fixture.probe.closed == 1)
+  test.assert(call(fixture, "DELETE", "/end-session?sessionId=" .. id).status == 404)
+  assert_pairing_unchanged(fixture)
+end
+
+function test_failed_http_startup_is_sanitized_and_can_retry(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  fixture.probe.fail_start = true
+  local response = call(fixture, "POST", "/start-session", start_body(fixture))
+  test.assert(response.status == 408 and response.body["error"] == "Failed to start headless Foundry session")
+  test.assert(fixture.probe.started == 1 and fixture.probe.closed == 1)
+  assert_pairing_unchanged(fixture)
+  fixture.probe.fail_start = false
+  local next = call(fixture, "POST", "/start-session", start_body(fixture))
+  test.assert(next.status == 200)
+  test.assert(call(fixture, "DELETE", "/end-session?sessionId=" .. wire.text(next.body, "sessionId")).status == 200)
+  test.assert(fixture.probe.started == 2 and fixture.probe.closed == 2)
+  assert_pairing_unchanged(fixture)
+end
+
+function test_http_handshake_rejects_duplicate_and_missing_headers(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  test.assert(call(fixture, "POST", "/session-handshake", nil, {
+    http.Header("x-foundry-url", origin), http.Header("x-foundry-url", origin),
+    http.Header("x-username", "Synthetic GM") }).status == 400)
+  test.assert(call(fixture, "POST", "/session-handshake", nil, {
+    http.Header("x-foundry-url", origin), http.Header("x-username", "Synthetic GM"),
+    http.Header("x-username", "Synthetic GM") }).status == 400)
+  test.assert(call(fixture, "POST", "/session-handshake", nil, {
+    http.Header("x-foundry-url", origin), http.Header("x-username", "Synthetic GM"),
+    http.Header("x-world-name", "HTTP World"), http.Header("x-world-name", "HTTP World") }).status == 400)
+  test.assert(call(fixture, "POST", "/session-handshake").status == 400)
+  test.assert(fixture.probe.started == 0)
+  assert_pairing_unchanged(fixture)
+end
+
+function test_server_close_reports_session_cleanup_failure_after_tearing_down_dependencies(_context: test.Context)
+  local fixture = fixture()
+  defer fixture:close()
+  local started = call(fixture, "POST", "/start-session", start_body(fixture))
+  test.assert(started.status == 200)
+  fixture.probe.fail_cleanup = true
+  local failure: value = nil
+  do fixture.instance:close()
+  catch failure = error
+  end
+  test.assert(failure is sessions.Error, "Server close hid its session cleanup failure")
+  local problem: sessions.Error = failure
+  test.assert(problem.status == 503 and problem.message == "Headless session cleanup failed")
+  test.assert(fixture.probe.closed == 1 and fixture.instance.worlds.closed,
+    "Failed session cleanup prevented shared Hub teardown")
+  local listed = fixture.instance.headless:list()
+  local active: {value} = listed["activeSessions"]
+  test.assert(#active == 0, "Failed retirement remained publicly active")
+  local store_closed = false
+  do fixture.instance.database:list()
+  catch store_closed = error == "relay store is closed"
+  end
+  test.assert(store_closed, "Failed session cleanup prevented Store teardown")
+end

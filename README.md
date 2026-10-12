@@ -1,8 +1,12 @@
 # Foundry relay in Titan
 
-A single-user REST-to-WebSocket relay for the Foundry VTT REST API module. It implements the core protocol of [ThreeHats' Go relay](https://github.com/ThreeHats/foundryvtt-rest-api-relay/tree/main/go-relay), with SQLite persistence and an environment API key. There is no dashboard, account system, billing, Redis, or headless browser service.
+A single-user REST-to-WebSocket relay for the Foundry VTT REST API module. It implements the core protocol of [ThreeHats' Go relay](https://github.com/ThreeHats/foundryvtt-rest-api-relay/tree/main/go-relay), with SQLite persistence, an environment API key, and optional headless sessions. There is no dashboard, account system, billing, or Redis.
 
 The server and tests are Titan. On POSIX, application modules and the Titan standard provider are linked into the native executable with `--static`. Windows uses an EXE launcher and application DLL with Titan DLL dependencies. The server does not invoke or depend on the Titan compiler at runtime.
+
+The retained [headless client spike](docs/headless-spike.md) builds a separate
+executable using native Titan CDP and a disposable Chrome context. Its guide
+records the build instructions, ownership model and current validation limits.
 
 ## Build and test
 
@@ -39,7 +43,7 @@ The test runner's source-owned `titan.test` support makes its standard-provider 
 
 `make coverage` runs the full Titan suite with native executable-line coverage,
 including the covered relay child launched by the process test. It combines
-both images' results across all eight production modules, retaining zero-hit
+both images' results across production modules, retaining zero-hit
 lines. See [the coverage workflow](docs/coverage.md) for the prepared SDK,
 matching GCC/gcov, Python and gcovr requirements, separate build/run targets,
 and reports under `build/coverage-report`.
@@ -70,6 +74,11 @@ The default listener is `127.0.0.1:3010`. SQLite credentials and metadata live i
 | `RELAY_HEARTBEAT_MS` | `30000` | WebSocket Ping interval; Pong progress has a five-second deadline |
 | `RELAY_MAX_PENDING` | `128` | Maximum pending REST requests per world |
 
+Headless sessions are available in the same executable when `RELAY_CHROME` is
+configured. Pair the already running world first, then use the authenticated
+handshake/start/list/end API. See [session setup and client examples](docs/sessions.md)
+for browser configuration, encrypted credentials, prerequisites, and cleanup.
+
 Set an exact Foundry origin if using a different hostname or port. An absent Origin is accepted for native clients. Deploy behind an HTTPS/WSS reverse proxy when browser clients require TLS; configure its externally visible `/relay` URL and allow the exact Foundry browser origin. The relay does not trust forwarded headers or configure proxy TLS itself.
 
 ## Pair a Foundry world
@@ -91,6 +100,10 @@ Exactly one online world is selected automatically when `clientId` is omitted. M
 
 See [the API catalog](docs/api.md) for all 91 forwarding declarations and [routing](docs/routing.md) for the project-local declarative router. REST replies preserve Foundry's response envelope. File downloads and screenshots can return binary data; `format=base64` retains their JSON form. Raw file uploads and JSON data-URL uploads are supported. Explicit JSON nulls survive forwarding.
 
+The [upstream API audit](docs/api-audit.md) records remaining response, filter,
+capacity, and transport gaps, plus the account and hosted-service features
+intentionally omitted from this single-user relay.
+
 Six authenticated SSE endpoints forward chat, roll, hook, combat, actor, and scene events. Each subscriber has a 128-event queue; a slow subscriber is retired when it fills. Streams send a 15-second keepalive and keep their subscription across a world reconnect. Foundry receives per-channel subscriber counts so it can enable and disable its hooks. Stream data is the inner Foundry event data; event names follow the corresponding channel and `eventType`. Upstream's per-subscriber event filters and consumer `/ws/api` transport are outside this implementation.
 
 The relay serializes output per world, correlates replies by world, action, and request ID, and permits concurrent REST requests. A forwarding deadline returns `408`; a world disconnect settles pending requests with `503`. A timed-out request may already have reached Foundry and performed a mutation; the relay does not retry it. The output queue is bounded, while Titan's underlying network receive buffering retains its current stdlib behavior. Failed HTTP responses are aborted, including disconnected SSE streams. Shutdown does not currently track and abort every accepted HTTP exchange, so it is not guaranteed to be bounded if a client permanently stalls while sending a request body or reading a response. The HTTP idle deadline covers waiting for the next request headers.
@@ -106,7 +119,16 @@ make -f Makefile.windows test PREFIX=/c/Titan/sdk
 
 Windows builds use a launcher EXE and application DLL. The application payload is `build/windows/app`: run `bin/foundry-relay.exe` and retain the entire `bin`, `lib`, and license layout. Its six runtime DLLs live beside the EXE; `lib/titan/0.6` contains the application and Titan standard providers. The payload contains no Titan compiler. The build copies runtime files from the SDK and does not modify that SDK.
 
-The Windows test target compiles the five routing, storage, API, protocol, and integration roots into a native Titan runner. The POSIX database mode assertion is separately skipped; credential persistence still runs. It also audits every shipped PE image for unexpected imports and runs a relocated application from ordinary PowerShell with MSYS2, LLVM, and SDK paths removed from the child environment. The Unix executable test exercises static linkage and SIGTERM behavior and is separate from this Windows validation. PowerShell script execution must be permitted by the local policy; the test target does not change that policy.
+The Windows test target compiles routing, storage, API, protocol, integration,
+CDP, browser, and session tests into a native Titan runner. The POSIX database
+mode and shell-child fixtures are separately skipped. Independent-client crypto
+tests use the OpenSSL CLI selected by `RELAY_TEST_OPENSSL`; production sessions
+call OpenSSL directly. The target also audits every shipped PE image for
+unexpected imports and runs a relocated application from ordinary PowerShell
+with MSYS2, LLVM, and SDK paths removed from the child environment. The Unix
+executable test exercises static linkage and SIGTERM behavior separately.
+PowerShell script execution must be permitted by local policy; the target does
+not change that policy.
 
 ## Provenance
 

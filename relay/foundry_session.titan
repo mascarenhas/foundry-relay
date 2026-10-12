@@ -1,0 +1,221 @@
+-- Foundry login and existing-pairing policy; caller inputs are ordinary data.
+local browser = import "relay.browser"
+local hub = import "relay.hub"
+local store = import "relay.store"
+local wire = import "relay.wire"
+local timer = import "timer"
+local uv = import "uv"
+
+record Options
+  const address: string
+  const origin: string
+  const world: string
+  const user: string
+  const password: string
+  const client: store.Client
+  const relay_url: string
+end
+
+record Session
+  local const browser: browser.Browser
+  local const relay: hub.Session
+  const client_id: string
+  const metadata: {string: value}
+end
+
+function existing_client(clients: {store.Client}, world: string,
+                         origin: string): store.Client
+  local selected: store.Client? = nil
+  for index = 1, #clients do
+    local client = clients[index]
+    if client.server_origin == origin and
+        (world == "" or client.world_id == world or client.world_title == world) then
+      if selected then raise "Multiple existing pairings match the Foundry world" end
+      selected = client
+    end
+  end
+  if not selected then raise "No existing pairing matches the Foundry world" end
+  return selected
+end
+
+local function remaining(deadline: integer, maximum: integer): integer
+  local milliseconds = (deadline - uv.hrtime()) // 1000000
+  if milliseconds < 1 then raise "Foundry readiness timed out" end
+  if milliseconds > maximum then return maximum end
+  return milliseconds
+end
+
+local function session_metadata(response: hub.Reply, world: string): {string: value}
+  if response.status ~= 200 then raise "Foundry readiness request failed" end
+  local envelope = wire.object(response.body)
+  local payload? = envelope["data"]
+  if not (payload is {string: value}) then raise "Invalid Foundry world information" end
+  local data: {string: value} = payload
+  local world_data? = data["world"]
+  local system_data? = data["system"]
+  if not (world_data is {string: value}) or not (system_data is {string: value}) then
+    raise "Invalid Foundry world information"
+  end
+  local foundry_world: {string: value} = world_data
+  local system: {string: value} = system_data
+  if wire.text(foundry_world, "id") ~= world then raise "Foundry loaded a different world" end
+  -- Exclude modules, users, document contents, and protocol identifiers.
+  return { ["worldId"] = world, ["worldTitle"] = wire.text(foundry_world, "title"),
+    ["foundryVersion"] = wire.text(data, "foundryVersion"),
+    ["systemId"] = wire.text(system, "id"), ["systemTitle"] = wire.text(system, "title"),
+    ["systemVersion"] = wire.text(system, "version") }
+end
+
+local function owns_connection(worlds: hub.Hub, client_id: string,
+                               expected: hub.Session): boolean
+  local current?, _problem? = worlds:select(client_id)
+  return current == expected
+end
+
+-- Runs in each new document, only on the configured Foundry origin. It waits
+-- for registered settings and validates all world-scoped pointers before
+-- seeding the existing token into this disposable profile's client storage.
+local function binding_script(options: Options): string
+  local config: {string: value} = {
+    ["origin"] = options.origin, ["world"] = options.world,
+    ["user"] = options.user, ["clientId"] = options.client.client_id,
+    ["token"] = options.client.token, ["relay"] = options.relay_url }
+  return "(() => { const cfg=" .. wire.encode(config) .. [=[;
+    if (location.origin !== cfg.origin) return;
+    const state = globalThis.__titanFoundrySpike = {phase:'waiting'};
+    const normalize = u => String(u).replace(/\/relay\/?$/, '');
+    let installed=false, bound=false, authorized=false, ticks=0;
+    const bind = () => {
+      if (bound || !globalThis.game?.ready) return;
+      const g=globalThis.game, mod=g.modules?.get('foundry-rest-api');
+      if (g.world?.id !== cfg.world) { state.phase='wrong-world'; bound=true; return; }
+      if (g.user?.name !== cfg.user || !g.user.isGM || g.user.role !== 4) {
+        state.phase='wrong-user'; bound=true; return;
+      }
+      if (!mod?.active) { state.phase='module-unavailable'; bound=true; return; }
+      try {
+        const s=g.settings, id='foundry-rest-api';
+        if (s.get(id,'clientId') !== cfg.clientId ||
+            !s.get(id,'pairedRelayUrl') ||
+            normalize(s.get(id,'wsRelayUrl')) !== normalize(cfg.relay) ||
+            normalize(s.get(id,'pairedRelayUrl')) !== normalize(cfg.relay)) {
+          state.phase='pairing-mismatch'; bound=true; return;
+        }
+        localStorage.setItem(id+'.connectionToken', JSON.stringify(cfg.token));
+        state.phase='bound'; bound=true; authorized=true;
+      } catch (_) { state.phase='module-unavailable'; bound=true; }
+    };
+    const tick = () => {
+      if (!installed && globalThis.Hooks) {
+        installed=true;
+        Hooks.once('ready', bind);
+        Hooks.on('foundry-rest-api.relayConnected', id => {
+          if (authorized && id === cfg.clientId)
+            state.phase='authenticated';
+        });
+        Hooks.on('foundry-rest-api.relayDisconnected', () => {
+          if (authorized) state.phase='disconnected';
+        });
+      }
+      bind();
+      if (bound || ++ticks > 12000) clearInterval(clock);
+    };
+    const clock=setInterval(tick,10); tick();
+  })()]=]
+end
+
+local function page_state(instance: browser.Browser, timeout_ms: integer): string
+  local value = instance:cdp():evaluate([=[(() => {
+    const phase=globalThis.__titanFoundrySpike?.phase;
+    if (phase === 'authenticated' &&
+        !globalThis.game?.modules?.get('foundry-rest-api')?.api?.isRelayConnected())
+      return 'disconnected';
+    if (phase && phase !== 'waiting') return phase;
+    if (document.querySelector('form[name="join"]')) return 'join';
+    if (document.querySelector('form[name="auth"]')) return 'admin-login';
+    return 'waiting';
+  })()]=], instance:session(), timeout_ms)
+  if not (value is string) then raise "Invalid Foundry readiness response" end
+  return value
+end
+
+local function login(instance: browser.Browser, options: Options, timeout_ms: integer)
+  local credentials: {string: value} = {
+    ["origin"] = options.origin, ["user"] = options.user, ["password"] = options.password }
+  local accepted = instance:cdp():evaluate("(() => { const cfg=" .. wire.encode(credentials) .. [=[;
+    if (location.origin !== cfg.origin) return false;
+    const form=document.querySelector('form[name="join"]');
+    const user=form?.querySelector('[name="username"]');
+    const password=form?.querySelector('[name="password"]');
+    const button=form?.querySelector('[name="join"]');
+    if (!form || !user || !password || !button) return false;
+    user.value=cfg.user; password.value=cfg.password;
+    user.dispatchEvent(new Event('input',{bubbles:true}));
+    password.dispatchEvent(new Event('input',{bubbles:true}));
+    form.requestSubmit(button); return true;
+  })()]=], instance:session(), timeout_ms)
+  if accepted ~= true then raise "Foundry login form is unavailable" end
+end
+
+function start(options: Options, executable: string, profile_parent: string,
+               worlds: hub.Hub, timeout_ms: integer?): Session
+  local timeout = timeout_ms or 120000
+  if timeout < 1 or timeout > 2147483647 then raise "Invalid Foundry startup timeout" end
+  local deadline = uv.hrtime() + timeout * 1000000
+  if worlds:online(options.client.client_id) then
+    raise "The paired world already has an active relay client"
+  end
+  local instance = browser.start(executable, profile_parent, true, remaining(deadline, 15000))
+  local published = false
+  defer if not published then instance:close() end
+  local protocol = instance:cdp()
+  local attached = instance:session()
+  protocol:call("Page.addScriptToEvaluateOnNewDocument",
+    {["source"] = binding_script(options)}, attached, remaining(deadline, 10000))
+  if worlds:online(options.client.client_id) then
+    raise "The paired world already has an active relay client"
+  end
+  protocol:call("Page.navigate", {["url"] = options.address}, attached, remaining(deadline, 45000))
+  local submitted = false
+  while uv.hrtime() < deadline do
+    if not instance:running() then raise "Headless browser exited" end
+    local phase = page_state(instance, remaining(deadline, 5000))
+    if phase == "authenticated" and worlds:online(options.client.client_id) then
+      local relay?, _problem? = worlds:select(options.client.client_id)
+      if relay then
+        local response = relay:request("world-info", {}, remaining(deadline, 10000))
+        local metadata = session_metadata(response, options.world)
+        if page_state(instance, remaining(deadline, 5000)) ~= "authenticated" or
+            not owns_connection(worlds, options.client.client_id, relay) then
+          raise "Headless Foundry session disconnected"
+        end
+        remaining(deadline, 1)
+        published = true
+        return Session(instance, relay, options.client.client_id, metadata)
+      end
+    elseif phase == "join" then
+      if not submitted then
+        login(instance, options, remaining(deadline, 5000)); submitted = true
+      end
+    elseif phase ~= "waiting" and phase ~= "bound" and phase ~= "authenticated" then
+      -- Only our finite phase names leave the page; no DOM or console data.
+      if phase == "pairing-mismatch" then raise "Foundry pairing settings do not match" end
+      if phase == "wrong-world" then raise "Foundry loaded a different world" end
+      if phase == "wrong-user" then raise "Foundry user is not the configured full GM" end
+      raise "Foundry requires setup or an active REST API module"
+    end
+    timer.sleep(remaining(deadline, 100))
+  end
+  raise "Foundry readiness timed out"
+end
+
+function Session:check(worlds: hub.Hub)
+  if not self.browser:running() or page_state(self.browser, 5000) ~= "authenticated" or
+     not owns_connection(worlds, self.client_id, self.relay) then
+    raise "Headless Foundry session disconnected"
+  end
+end
+
+function Session:close()
+  self.browser:close()
+end

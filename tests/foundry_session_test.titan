@@ -1,0 +1,173 @@
+local test = import "test"
+local async = import "async"
+local fs = import "fs"
+local uv = import "uv"
+local store = import "relay.store"
+local foundry = import "relay.foundry_session.titan"
+local hub = import "relay.hub.titan"
+local wire = import "relay.wire"
+local browser_fixture = import "tests.browser_test.titan"
+local cdp_fixture = import "tests.cdp_test.titan"
+
+local function paired(id: string, world: string, origin: string): store.Client
+  return store.Client(id, "synthetic-token", world, "Test World", "fingerprint",
+    origin, "3.4.1", "{}", 0)
+end
+
+function test_existing_pairing_requires_world_and_origin(_context: test.Context)
+  local selected = foundry.existing_client({
+    paired("other-world", "other", "https://example.test"),
+    paired("other-origin", "sandbox", "https://other.test"),
+    paired("expected", "sandbox", "https://example.test") },
+    "sandbox", "https://example.test")
+  test.assert(selected.client_id == "expected")
+end
+
+function test_missing_pairing_is_not_created(_context: test.Context)
+  local rejected = false
+  do foundry.existing_client({}, "sandbox", "https://example.test")
+  catch
+    rejected = true
+    test.assert(error == "No existing pairing matches the Foundry world")
+  end
+  test.assert(rejected)
+end
+
+function test_ambiguous_pairing_is_rejected(_context: test.Context)
+  local rejected = false
+  do foundry.existing_client({paired("one", "sandbox", "https://example.test"),
+    paired("two", "sandbox", "https://example.test")}, "sandbox", "https://example.test")
+  catch
+    rejected = true
+    test.assert(error == "Multiple existing pairings match the Foundry world")
+  end
+  test.assert(rejected)
+end
+
+function test_omitted_world_requires_unique_pairing_at_origin(_context: test.Context)
+  local selected = foundry.existing_client({
+    paired("other-origin", "sandbox", "https://other.test"),
+    paired("expected", "sandbox", "https://example.test") }, "", "https://example.test")
+  test.assert(selected.client_id == "expected" and selected.world_id == "sandbox")
+  local failure: value = nil
+  do
+    foundry.existing_client({paired("one", "one", "https://example.test"),
+      paired("two", "two", "https://example.test")}, "", "https://example.test")
+  catch failure = error
+  end
+  test.assert(failure == "Multiple existing pairings match the Foundry world",
+    "Omitted world silently selected one of several paired worlds")
+end
+
+function test_world_title_resolves_to_concrete_paired_world(_context: test.Context)
+  local selected = foundry.existing_client({paired("expected", "sandbox", "https://example.test")},
+    "Test World", "https://example.test")
+  test.assert(selected.world_id == "sandbox", "Display title did not resolve to the paired world id")
+end
+
+function test_world_information_publishes_only_documented_metadata(_context: test.Context)
+  local response = hub.Reply(200, [[{"type":"world-info-result","requestId":"private",
+    "data":{"world":{"id":"sandbox","title":"Test World"},
+    "system":{"id":"test-system","title":"Test System","version":"1.2"},
+    "foundryVersion":"14.1","modules":[{"id":"private-module"}],
+    "users":[{"name":"private-user"}],"activeScene":{"id":"private-scene"}}}]])
+  local metadata = foundry.session_metadata(response, "sandbox")
+  test.assert(metadata["worldId"] == "sandbox" and metadata["worldTitle"] == "Test World")
+  test.assert(metadata["systemId"] == "test-system" and metadata["systemTitle"] == "Test System" and
+    metadata["systemVersion"] == "1.2" and metadata["foundryVersion"] == "14.1")
+  test.assert(metadata["users"] == nil and metadata["modules"] == nil and
+    metadata["activeScene"] == nil and metadata["requestId"] == nil)
+end
+
+local function rejected_information(body: string, expected: string)
+  local failure: value = nil
+  do foundry.session_metadata(hub.Reply(200, body), "sandbox")
+  catch failure = error
+  end
+  test.assert(failure == expected, "Malformed or wrong-world information was accepted")
+end
+
+function test_world_information_requires_expected_world(context: test.Context)
+  context:run("wrong world", function (_child: test.Context)
+    rejected_information([[{"data":{"world":{"id":"other"},"system":{}}}]],
+      "Foundry loaded a different world")
+  end)
+  context:run("missing data", function (_child: test.Context)
+    rejected_information([[{}]], "Invalid Foundry world information")
+  end)
+  context:run("invalid system", function (_child: test.Context)
+    rejected_information([[{"data":{"world":{"id":"sandbox"},"system":false}}]],
+      "Invalid Foundry world information")
+  end)
+end
+
+function test_readiness_uses_exact_hub_connection(_context: test.Context)
+  local worlds = hub.Hub(8, 60000)
+  defer worlds:close()
+  local admitted: hub.Session? = nil
+  local replacement: hub.Session? = nil
+  local release, wait_release, close_release = async.channel<|boolean|>(1)
+  defer close_release()
+  local send_ready, wait_ready, close_ready = async.channel<|boolean|>(1)
+  defer close_ready()
+  local fixture = cdp_fixture.fixture(function (stream)
+    admitted = hub.Session("paired", stream, 8)
+    replacement = hub.Session("paired", stream, 8)
+    defer do
+      admitted:close(); admitted.outbox:close()
+      replacement:close(); replacement.outbox:close()
+    end
+    worlds.sessions["paired"] = admitted
+    send_ready(true)
+    wait_release()
+  end)
+  defer fixture:close()
+  wait_ready()
+  test.assert(foundry.owns_connection(worlds, "paired", admitted))
+  worlds.sessions["paired"] = replacement
+  test.assert(worlds:online("paired") and not foundry.owns_connection(worlds, "paired", admitted),
+    "A replacement connection kept its predecessor's owned session ready")
+  test.assert(foundry.owns_connection(worlds, "paired", replacement))
+  worlds:disconnect("paired")
+  test.assert(not foundry.owns_connection(worlds, "paired", replacement))
+  release(true)
+  fixture:finish_peer()
+end
+
+function test_startup_budget_includes_browser_initialization(_context: test.Context)
+  local process = browser_fixture.fixture([[port=$(cat "$parent/port")
+printf '%s\n/devtools/browser/fixture\n' "$port" > "$profile/DevToolsActivePort"
+exec /bin/sleep 30]])
+  defer process:close()
+  local peer = browser_fixture.browser_peer()
+  defer peer:close()
+  peer.acknowledge_page = false
+  peer.expected_abort = true
+  fs.write_file(process.directory .. "/port", "" .. peer.port)
+  local worlds = hub.Hub(8, 60000)
+  defer worlds:close()
+  local client = paired("paired", "sandbox", "https://example.test")
+  local options = foundry.Options { address = "https://example.test/", origin = "https://example.test",
+    world = client.world_id, user = "Synthetic GM", password = "synthetic-password", client = client,
+    relay_url = "ws://127.0.0.1:3010/relay" }
+  local started = uv.hrtime()
+  local failure: value = nil
+  do foundry.start(options, process.executable, process.directory, worlds, 1000)
+  catch failure = error
+  end
+  test.assert(failure == "Browser startup failed", "Browser activation failure escaped startup sanitization")
+  test.assert((uv.hrtime() - started) // 1000000 < 6000,
+    "Foundry's total startup budget did not include browser initialization")
+  peer:finish()
+  process:assert_reaped()
+end
+
+function test_startup_budget_rejects_expiration(_context: test.Context)
+  local failure: value = nil
+  do foundry.remaining(uv.hrtime() - 1000000, 5000)
+  catch failure = error
+  end
+  test.assert(failure == "Foundry readiness timed out")
+  test.assert(foundry.remaining(uv.hrtime() + 10000000000, 100) == 100,
+    "Stage deadline exceeded its own cap")
+end

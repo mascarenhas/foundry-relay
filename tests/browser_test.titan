@@ -1,0 +1,585 @@
+local test = import "test"
+local async = import "async"
+local fs = import "fs"
+local http = import "http"
+local iteration = import "iteration"
+local math = import "math"
+local net = import "net"
+local os = import "os"
+local string = import "string"
+local timer = import "timer"
+local uv = import "uv"
+local websocket = import "websocket"
+local browser = import "relay.browser.titan"
+local hub = import "relay.hub"
+local wire = import "relay.wire"
+
+local function debugging_listener_refused(port: integer): boolean
+  local probe = async.run<|boolean, value|>(function(): boolean
+    do
+      local connection = net.connect("127.0.0.1", port)
+      connection:close()
+      return false
+    catch
+      if error is async.OperationError then
+        local problem: async.OperationError = error
+        return problem.name == "ECONNREFUSED"
+      end
+      return false
+    end
+  end)
+  defer hub.drain(probe)
+  local deadline = async.run<|nil, value|>(function(): nil
+    timer.sleep(1000)
+    probe:cancel()
+    return nil
+  end)
+  defer hub.drain(deadline)
+  case async.join(probe)
+  when succeeded(refused) then return refused
+  else return false
+  end
+end
+
+function test_installed_chromium_owned_lifetime(context: test.Context)
+  local executable = os.getenv("RELAY_TEST_CHROME") or ""
+  local parent = os.getenv("RELAY_TEST_BROWSER_PROFILES") or ""
+  if executable == "" or parent == "" then
+    test.skip("capability: set RELAY_TEST_CHROME and RELAY_TEST_BROWSER_PROFILES for installed Chromium")
+  end
+  for index = 1, 2 do
+    context:run(index == 1 and "normal_close" or "aborted_transport_recovery", function(_child)
+      local instance = browser.start(executable, parent, true, 15000)
+      defer instance:close()
+      local profile = instance:profile()
+      local endpoint = fs.read_file(profile .. "/DevToolsActivePort")
+      local newline? = string.find(endpoint, "\n", 1)
+      test.assert(newline ~= nil)
+      local port? = math.tointeger(string.sub(endpoint, 1, newline - 1))
+      test.assert(port ~= nil)
+      test.assert(instance:running() and fs.lstat(profile) ~= nil)
+      test.assert(instance:cdp():evaluate("6 * 7", instance:session(), 5000) == 42)
+      if index == 2 then instance:cdp():abort() end
+      instance:close()
+      test.assert(not instance:running() and fs.lstat(profile) == nil,
+        "Installed Chromium retained its owned process or profile")
+      test.assert(debugging_listener_refused(port), "Installed Chromium retained its debugging listener")
+    end)
+  end
+end
+
+local record Fixture
+  const directory: string
+  const executable: string
+end
+
+local record BrowserPeer
+  const listener: http.Server
+  const port: integer
+  readers: {async.Task<|async.Error?, value|>}
+  serving: async.Task<|async.Error?, value|>?
+  connections: integer
+  close_requests: integer
+  context_requests: integer
+  target_requests: integer
+  page_enables: integer
+  context_id: value
+  close_marker: string?
+  expected_abort: boolean
+  acknowledge_close: boolean
+  acknowledge_page: boolean
+end
+
+local function BrowserPeer:close()
+  self.listener:close()
+  for _, reader in iteration.ipairs(self.readers) do hub.drain(reader) end
+  if self.serving then hub.drain(self.serving) end
+end
+
+local function BrowserPeer:finish()
+  for _, reader in iteration.ipairs(self.readers) do
+    case async.join(reader)
+    when succeeded(failure) then if failure then failure:raise() end
+    when failed(failure) then failure:raise()
+    else raise "Mock browser reader was cancelled"
+    end
+  end
+end
+
+local function BrowserPeer:respond(stream: websocket.Connection, connection: integer): async.Error?
+  defer stream:close()
+  while true do
+    local kind?, contents? = stream:read()
+    if not kind then return nil end
+    test.assert(kind == websocket.TEXT, "Mock browser received a non-text command")
+    local command = wire.object(contents)
+    local result: {string: value} = {}
+    local closing = false
+    local send_reply = true
+    if command["method"] == "Target.createBrowserContext" then
+      self.context_requests = self.context_requests + 1
+      local params: {string: value} = command["params"]
+      test.assert(params["disposeOnDetach"] == true,
+        "Owned context must retire when its creating CDP connection detaches")
+      test.assert(params["proxyServer"] == nil and params["proxyBypassList"] == nil and
+        params["originsWithUniversalNetworkAccess"] == nil,
+        "Owned context changed network or origin policy")
+      result["browserContextId"] = self.context_id
+    elseif command["method"] == "Target.createTarget" then
+      self.target_requests = self.target_requests + 1
+      local params: {string: value} = command["params"]
+      test.assert(params["url"] == "about:blank" and params["browserContextId"] == "owned-context",
+        "Browser target was not created in its owned in-memory context")
+      result["targetId"] = "owned-target"
+    elseif command["method"] == "Target.attachToTarget" then
+      local params: {string: value} = command["params"]
+      test.assert(params["targetId"] == "owned-target" and params["flatten"] == true,
+        "Browser attached outside its owned target")
+      result["sessionId"] = "owned-session"
+    elseif command["method"] == "Page.enable" then
+      test.assert(command["sessionId"] == "owned-session" and self.target_requests == 1,
+        "Browser activated page instrumentation outside its owned target session")
+      self.page_enables = self.page_enables + 1
+      send_reply = self.acknowledge_page
+    elseif command["method"] == "Browser.close" then
+      self.close_requests = self.close_requests + 1
+      if not self.acknowledge_close then return nil end
+      if self.close_marker then fs.write_file(self.close_marker, "closing") end
+      closing = true
+    else raise "Mock browser received an unexpected command"
+    end
+    if send_reply then
+      local reply: {string: value} = {["id"] = command["id"], ["result"] = result}
+      if command["sessionId"] ~= nil then reply["sessionId"] = command["sessionId"] end
+      stream:write(websocket.TEXT, wire.encode(reply))
+    end
+    if closing then return nil end
+  end
+catch
+  if self.expected_abort and connection == 1 and error is websocket.Error then
+    local failure: websocket.Error = error
+    if failure.kind == "abnormal" and failure.operation == "websocket.read" and
+        failure.message == "transport ended before WebSocket Close" then return nil end
+  end
+  return async.Error(error, traceback)
+end
+
+local function browser_peer(): BrowserPeer
+  local first = 58000 + (os.pid() % 40) * 100
+  for port = first, first + 99 do
+    local instance: BrowserPeer? = nil
+    local listener: http.Server? = nil
+    local failure: async.Error? = nil
+    do
+      listener = http.listen("127.0.0.1", function(request, response)
+        test.assert(request.target == "/devtools/browser/fixture", "Wrong private browser endpoint")
+        local stream = websocket.accept(request, response)
+        instance.connections = instance.connections + 1
+        local connection = instance.connections
+        instance.readers[#instance.readers + 1] = async.run<|async.Error?, value|>(function (): async.Error?
+          return instance:respond(stream, connection)
+        end)
+      end, port, 16, 1000)
+    catch failure = async.Error(error, traceback)
+    end
+    if failure then
+      if failure.error is async.OperationError then
+        local problem: async.OperationError = failure.error
+        if problem.name ~= "EADDRINUSE" then failure:raise() end
+      else failure:raise()
+      end
+    else
+      instance = BrowserPeer(listener, port, {}, nil, 0, 0, 0, 0, 0, "owned-context", nil, false, true, true)
+      instance.serving = async.run<|async.Error?, value|>(function (): async.Error?
+        listener:serve()
+        return nil
+      catch return async.Error(error, traceback)
+      end)
+      return instance
+    end
+  end
+  raise "No loopback port available for mock browser"
+end
+
+local function fixture(body: string): Fixture
+  if os.getenv("OS") == "Windows_NT" then
+    test.skip("Browser process tests use a POSIX fake-child fixture")
+  end
+  local directory = fs.tmpname()
+  fs.unlink(directory)
+  fs.mkdir(directory)
+  local executable = directory .. "/fake-chrome"
+  fs.write_file(executable, [[#!/bin/sh
+profile=''
+for argument do
+  case "$argument" in --user-data-dir=*) profile=${argument#--user-data-dir=};; esac
+done
+parent=${profile%/*}
+printf '%s\n%s\n' "$$" "$profile" > "$parent/started"
+]] .. body .. "\n")
+  local request = uv.fs_t()
+  defer uv.fs_req_cleanup(request)
+  test.assert(uv.fs_chmod(nil, request, executable, 448, nil) == 0)
+  return Fixture(directory, executable)
+end
+
+local function Fixture:close()
+  -- The assertions verify that Browser removed its own profile. Fixture
+  -- cleanup also runs after a failed assertion so the test owns all outputs.
+  local prefix = "foundry-cdp-"
+  for _, name in iteration.ipairs(fs.list(self.directory)) do
+    local path = self.directory .. "/" .. name
+    local entry? = fs.lstat(path)
+    if string.sub(name, 1, #prefix) == prefix and entry and entry.kind == "directory" then
+      local request = uv.fs_t()
+      defer uv.fs_req_cleanup(request)
+      test.assert(uv.fs_chmod(nil, request, path, 448, nil) == 0,
+        "Could not restore owned test profile permissions")
+    end
+  end
+  browser.remove_profile(self.directory)
+end
+
+local function expect_failure(operation: function (): (), expected: string)
+  local problem: value = nil
+  do operation() catch problem = error end
+  if problem is browser.Failure then
+    local failure: browser.Failure = problem
+    problem = failure.message
+  end
+  test.assert(problem == expected, "Browser returned the wrong sanitized failure")
+end
+
+local function Fixture:assert_child_reaped(): string
+  local marker = fs.read_file(self.directory .. "/started")
+  local newline? = string.find(marker, "\n", 1)
+  test.assert(newline ~= nil)
+  local pid = math.tonumber(string.sub(marker, 1, newline - 1))
+  test.assert(pid is integer)
+  test.assert(uv.kill(pid, 0) == uv.ESRCH as integer, "Browser child was not reaped")
+  return string.sub(marker, newline + 1, -2)
+end
+
+local function Fixture:assert_reaped()
+  local profile = self:assert_child_reaped()
+  test.assert(fs.lstat(profile) == nil, "Browser retained its disposable profile")
+end
+
+function test_missing_executable_removes_profile(_context: test.Context)
+  local instance = fixture("exit 0")
+  defer instance:close()
+  expect_failure(function ()
+    browser.start(instance.directory .. "/absent", instance.directory, true, 200)
+  end, "Browser startup failed")
+  local names = fs.list(instance.directory)
+  test.assert(#names == 1 and names[1] == "fake-chrome", "Failed spawn retained its profile")
+end
+
+function test_start_preserves_cleanup_failure(_context: test.Context)
+  local instance = fixture([[chmod 000 "$profile"
+exit 0]])
+  defer instance:close()
+  expect_failure(function ()
+    browser.start(instance.executable, instance.directory, true, 1000)
+  end, "Browser cleanup failed")
+  local marker = fs.read_file(instance.directory .. "/started")
+  local newline? = string.find(marker, "\n", 1)
+  test.assert(newline ~= nil)
+  local pid = math.tonumber(string.sub(marker, 1, newline - 1))
+  test.assert(pid is integer)
+  test.assert(uv.kill(pid, 0) == uv.ESRCH as integer, "Cleanup failure left its child alive")
+  local profile = string.sub(marker, newline + 1, -2)
+  local retained? = fs.lstat(profile)
+  test.assert(retained ~= nil and (retained.mode & 511) == 0,
+    "Synthetic cleanup failure did not leave the unreadable owned profile")
+end
+
+function test_early_exit_is_reaped(_context: test.Context)
+  local instance = fixture([[i=0
+while [ "$i" -lt 5000 ]; do
+  printf 'fake-private-output-0123456789\n'
+  printf 'fake-private-error-0123456789\n' >&2
+  i=$((i+1))
+done
+exit 7]])
+  defer instance:close()
+  expect_failure(function ()
+    browser.start(instance.executable, instance.directory, true, 3000)
+  end, "Browser exited during startup")
+  instance:assert_reaped()
+end
+
+function test_timeout_kills_term_resistant_child(_context: test.Context)
+  local instance = fixture("trap '' TERM\nwhile :; do :; done")
+  defer instance:close()
+  local started = uv.hrtime()
+  expect_failure(function ()
+    browser.start(instance.executable, instance.directory, true, 100)
+  end, "Browser startup timed out")
+  test.assert((uv.hrtime() - started) // 1000000 < 3000, "Browser cleanup exceeded its escalation window")
+  instance:assert_reaped()
+end
+
+function test_cancellation_reaps_child_and_profile(_context: test.Context)
+  local instance = fixture("exec /bin/sleep 30")
+  defer instance:close()
+  local starting = async.run<|nil, value|>(function (): nil
+    local launched = browser.start(instance.executable, instance.directory, true, 10000)
+    defer launched:close()
+    return nil
+  end)
+  defer hub.drain(starting)
+  local deadline = uv.hrtime() + 2000000000
+  while not fs.lstat(instance.directory .. "/started") do
+    test.assert(uv.hrtime() < deadline, "Fake browser did not start")
+    timer.sleep(5)
+  end
+  starting:cancel()
+  case async.join(starting)
+  when cancelled(_) then
+  else test.assert(false, "Cancelled browser startup did not finish as cancelled")
+  end
+  instance:assert_reaped()
+end
+
+function test_malformed_endpoint_does_not_leak_or_connect(_context: test.Context)
+  local instance = fixture([[printf '9222\nws://example.invalid/private-token\n' > "$profile/DevToolsActivePort"
+exec /bin/sleep 30]])
+  defer instance:close()
+  expect_failure(function ()
+    browser.start(instance.executable, instance.directory, true, 1000)
+  end, "Invalid browser debugging endpoint")
+  instance:assert_reaped()
+end
+
+function test_profile_cleanup_unlinks_symlinks(_context: test.Context)
+  local instance = fixture("exit 0")
+  defer instance:close()
+  local outside = instance.directory .. "/outside"
+  fs.mkdir(outside)
+  fs.write_file(outside .. "/retained", "sentinel")
+  local profile = browser.new_profile(instance.directory)
+  local request = uv.fs_t()
+  defer uv.fs_req_cleanup(request)
+  test.assert(uv.fs_symlink(nil, request, outside, profile .. "/linked", 0, nil) == 0)
+  browser.remove_profile(profile)
+  test.assert(fs.read_file(outside .. "/retained") == "sentinel", "Profile cleanup followed a symlink")
+  test.assert(fs.lstat(profile) == nil)
+end
+
+function test_concurrent_close_reuses_owned_retirement(_context: test.Context)
+  local instance = fixture("exec /bin/sleep 30")
+  defer instance:close()
+  local profile = browser.new_profile(instance.directory)
+  local process = os.spawn(instance.executable, {"--user-data-dir=" .. profile})
+  local owner = browser.Browser { directory = profile, process = process, connection = nil,
+    debugging_endpoint = nil,
+    target_session = "", output = nil, diagnostics = nil, retirement = nil, closed = false }
+  defer owner:close()
+  local deadline = uv.hrtime() + 2000000000
+  while not fs.lstat(instance.directory .. "/started") do
+    test.assert(uv.hrtime() < deadline, "Fake browser did not start")
+    timer.sleep(5)
+  end
+  local closing = async.run<|nil, value|>(function (): nil owner:close(); return nil end)
+  defer hub.drain(closing)
+  owner:close()
+  case async.join(closing)
+  when succeeded() then
+  when failed(failure) then failure:raise()
+  else test.assert(false, "Concurrent browser close was cancelled")
+  end
+  owner:close()
+  test.assert(not owner:running())
+  instance:assert_reaped()
+end
+
+local function mock_close(abort_original: boolean, failed_recovery: boolean?)
+  local instance = fixture([[port=$(cat "$parent/port")
+printf '%s\n/devtools/browser/fixture\n' "$port" > "$profile/DevToolsActivePort"
+exec /bin/sleep 30]])
+  defer instance:close()
+  local peer = browser_peer()
+  defer peer:close()
+  fs.write_file(instance.directory .. "/port", "" .. peer.port)
+  local owner = browser.start(instance.executable, instance.directory, true, 2000)
+  local retired = false
+  defer if not retired then owner:close() end
+  test.assert(owner:running() and owner:session() == "owned-session")
+  test.assert(peer.context_requests == 1 and peer.target_requests == 1,
+    "Browser did not create exactly one owned context and target")
+  test.assert(peer.page_enables == 1, "Browser published startup before activating page instrumentation")
+  test.assert(peer.connections == 1)
+  if abort_original then peer.expected_abort = true; owner:cdp():abort() end
+  peer.acknowledge_close = not failed_recovery
+  if failed_recovery then
+    expect_failure(function () owner:close() end, "Browser cleanup failed")
+  else
+    owner:close()
+    owner:close()
+  end
+  retired = true
+  peer:finish()
+  test.assert(peer.close_requests == 1, "Browser did not request one owned browser exit")
+  local expected = 1
+  if abort_original then expected = 2 end
+  test.assert(peer.connections == expected, "Browser opened an unexpected recovery transport")
+  if failed_recovery then
+    local profile = instance:assert_child_reaped()
+    test.assert(fs.lstat(profile) ~= nil, "Unconfirmed browser exit discarded its private profile")
+  else instance:assert_reaped()
+  end
+end
+
+local function rejected_context(context_id: value)
+  local instance = fixture([[port=$(cat "$parent/port")
+printf '%s\n/devtools/browser/fixture\n' "$port" > "$profile/DevToolsActivePort"
+exec /bin/sleep 30]])
+  defer instance:close()
+  local peer = browser_peer()
+  defer peer:close()
+  peer.context_id = context_id
+  fs.write_file(instance.directory .. "/port", "" .. peer.port)
+  expect_failure(function ()
+    browser.start(instance.executable, instance.directory, true, 2000)
+  end, "Invalid browser context")
+  peer:finish()
+  test.assert(peer.context_requests == 1 and peer.target_requests == 0,
+    "Invalid context identity reached target creation")
+  test.assert(peer.close_requests == 1 and peer.connections == 1,
+    "Invalid context identity did not retire its owned browser")
+  instance:assert_reaped()
+end
+
+function test_context_identity_must_be_nonempty_string(context: test.Context)
+  context:run("missing", function (_child: test.Context) rejected_context(nil) end)
+  context:run("empty", function (_child: test.Context) rejected_context("") end)
+  context:run("wrong type", function (_child: test.Context) rejected_context(42) end)
+end
+
+function test_successful_close_uses_existing_transport(_context: test.Context)
+  mock_close(false)
+end
+
+function test_start_waits_for_owned_page_activation(_context: test.Context)
+  local instance = fixture([[port=$(cat "$parent/port")
+printf '%s\n/devtools/browser/fixture\n' "$port" > "$profile/DevToolsActivePort"
+exec /bin/sleep 30]])
+  defer instance:close()
+  local peer = browser_peer()
+  defer peer:close()
+  peer.acknowledge_page = false
+  peer.expected_abort = true
+  fs.write_file(instance.directory .. "/port", "" .. peer.port)
+  local started = uv.hrtime()
+  expect_failure(function ()
+    local owner = browser.start(instance.executable, instance.directory, true, 1000)
+    defer owner:close()
+    test.assert(false, "Browser published startup without page activation acknowledgment")
+  end, "Browser startup failed")
+  test.assert((uv.hrtime() - started) // 1000000 < 6000,
+    "Page activation exceeded the startup deadline and bounded cleanup allowance")
+  peer:finish()
+  test.assert(peer.page_enables == 1 and peer.close_requests == 1 and peer.connections == 2,
+    "Unacknowledged page activation did not use bounded startup and owned recovery cleanup")
+  instance:assert_reaped()
+end
+
+function test_acknowledged_close_allows_natural_exit_before_profile_removal(_context: test.Context)
+  local instance = fixture([[port=$(cat "$parent/port")
+printf '%s\n/devtools/browser/fixture\n' "$port" > "$profile/DevToolsActivePort"
+trap 'printf term > "$parent/signalled"; exit 0' TERM
+while [ ! -f "$parent/closing" ]; do /bin/sleep 0.01; done
+/bin/sleep 0.15
+printf 'late owned state' > "$profile/late-state"
+printf flushed > "$parent/flushed"
+exit 0]])
+  defer instance:close()
+  local peer = browser_peer()
+  defer peer:close()
+  peer.close_marker = instance.directory .. "/closing"
+  fs.write_file(instance.directory .. "/port", "" .. peer.port)
+  local owner = browser.start(instance.executable, instance.directory, true, 2000)
+  defer owner:close()
+  owner:close()
+  peer:finish()
+  test.assert(fs.lstat(instance.directory .. "/signalled") == nil,
+    "Browser signalled its process before graceful shutdown completed")
+  test.assert(fs.read_file(instance.directory .. "/flushed") == "flushed",
+    "Browser did not finish its late profile write before retirement")
+  instance:assert_reaped()
+end
+
+function test_aborted_transport_recovers_owned_browser_close(_context: test.Context)
+  mock_close(true)
+end
+
+function test_failed_recovery_surfaces_cleanup_failure_and_retains_profile(_context: test.Context)
+  mock_close(true, true)
+end
+
+function test_debug_endpoint_requires_local_browser_path(_context: test.Context)
+  test.assert(browser.endpoint("9222\n/devtools/browser/abc-DEF-123\n") ==
+    "ws://127.0.0.1:9222/devtools/browser/abc-DEF-123")
+  expect_failure(function () browser.endpoint("65536\n/devtools/browser/token\n") end,
+    "Invalid browser debugging endpoint")
+  expect_failure(function () browser.endpoint("9222\n/devtools/browser/token?secret=value\n") end,
+    "Invalid browser debugging endpoint")
+end
+
+function test_endpoint_read_preserves_unrelated_open_errors(_context: test.Context)
+  local address = fs.tmpname()
+  fs.unlink(address)
+  local caught = false
+  do
+    browser.read_endpoint(address)
+  catch
+    caught = true
+    test.assert(error is async.OperationError, "Endpoint read lost its native error")
+    local problem: async.OperationError = error
+    test.assert(problem.name == "ENOENT" and problem.operation == "fs.open",
+      "Endpoint read hid an unrelated open failure")
+  end
+  test.assert(caught, "Missing endpoint file was treated as a busy publisher")
+end
+
+local function close_descriptor(descriptor: integer)
+  local request = uv.fs_t()
+  defer uv.fs_req_cleanup(request)
+  test.assert(uv.fs_close(nil, request, descriptor) == 0, "Could not close endpoint writer")
+end
+
+function test_windows_endpoint_treats_exclusive_publisher_as_pending(_context: test.Context)
+  if os.getenv("OS") ~= "Windows_NT" then
+    test.skip("platform: exclusive Windows file sharing")
+  end
+  local address = fs.tmpname()
+  defer fs.unlink(address)
+  local contents = "9222\n/devtools/browser/owned-endpoint\n"
+  fs.write_file(address, contents)
+  local request = uv.fs_t()
+  defer uv.fs_req_cleanup(request)
+  test.assert(uv.FS_O_EXLOCK ~= nil and uv.FS_O_EXLOCK ~= 0,
+    "Windows exclusive sharing flag is unavailable")
+  local descriptor = uv.fs_open(nil, request, address,
+    uv.FS_O_WRONLY | uv.FS_O_EXLOCK, 384, nil)
+  test.assert(descriptor >= 0, "Could not acquire exclusive endpoint writer")
+  defer if descriptor >= 0 then close_descriptor(descriptor) end
+  test.assert(fs.lstat(address) ~= nil, "Exclusive publisher must expose the endpoint file")
+  local busy = false
+  do
+    fs.read_file(address)
+  catch
+    test.assert(error is async.OperationError, "Exclusive writer caused a non-native error")
+    local problem: async.OperationError = error
+    busy = problem.name == "EBUSY" and problem.operation == "fs.open"
+  end
+  test.assert(busy, "Fixture did not reproduce Chromium's busy endpoint open")
+  test.assert(browser.read_endpoint(address) == nil,
+    "Busy endpoint publisher was treated as a startup failure")
+  close_descriptor(descriptor)
+  descriptor = -1
+  local published? = browser.read_endpoint(address)
+  test.assert(published == contents, "Endpoint was not readable after publisher release")
+  test.assert(browser.endpoint(published) == "ws://127.0.0.1:9222/devtools/browser/owned-endpoint")
+end

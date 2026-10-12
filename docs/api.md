@@ -18,6 +18,13 @@ Canvas document types are `tokens`, `tiles`, `drawings`, `lights`, `sounds`, `no
 
 Six separate SSE endpoints subscribe to module events: `/chat/subscribe`, `/rolls/subscribe`, `/hooks/subscribe`, `/encounters/subscribe`, `/actor/subscribe`, and `/scene/subscribe`. Subscriptions activate Foundry hooks only while consumers are present. The server handles these outside the ordinary request/response catalog.
 
+The local session API adds `POST /session-handshake`, `POST /start-session`,
+`GET /session`, and `DELETE /end-session`, authenticated with the same API key.
+See [sessions](sessions.md) for prerequisites, RSA-OAEP client examples, response
+shapes, and resource lifetime. These are local handlers rather than forwarding
+declarations. The [compatibility audit](api-audit.md) identifies remaining gaps
+against the official documentation and pinned Go relay.
+
 ## Forwarding routes
 
 Required parameter names are listed below. Path parameters are decoded independently; an encoded slash cannot create another path segment.
@@ -220,4 +227,4 @@ The module posts `/auth/pair` with `code`, `worldId`, `worldTitle`, `serverFinge
 
 Public `GET /api/clients/:clientId/active` returns `{"active":true|false}` for registered clients and 404 for unknown IDs. `POST /api/self-unpair` uses its body connection token to revoke that browser's token while preserving the world registration.
 
-The reference frontend, accounts, scoped-key tenancy, billing, external notifications, Redis clustering, browser-driven headless sessions, and interactive screenshot-control transport are outside this single-user application's scope. The D&D5e forwarding routes are included and require a compatible D&D5e world.
+The reference frontend, accounts, scoped-key tenancy, billing, external notifications, Redis clustering, and interactive screenshot-control transport are outside this single-user application's scope. The D&D5e forwarding routes are included and require a compatible D&D5e world.

@@ -1,0 +1,271 @@
+local test = import "test"
+local async = import "async"
+local http = import "http"
+local websocket = import "websocket"
+local os = import "os"
+local hub = import "relay.hub"
+local wire = import "relay.wire"
+local cdp = import "relay.cdp"
+
+local record Fixture
+  const listener: http.Server
+  serving: async.Task<|async.Error?, value|>?
+  peer: async.Task<|async.Error?, value|>?
+  client: cdp.Connection?
+  closed: boolean
+end
+
+local function Fixture:close()
+  if self.closed then return end
+  self.closed = true
+  if self.client then self.client:close() end
+  self.listener:close()
+  if self.peer then hub.drain(self.peer) end
+  if self.serving then hub.drain(self.serving) end
+end
+
+local function Fixture:finish_peer()
+  case async.join(self.peer)
+  when succeeded(failure) then if failure then failure:raise() end
+  when failed(failure) then failure:raise()
+  else raise "CDP peer was cancelled"
+  end
+end
+
+local function fixture(handler: function(websocket.Connection): ()): Fixture
+  local first = 48000 + (os.pid() % 100) * 100
+  for port = first, first + 99 do
+    local instance: Fixture? = nil
+    local listener: http.Server? = nil
+    local failure: async.Error? = nil
+    do
+      listener = http.listen("127.0.0.1", function(request, response)
+        local stream = websocket.accept(request, response)
+        instance.peer = async.run<|async.Error?, value|>(function (): async.Error?
+          defer stream:close()
+          handler(stream)
+          return nil
+        catch
+          return async.Error(error, traceback)
+        end)
+      end, port, 16, 1000)
+    catch
+      failure = async.Error(error, traceback)
+    end
+    if failure then
+      if failure.error is async.OperationError then
+        local problem: async.OperationError = failure.error
+        if problem.name ~= "EADDRINUSE" then failure:raise() end
+      else failure:raise()
+      end
+    else
+      instance = Fixture(listener, nil, nil, nil, false)
+      local published = false
+      defer if not published then instance:close() end
+      instance.serving = async.run<|async.Error?, value|>(function (): async.Error?
+        listener:serve()
+        return nil
+      catch
+        return async.Error(error, traceback)
+      end)
+      instance.client = cdp.Connection(websocket.connect("ws://127.0.0.1:" .. port .. "/cdp"))
+      published = true
+      return instance
+    end
+  end
+  raise "No loopback port available for CDP tests"
+end
+
+local function request(stream: websocket.Connection): {string: value}
+  local kind?, contents? = stream:read()
+  test.assert(kind == websocket.TEXT, "CDP peer did not receive a text request")
+  return wire.object(contents)
+end
+
+local function reply(stream: websocket.Connection, command: {string: value}, result: {string: value})
+  local envelope: {string: value} = {["id"] = command["id"], ["result"] = result}
+  if command["sessionId"] ~= nil then envelope["sessionId"] = command["sessionId"] end
+  stream:write(websocket.TEXT, wire.encode(envelope))
+end
+
+local function expect_error(operation: function(): (), expected: string)
+  local caught = false
+  do operation()
+  catch
+    caught = true
+    test.assert(error == expected, "CDP exposed the wrong failure")
+  end
+  test.assert(caught, "CDP operation unexpectedly succeeded")
+end
+
+function test_notifications_and_sequential_ids(_context: test.Context)
+  local peer = fixture(function(stream)
+    local first = request(stream)
+    test.assert(first["id"] == 1 and first["method"] == "Target.createTarget")
+    test.assert(first["sessionId"] == nil)
+    stream:write(websocket.TEXT, [[{"method":"Target.targetCreated","params":{"url":"private"}}]])
+    reply(stream, first, {["targetId"] = "target"})
+    local second = request(stream)
+    test.assert(second["id"] == 2 and second["sessionId"] == "session")
+    reply(stream, second, {["done"] = false})
+  end)
+  defer peer:close()
+  local first = peer.client:call("Target.createTarget", {["url"] = "about:blank"})
+  test.assert(first["targetId"] == "target", "notification displaced the command reply")
+  local second = peer.client:call("Page.enable", {}, "session")
+  test.assert(second["done"] == false, "CDP dropped a false result")
+  peer:finish_peer()
+end
+
+function test_protocol_error_is_sanitized_and_retires_connection(_context: test.Context)
+  local peer = fixture(function(stream)
+    local command = request(stream)
+    local details: {string: value} = {["message"] = "private-token", ["code"] = -1}
+    local envelope: {string: value} = {
+      ["id"] = command["id"], ["error"] = details }
+    stream:write(websocket.TEXT, wire.encode(envelope))
+  end)
+  defer peer:close()
+  expect_error(function() peer.client:call("Private.method", {}) end, "CDP command rejected")
+  expect_error(function() peer.client:call("Page.enable", {}) end, "CDP connection closed")
+  peer:finish_peer()
+end
+
+function test_javascript_exception_is_sanitized(_context: test.Context)
+  local peer = fixture(function(stream)
+    local command = request(stream)
+    test.assert(command["method"] == "Runtime.evaluate" and command["sessionId"] == "session")
+    local params: {string: value} = command["params"]
+    test.assert(params["awaitPromise"] == true and params["returnByValue"] == true)
+    reply(stream, command, {["result"] = {["type"] = "object"},
+      ["exceptionDetails"] = {["text"] = "private-password"}})
+    local next_command = request(stream)
+    local next_result: {string: value} = {["type"] = "boolean", ["value"] = true}
+    reply(stream, next_command, {["result"] = next_result})
+  end)
+  defer peer:close()
+  expect_error(function() peer.client:evaluate("throw 'private-password'", "session") end,
+    "CDP evaluation failed")
+  test.assert(peer.client:evaluate("true", "session") == true,
+    "a JavaScript exception retired a valid CDP transport")
+  peer:finish_peer()
+end
+
+function test_evaluate_returns_json_value(_context: test.Context)
+  local peer = fixture(function(stream)
+    local command = request(stream)
+    local result: {string: value} = {["type"] = "boolean", ["value"] = false}
+    reply(stream, command, {["result"] = result})
+  end)
+  defer peer:close()
+  test.assert(peer.client:evaluate("false", "session") == false,
+    "evaluation confused false with an absent result")
+  peer:finish_peer()
+end
+
+function test_concurrent_command_is_rejected_before_output(_context: test.Context)
+  local acknowledge, received, close_ack = async.channel<|boolean|>(1)
+  defer close_ack()
+  local release, released, close_release = async.channel<|boolean|>(1)
+  defer close_release()
+  local peer = fixture(function(stream)
+    local command = request(stream)
+    acknowledge(true)
+    released()
+    reply(stream, command, {["done"] = true})
+  end)
+  defer peer:close()
+  local calling = async.run<|{string: value}, value|>(function (): {string: value}
+    return peer.client:call("Page.enable", {})
+  end)
+  defer hub.drain(calling)
+  test.assert(received(), "CDP peer did not acknowledge the first command")
+  expect_error(function() peer.client:call("Page.disable", {}) end, "CDP command already in progress")
+  release(true)
+  case async.join(calling)
+  when succeeded(result) then test.assert(result["done"] == true, "concurrent admission damaged the owner")
+  when failed(failure) then failure:raise()
+  else raise "CDP owner was cancelled"
+  end
+  peer:finish_peer()
+end
+
+function test_peer_close_retires_connection(_context: test.Context)
+  local peer = fixture(function(stream)
+    request(stream)
+    stream:shutdown(1000, "finished", 1000)
+  end)
+  defer peer:close()
+  expect_error(function() peer.client:call("Page.enable", {}) end, "CDP connection closed")
+  expect_error(function() peer.client:call("Page.enable", {}) end, "CDP connection closed")
+  peer:finish_peer()
+end
+
+function test_deadline_retires_connection(_context: test.Context)
+  local peer = fixture(function(stream)
+    request(stream)
+    -- The adapter's deadline must abort the idle transport, not await a reply.
+    do stream:read() catch end
+  end)
+  defer peer:close()
+  expect_error(function() peer.client:call("Page.enable", {}, nil, 25) end, "CDP command timed out")
+  expect_error(function() peer.client:call("Page.enable", {}) end, "CDP connection closed")
+  peer:finish_peer()
+end
+
+function test_unexpected_id_retires_connection(_context: test.Context)
+  local peer = fixture(function(stream)
+    request(stream)
+    stream:write(websocket.TEXT, [[{"id":999,"result":{}}]])
+  end)
+  defer peer:close()
+  expect_error(function() peer.client:call("Page.enable", {}) end, "Unexpected CDP response")
+  peer:finish_peer()
+end
+
+function test_reply_from_another_session_is_rejected(_context: test.Context)
+  local peer = fixture(function(stream)
+    local command = request(stream)
+    local result: {string: value} = {}
+    local envelope: {string: value} = {
+      ["id"] = command["id"], ["sessionId"] = "other-session", ["result"] = result }
+    stream:write(websocket.TEXT, wire.encode(envelope))
+  end)
+  defer peer:close()
+  expect_error(function() peer.client:call("Page.enable", {}, "expected-session") end,
+    "Unexpected CDP session")
+  peer:finish_peer()
+end
+
+function test_malformed_reply_does_not_expose_page_data(_context: test.Context)
+  local peer = fixture(function(stream)
+    request(stream)
+    stream:write(websocket.TEXT, [[{"private-token":]])
+  end)
+  defer peer:close()
+  expect_error(function() peer.client:call("Page.enable", {}) end, "CDP command failed")
+  peer:finish_peer()
+end
+
+function test_cancelled_command_retires_connection(_context: test.Context)
+  local acknowledge, received, close_ack = async.channel<|boolean|>(1)
+  defer close_ack()
+  local peer = fixture(function(stream)
+    request(stream)
+    acknowledge(true)
+    do stream:read() catch end
+  end)
+  defer peer:close()
+  local calling = async.run<|nil, value|>(function (): nil
+    peer.client:call("Page.enable", {})
+    return nil
+  catch
+    return nil
+  end)
+  defer hub.drain(calling)
+  test.assert(received(), "CDP peer did not acknowledge the owned command")
+  calling:cancel()
+  test.assert(async.join(calling):has_cancelled(), "CDP changed the authoritative cancellation state")
+  expect_error(function() peer.client:call("Page.enable", {}) end, "CDP connection closed")
+  peer:finish_peer()
+end

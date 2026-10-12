@@ -2,6 +2,8 @@ param(
   [Parameter(Mandatory = $true)][string]$Application,
   [Parameter(Mandatory = $true)][string]$TestPayload,
   [Parameter(Mandatory = $true)][string]$ReadObj,
+  [string]$OpenSSL = $env:RELAY_TEST_OPENSSL,
+  [string]$Chrome = $env:RELAY_TEST_CHROME,
   [ValidateRange(1, 600)][int]$TimeoutSeconds = 120
 )
 
@@ -136,7 +138,8 @@ try {
   $server = $null
 
   $suite = Start-NativeProcess "$TestPayload\bin\relay-tests.exe" $cwd @{
-    TMP = $cwd; TEMP = $cwd
+    TMP = $cwd; TEMP = $cwd; RELAY_TEST_OPENSSL = $OpenSSL
+    RELAY_TEST_CHROME = $Chrome; RELAY_TEST_BROWSER_PROFILES = $cwd
   }
   $stdout = $suite.StandardOutput.ReadToEndAsync()
   $stderr = $suite.StandardError.ReadToEndAsync()
@@ -145,8 +148,9 @@ try {
   Write-Output $stdout.Result
   if ($stderr.Result) { Write-Output $stderr.Result }
   if ($suite.ExitCode -ne 0) { throw "Windows Titan suite failed: $($suite.ExitCode)" }
-  if ($stdout.Result -notmatch '\[==========\] [1-9][0-9]* tests ran\.' -or
-      $stdout.Result -notmatch '\[  PASSED  \]') { throw 'Missing native test summary' }
+  $summary = $stdout.Result + "`n" + $stderr.Result
+  if ($summary -notmatch '\[==========\] [1-9][0-9]* tests ran\.' -or
+      $summary -notmatch '\[  PASSED  \]') { throw 'Missing native test summary' }
 } finally {
   if ($server) { Stop-NativeProcess $server }
   if ($suite) { Stop-NativeProcess $suite }

@@ -1,0 +1,70 @@
+-- Local spike fixtures are data, never shell programs or production defaults.
+local fs = import "fs"
+local string = import "string"
+local url = import "url"
+
+record Input
+  const url: string
+  const origin: string
+  const world: string
+  const user: string
+  const password: string
+end
+
+function Input.new(address: string, world: string, user: string,
+                   password: string): Input
+  local parsed?, _diagnostic? = url.parse(address)
+  if not parsed or (parsed.scheme ~= "http" and parsed.scheme ~= "https") or
+     parsed.query ~= nil then raise "Invalid Foundry URL" end
+  if world == "" or user == "" then raise "Foundry world and user are required" end
+  local authority = parsed.host
+  if string.find(authority, ":") then authority = "[" .. authority .. "]" end
+  local default_port = false
+  if parsed.scheme == "https" then default_port = parsed.port == 443
+  else default_port = parsed.port == 80
+  end
+  if not default_port then authority = authority .. ":" .. parsed.port end
+  return { url = address, origin = parsed.scheme .. "://" .. authority,
+           world = world, user = user, password = password }
+end
+
+local function trim(text: string): string
+  local result = string.gsub(text, "^\\s+|\\s+$", function (_match: string): string
+    return ""
+  end)
+  return result
+end
+
+function parse(source: string): Input
+  if #source > 16384 then raise "Spike fixture is too large" end
+  local fields: {string: string} = {}
+  for line in string.split(source, "\\r?\\n") do
+    local text = trim(line)
+    if text ~= "" and string.sub(text, 1, 1) ~= "#" then
+      local separator? = string.find(line, "=")
+      local key = text
+      local contents = ""
+      if separator then
+        key = trim(string.sub(line, 1, separator - 1))
+        contents = string.sub(line, separator + 1)
+      end
+      if key ~= "FOUNDRY_URL" and key ~= "WORLD_NAME" and key ~= "GM_USER" and
+         key ~= "GM_PASSWORD" and key ~= "ADMIN_PASSWORD" then
+        raise "Unknown spike fixture field"
+      end
+      if fields[key] ~= nil then raise "Duplicate spike fixture field" end
+      fields[key] = contents
+    end
+  end
+  return Input(fields["FOUNDRY_URL"] or "", fields["WORLD_NAME"] or "",
+               fields["GM_USER"] or "", fields["GM_PASSWORD"] or "")
+end
+
+function load(path: string): Input
+  do
+    return parse(fs.read_file(path))
+  catch
+    -- File/parse errors must not quote credentials or the input source.
+    raise "Could not load spike fixture"
+  end
+end
