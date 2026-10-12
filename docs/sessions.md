@@ -33,6 +33,9 @@ export RELAY_ALLOWED_ORIGINS='https://foundry.example.test'
 
 For a system Flatpak Chrome installation, the launcher can be
 `/var/lib/flatpak/exports/bin/com.google.Chrome`.
+Preserve the user's desktop D-Bus environment (`XDG_RUNTIME_DIR` and
+`DBUS_SESSION_BUS_ADDRESS`) when starting the relay with this launcher;
+without it, Flatpak can exit before creating the browser debugging endpoint.
 
 Use a profile parent accessible to the selected launcher. A Flatpak Chrome
 launcher may not see the host's `/tmp`; an accessible directory under the
@@ -218,9 +221,16 @@ existing pairing token. If retirement fails, the manager logs a static cleanup
 error and retains the reservation; ending that session returns 503 and another
 start for the same world remains blocked. Unknown session IDs return 404.
 Malformed inputs return 400, a nonce mismatch returns 401, disallowed Foundry
-origins return 403, capacity limits return 429, startup failure returns 408, and
-disabled session creation returns 503. Listing still returns an empty list when
-creation is disabled.
+origins return 403, capacity limits return 429, expired startup deadlines return
+408, other startup failures return 500, and disabled session creation returns
+503. Listing still returns an empty list when creation is disabled.
+
+Startup error logs include fixed `stage` and `cause` categories plus `elapsed_ms`.
+For example, a missing profile parent reports `browser_profile` and
+`profile_parent_missing`; relative profile paths resolve from the relay process's
+working directory. Create the configured parent before starting a session.
+Browser output, raw errors, profile paths, credentials, and handshake data are
+excluded from these diagnostics. API errors retain their generic message.
 
 Sessions, handshakes, and RSA keys exist only in memory. Restart does not resume
 sessions, replay handshakes, load `.world`, or retrieve stored Foundry passwords.

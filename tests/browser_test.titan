@@ -275,6 +275,32 @@ function test_missing_executable_removes_profile(_context: test.Context)
   test.assert(#names == 1 and names[1] == "fake-chrome", "Failed spawn retained its profile")
 end
 
+function test_missing_profile_parent_fails_before_spawn(_context: test.Context)
+  local directory = fs.tmpname()
+  fs.unlink(directory)
+  fs.mkdir(directory)
+  defer browser.remove_profile(directory)
+  local parent = directory .. "/private-profile-parent"
+  expect_failure(function ()
+    browser.start("unreached-browser", parent, true, 200)
+  end, "Browser profile parent is missing")
+  test.assert(fs.lstat(parent) == nil and #fs.list(directory) == 0,
+    "Missing profile parent created a browser resource")
+end
+
+function test_profile_parent_failure_categories(_context: test.Context)
+  test.assert(browser.profile_failure("ENOENT").message == "Browser profile parent is missing")
+  test.assert(browser.profile_failure("ENOTDIR").message == "Browser profile parent is not a directory")
+  test.assert(browser.profile_failure("EACCES").message == "Browser profile parent permission denied")
+  test.assert(browser.profile_failure("EPERM").message == "Browser profile parent permission denied")
+  test.assert(browser.profile_failure("EIO").message == "Browser profile parent is unavailable")
+  local parent = fs.tmpname()
+  defer fs.unlink(parent)
+  expect_failure(function ()
+    browser.start("unreached-browser", parent, true, 200)
+  end, "Browser profile parent is not a directory")
+end
+
 function test_start_preserves_cleanup_failure(_context: test.Context)
   local instance = fixture([[chmod 000 "$profile"
 exit 0]])
@@ -476,7 +502,7 @@ exec /bin/sleep 30]])
     local owner = browser.start(instance.executable, instance.directory, true, 1000)
     defer owner:close()
     test.assert(false, "Browser published startup without page activation acknowledgment")
-  end, "Browser startup failed")
+  end, "Browser startup timed out")
   test.assert((uv.hrtime() - started) // 1000000 < 6000,
     "Page activation exceeded the startup deadline and bounded cleanup allowance")
   peer:finish()

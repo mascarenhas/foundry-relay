@@ -1,6 +1,7 @@
 local test = import "test"
 local async = import "async"
 local fs = import "fs"
+local string = import "string"
 local timer = import "timer"
 local uv = import "uv"
 local sessions = import "relay.sessions.titan"
@@ -9,6 +10,7 @@ local store = import "relay.store"
 local hub = import "relay.hub"
 local wire = import "relay.wire"
 local encryption = import "tests.session_crypto_test"
+local log = import "relay.log"
 
 local record Probe
   started: integer
@@ -18,6 +20,7 @@ local record Probe
   fail_start: boolean
   fail_check: boolean
   fail_cleanup: boolean
+  failure: string
 end
 
 local record Fake
@@ -54,12 +57,12 @@ local record Fixture
   const probe: Probe
 end
 
-local function fixture(maximum: integer?): Fixture
+local function fixture(maximum: integer?, logger: log.Logger?): Fixture
   local path = fs.tmpname()
   local database = store.open(path)
   database:pair("sandbox", "Sandbox", "test-fingerprint", "https://example.test")
   local worlds = hub.Hub(16, 60000)
-  local probe = Probe(0, 0, 5, 5, false, false, false)
+  local probe = Probe(0, 0, 5, 5, false, false, false, "private startup diagnostic")
   local launch = function(options: foundry.Options, _executable: string, _parent: string,
       _worlds: hub.Hub, _timeout: integer): sessions.Client
     test.assert(options.world == "sandbox" and options.user == "GM")
@@ -68,12 +71,12 @@ local function fixture(maximum: integer?): Fixture
     defer if not transferred then client:close() end
     probe.started = probe.started + 1
     timer.sleep(probe.startup_ms)
-    if probe.fail_start then raise "private startup diagnostic" end
+    if probe.fail_start then raise probe.failure end
     transferred = true
     return client
   end
   local manager = sessions.Manager(sessions.Options("synthetic-Chrome", "/unused", maximum or 4, 1000),
-    database, worlds, "wss://relay.example.test/relay", {"https://example.test"}, launch)
+    database, worlds, "wss://relay.example.test/relay", {"https://example.test"}, launch, logger)
   return Fixture(database, path, worlds, manager, probe)
 end
 
@@ -266,13 +269,75 @@ function test_failed_start_is_sanitized_and_releases_reservation(_context: test.
   defer fixture:close()
   fixture.probe.fail_start = true
   local entry = fixture.manager:begin(request(fixture.manager))
-  expect_error(function() fixture.manager:ready(entry) end, 408)
+  expect_error(function() fixture.manager:ready(entry) end, 500)
   fixture.manager:discard(entry)
   fixture.probe.fail_start = false
   local next = fixture.manager:begin(request(fixture.manager))
   fixture.manager:ready(next)
   fixture.manager:discard(next)
   test.assert(fixture.probe.closed == 2)
+end
+
+local record StartupCase
+  const message: string
+  const status: integer
+  const stage: string
+  const cause: string
+end
+
+function test_startup_failure_logs_finite_causes_and_keeps_secrets_private(context: test.Context)
+  local cases = {
+    StartupCase("Browser profile parent is missing", 500, "browser_profile", "profile_parent_missing"),
+    StartupCase("Browser profile parent is not a directory", 500, "browser_profile", "profile_parent_not_directory"),
+    StartupCase("Browser profile parent permission denied", 500, "browser_profile", "profile_parent_permission_denied"),
+    StartupCase("Browser profile parent is unavailable", 500, "browser_profile", "profile_parent_unavailable"),
+    StartupCase("Browser startup timed out", 408, "browser_startup", "deadline_expired"),
+    StartupCase("Foundry readiness timed out", 408, "foundry_readiness", "deadline_expired"),
+    StartupCase("CDP command timed out", 408, "browser_protocol", "deadline_expired"),
+    StartupCase("private-raw-secret https://private.example/ private-profile-path", 500, "startup", "startup_failed") }
+  for index = 1, #cases do
+    local selected = cases[index]
+    context:run(selected.stage .. "." .. selected.cause, function(_child)
+      local output = string.writer()
+      local logger = log.Logger("error", function(text: string) output:write(text) end)
+      defer logger:close()
+      local fixture = fixture(nil, logger)
+      defer fixture:close()
+      fixture.probe.fail_start = true
+      fixture.probe.failure = selected.message
+      local data = request(fixture.manager, "private-password")
+      local original = fixture.database:list()[1]
+      local entry = fixture.manager:begin(data)
+      do fixture.manager:ready(entry)
+        raise "Failed startup unexpectedly became ready"
+      catch
+        test.assert(error is sessions.Error, "Raw startup failure escaped the API boundary")
+        local failure: sessions.Error = error
+        test.assert(failure.status == selected.status and
+          failure.message == "Failed to start headless Foundry session")
+      end
+      fixture.manager:discard(entry)
+      logger:close()
+      local contents = output:drain()
+      local logged = wire.object(contents)
+      test.assert(logged["event"] == "headless_session_failed" and logged["reason"] == "startup_failed")
+      test.assert(logged["stage"] == selected.stage and logged["cause"] == selected.cause)
+      test.assert(logged["client_id"] == original.client_id and logged["elapsed_ms"] is integer)
+      test.assert((logged["elapsed_ms"] as integer) >= 0, "Startup elapsed time was negative")
+      local secrets: {string} = {"private-password", "private-raw-secret", "private.example",
+        "private-profile-path", "example.test", "/unused", original.token,
+        data["handshakeToken"], data["encryptedPassword"]}
+      for secret_index = 1, #secrets do
+        test.assert(string.find(contents, secrets[secret_index], 1, true) == nil,
+          "Startup log leaked private inputs or diagnostics")
+      end
+      fixture.probe.fail_start = false
+      local next = fixture.manager:begin(request(fixture.manager))
+      fixture.manager:ready(next)
+      fixture.manager:discard(next)
+      test.assert(fixture.probe.closed == 2, "Failed startup retained its reservation")
+    end)
+  end
 end
 
 function test_cleanup_failure_quarantines_world(_context: test.Context)

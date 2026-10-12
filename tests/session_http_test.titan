@@ -190,7 +190,7 @@ function test_failed_http_startup_is_sanitized_and_can_retry(_context: test.Cont
   defer fixture:close()
   fixture.probe.fail_start = true
   local response = call(fixture, "POST", "/start-session", start_body(fixture))
-  test.assert(response.status == 408 and response.body["error"] == "Failed to start headless Foundry session")
+  test.assert(response.status == 500 and response.body["error"] == "Failed to start headless Foundry session")
   test.assert(fixture.probe.started == 1 and fixture.probe.closed == 1)
   assert_pairing_unchanged(fixture)
   fixture.probe.fail_start = false

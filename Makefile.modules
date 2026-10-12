@@ -28,5 +28,5 @@ MODULE_IMPORTS_tests/protocol_test := relay/config relay/hub relay/wire
 MODULE_IMPORTS_tests/router_test := relay/router
 MODULE_IMPORTS_tests/session_crypto_test := relay/api relay/hub relay/session_crypto relay/wire
 MODULE_IMPORTS_tests/session_http_test := relay/config relay/foundry_session relay/hub relay/server relay/sessions relay/store relay/wire tests/session_crypto_test
-MODULE_IMPORTS_tests/sessions_test := relay/foundry_session relay/hub relay/sessions relay/store relay/wire tests/session_crypto_test
+MODULE_IMPORTS_tests/sessions_test := relay/foundry_session relay/hub relay/log relay/sessions relay/store relay/wire tests/session_crypto_test
 MODULE_IMPORTS_tests/store_test := relay/store
