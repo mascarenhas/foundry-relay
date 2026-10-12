@@ -1,12 +1,8 @@
 # Foundry relay in Titan
 
-A single-user REST-to-WebSocket relay for the Foundry VTT REST API module. It implements the core protocol of [ThreeHats' Go relay](https://github.com/ThreeHats/foundryvtt-rest-api-relay/tree/main/go-relay), with SQLite persistence, an environment API key, and optional headless sessions. There is no dashboard, account system, billing, or Redis.
+A single-user REST-to-WebSocket relay for the Foundry VTT REST API module. It implements the core protocol of [ThreeHats' Go relay](https://github.com/ThreeHats/foundryvtt-rest-api-relay/tree/main/go-relay), with SQLite persistence, an environment API key, and optional headless sessions through the same server's REST API. There is no dashboard, account system, billing, or Redis.
 
 The server and tests are Titan. On POSIX, application modules and the Titan standard provider are linked into the native executable with `--static`. Windows uses an EXE launcher and application DLL with Titan DLL dependencies. The server does not invoke or depend on the Titan compiler at runtime.
-
-The retained [headless client spike](docs/headless-spike.md) builds a separate
-executable using native Titan CDP and a disposable Chrome context. Its guide
-records the build instructions, ownership model and current validation limits.
 
 ## Build and test
 
@@ -73,6 +69,7 @@ The default listener is `127.0.0.1:3010`. SQLite credentials and metadata live i
 | `RELAY_AUTH_TIMEOUT_MS` | `10000` | First-message WebSocket authentication deadline |
 | `RELAY_HEARTBEAT_MS` | `30000` | WebSocket Ping interval; Pong progress has a five-second deadline |
 | `RELAY_MAX_PENDING` | `128` | Maximum pending REST requests per world |
+| `RELAY_LOG_LEVEL` | `info` | JSON logging threshold: `error`, `info`, or `debug` |
 
 Headless sessions are available in the same executable when `RELAY_CHROME` is
 configured. Pair the already running world first, then use the authenticated
@@ -80,6 +77,54 @@ handshake/start/list/end API. See [session setup and client examples](docs/sessi
 for browser configuration, encrypted credentials, prerequisites, and cleanup.
 
 Set an exact Foundry origin if using a different hostname or port. An absent Origin is accepted for native clients. Deploy behind an HTTPS/WSS reverse proxy when browser clients require TLS; configure its externally visible `/relay` URL and allow the exact Foundry browser origin. The relay does not trust forwarded headers or configure proxy TLS itself.
+
+## Logs
+
+Relay-generated logs write one JSON object per line to stderr. `RELAY_LOG_LEVEL` defaults
+to `info`; values are case sensitive, and invalid values fail startup.
+
+| Level | Events included |
+| --- | --- |
+| `error` | Configuration, listener, I/O, WebSocket protocol/transport and heartbeat failures; forwarding timeouts; headless browser startup, connection and cleanup failures |
+| `info` | All errors, server startup/shutdown, HTTP request admission, successful pairing/revocation/removal, authenticated WebSocket connect/disconnect, and headless session lifecycle |
+| `debug` | All info events, WebSocket message categories and byte counts, ignored/discarded messages, forwarding/results, heartbeat Ping/Pong, and subscription counts/overflow |
+
+Every record contains `timestamp` (UTC, one-second resolution), `level`, and
+`event`. Additional fields depend on the event, for example:
+
+```json
+{"event":"http_request","level":"info","method":"GET","route":"/world-info","timestamp":"2026-10-11T20:00:00Z"}
+```
+
+HTTP admission records cover requests reaching the Titan HTTP handler, including
+authentication failures, unmatched routes, OPTIONS and long-lived SSE/upgrade
+requests. They are emitted before dispatch. The `route` is a declared template
+such as `/clients/:clientId`, or `<unmatched>` for unresolved targets. Requests
+rejected by the underlying HTTP parser never reach this handler.
+
+Logs omit headers, query values, route parameters, bodies, tokens, passwords,
+world metadata, browser/CDP contents, arbitrary error text and peer Close
+reasons. Message categories come from the known protocol catalog; unrecognized
+types are recorded as `unknown`. Client IDs in lifecycle logs come from stored
+pairings. Normal disconnect, reconnect replacement, unpair and shutdown are
+lifecycle events.
+
+Logging admission does not suspend request or connection owners. A writer drains
+up to 1,024 queued records plus one in-flight record, with each JSON object
+capped at 16 KiB.
+Overflow and unencodable records are counted in an error-level `log_dropped`
+record when the sink progresses. A failed sink disables further logging for that
+process. Shutdown drains admitted records; a permanently stalled stderr sink
+can delay that drain.
+
+Low-level Titan runtime diagnostics outside relay handlers, such as an uncaught
+HTTP parser/framing failure, retain the runtime's diagnostic format and are not
+controlled by `RELAY_LOG_LEVEL`.
+
+The current Titan standard-stream API supports terminals and pipes. To save
+logs, pipe through a collector, for example
+`./build/foundry-relay 2>&1 | tee relay.log`; direct stderr redirection to a
+regular file is unsupported and disables the log sink.
 
 ## Pair a Foundry world
 

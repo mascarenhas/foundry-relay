@@ -14,7 +14,7 @@ endif
 ROOT := $(abspath .)
 APP_SOURCES := $(wildcard relay/*.titan) main.titan
 SOURCES := $(APP_SOURCES) $(wildcard tests/*.titan)
-TEST_ROOTS := tests.router_test tests.store_test tests.api_test tests.protocol_test tests.integration_test tests.process_test tests.cdp_test tests.browser_test tests.spike_input_test tests.foundry_session_test tests.session_crypto_test tests.sessions_test tests.session_http_test
+TEST_ROOTS := tests.router_test tests.store_test tests.api_test tests.protocol_test tests.integration_test tests.process_test tests.cdp_test tests.browser_test tests.foundry_session_test tests.session_crypto_test tests.sessions_test tests.session_http_test tests.log_test tests.logging_http_test
 COVERAGE_GCOV ?= $(shell command -v gcov)
 COVERAGE_GCOVR ?= $(shell command -v gcovr)
 COVERAGE_FORMATS ?= html lcov cobertura
@@ -22,19 +22,8 @@ PYTHON ?= python3
 COVERAGE_OPTIONS = --coverage --coverage-gcov "$(COVERAGE_GCOV)" --coverage-gcovr "$(COVERAGE_GCOVR)" $(foreach format,$(sort lcov $(COVERAGE_FORMATS)),--coverage-format $(format))
 COVERAGE_RENDER = $(if $(filter html,$(COVERAGE_FORMATS)),--html-details build/coverage-report/coverage.html --html-single-page static --html-template-dir build/coverage-src/.coverage/report --html-title 'Foundry relay executable-line coverage') $(if $(filter lcov,$(COVERAGE_FORMATS)),--lcov build/coverage-report/coverage.info) $(if $(filter cobertura,$(COVERAGE_FORMATS)),--cobertura build/coverage-report/coverage.xml)
 
-.PHONY: all test clean check-openssl build/foundry-relay build/relay-tests coverage coverage-build coverage-run headless build/foundry-relay-headless
+.PHONY: all test clean check-openssl build/foundry-relay build/relay-tests coverage coverage-build coverage-run
 all: build/foundry-relay
-
-# Retained explicit spike harness; production sessions use the ordinary main.
-headless: build/foundry-relay-headless
-
-build/foundry-relay-headless: $(APP_SOURCES) headless.titan Makefile | check-openssl
-	rm -rf build/headless-src
-	mkdir -p build/headless-src/relay build/tmp
-	cp relay/*.titan build/headless-src/relay/
-	cp headless.titan build/headless-src/headless.titan
-	cd build/headless-src && TMPDIR="$(ROOT)/build/tmp" $(TITANC) --static -j $(TITAN_JOBS) headless
-	cp build/headless-src/headless $@
 
 check-openssl:
 ifeq ($(OPENSSL_MODE),system)

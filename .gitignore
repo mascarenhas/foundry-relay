@@ -15,7 +15,6 @@
 
 # Leftovers from source-tree compiler/test invocations.
 /main
-/headless
 /tests/*_test
 *.o
 *.ffi.h

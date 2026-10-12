@@ -1,0 +1,138 @@
+-- Admission never suspends a caller. One owned Task writes bounded JSON lines.
+local async = import "async"
+local iteration = import "iteration"
+local json = import "json"
+local os = import "os"
+
+local const maximum_line_bytes = 16384
+
+local function rank(level: string): integer?
+  if level == "error" then return 1 end
+  if level == "info" then return 2 end
+  if level == "debug" then return 3 end
+  return nil
+end
+
+function resolve_level(level: string?): string
+  local selected = level or "info"
+  if rank(selected) == nil then raise "RELAY_LOG_LEVEL must be error, info, or debug" end
+  return selected
+end
+
+local function line(level: string, event: string, fields: {string: value}?): string
+  local contents: {string: value} = {}
+  if fields then
+    for key, item in iteration.pairs(fields) do contents[key] = item end
+  end
+  contents["timestamp"] = os.date("!%Y-%m-%dT%H:%M:%SZ")
+  contents["level"] = level
+  contents["event"] = event
+  return json.encode(contents, json.EncodeOption.max_bytes(maximum_line_bytes)) .. "\n"
+end
+
+record Logger
+  local const minimum: integer
+  local const sink: function (string): ()
+  local const source: async.BufferedSubscription<|string, nil|>
+  local const publish: function (string): (boolean)
+  local const finish: function (): (boolean)
+  local const capacity: integer
+  local queued: integer
+  local dropped: integer
+  local closed: boolean
+  local failed: boolean
+  local worker: async.Task<|nil, value|>?
+end
+
+local function Logger:report_dropped()
+  if self.dropped == 0 then return end
+  local count = self.dropped
+  self.dropped = 0
+  self.sink(line("error", "log_dropped", {["count"] = count}))
+end
+
+local function Logger:write_loop(): nil
+  defer self.source:close()
+  while true do
+    case self.source:next()
+    when item(text) then
+      self.queued = self.queued - 1
+      self.sink(text)
+      self:report_dropped()
+    else
+      self:report_dropped()
+      return nil
+    end
+  end
+  return nil
+catch
+  -- A failed destination disables logging and discards unread records. It must
+  -- never become an uncaught Task error or replace an application failure.
+  self.failed = true
+  self.queued = 0
+  return nil
+end
+
+function Logger.new(level: string?, sink: (function (string): ())?, capacity: integer?): Logger
+  local selected = resolve_level(level)
+  local maximum = capacity or 1024
+  if maximum < 1 then raise "log queue capacity must be positive" end
+  local publish: (function (string): (boolean))? = nil
+  local finish: (function (): (boolean))? = nil
+  local source = async.BufferedSubscription<|string, nil|>(function (p, _fail, f)
+    publish = p
+    finish = f
+    return async.SubscriptionActions<|string|>(function () end, function (_drain) end)
+  end)
+  local destination = sink or function (text: string) os.stderr:write(text) end
+  local result: Logger = {minimum = rank(selected), sink = destination,
+    source = source, publish = publish, finish = finish, capacity = maximum,
+    queued = 0, dropped = 0, closed = false, failed = false, worker = nil}
+  result.worker = async.run<|nil, value|>(result:write_loop)
+  return result
+end
+
+function Logger:emit(level: string, event: string, fields: {string: value}?)
+  if self.closed or self.failed then return end
+  local severity? = rank(level)
+  if severity == nil then self.dropped = self.dropped + 1; return end
+  if severity > self.minimum then return end
+  if self.queued >= self.capacity then self.dropped = self.dropped + 1; return end
+  local encoded = line(level, event, fields)
+  if self.publish(encoded) then self.queued = self.queued + 1
+  else self.dropped = self.dropped + 1
+  end
+catch
+  -- Encoding rejects invalid UTF-8, cycles, unsupported values and large
+  -- records without exposing their contents or changing the caller's outcome.
+  self.dropped = self.dropped + 1
+end
+
+function emit(logger: Logger?, level: string, event: string, fields: {string: value}?)
+  if logger then logger:emit(level, event, fields) end
+end
+
+local function await_terminal(task: async.Task<|nil, value|>)
+  if task:status():has_finished() then return end
+  local remove: (function (): ())? = nil
+  defer if remove then remove() end
+  async.await_cleanup<|nil, nil|>(function (resolve, _reject, _fatal)
+    if task:status():has_finished() then resolve(nil)
+    else remove = task:add_terminal_listener(function (_status) resolve(nil) end)
+    end
+  end)
+end
+
+function Logger:close()
+  if self.closed then return end
+  self.closed = true
+  self.finish()
+  if self.worker then await_terminal(self.worker) end
+end
+
+-- Startup may fail before a Logger exists. Callers supply only fixed, safe
+-- event/reason strings; failure of this final diagnostic remains isolated.
+function fatal(event: string, reason: string)
+  os.stderr:write(line("error", event, {["reason"] = reason}))
+catch
+end

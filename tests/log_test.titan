@@ -1,0 +1,217 @@
+local test = import "test"
+local async = import "async"
+local json = import "json"
+local string = import "string"
+local timer = import "timer"
+local log = import "relay.log.titan"
+
+local function records(source: string): {{string: value}}
+  local result: {{string: value}} = {}
+  for text in string.split(source, "\n") do
+    if text ~= "" then
+      local contents: {string: value} = json.decode(text)
+      test.assert(contents["timestamp"] is string and contents["level"] is string and
+        contents["event"] is string, "log line omitted its common fields")
+      result[#result + 1] = contents
+    end
+  end
+  return result
+end
+
+local function captured(level: string?): (log.Logger, string.StringWriter)
+  local output = string.writer()
+  local logger = log.Logger(level, function (text: string) output:write(text) end)
+  return logger, output
+end
+
+function test_levels_default_to_info_and_reject_invalid_values(_context: test.Context)
+  test.assert(log.resolve_level(nil) == "info")
+  test.assert(log.resolve_level("error") == "error" and log.resolve_level("info") == "info" and
+    log.resolve_level("debug") == "debug")
+  for level in string.split(",INFO,warning,trace, info", ",") do
+    local rejected = false
+    do log.resolve_level(level)
+    catch
+      rejected = true
+      test.assert(error == "RELAY_LOG_LEVEL must be error, info, or debug")
+    end
+    test.assert(rejected, "invalid log level was accepted")
+  end
+end
+
+function test_filtering_and_finish_keep_record_order(_context: test.Context)
+  local levels: const {string} = {"error", "info", "debug"}
+  for index = 1, #levels do
+    local logger, output = captured(levels[index])
+    defer logger:close()
+    logger:emit("debug", "debug_event")
+    logger:emit("info", "info_event")
+    logger:emit("error", "error_event")
+    logger:close()
+    logger:close()
+    logger:emit("error", "after_close")
+    local contents = records(output:drain())
+    test.assert(#contents == index, "severity filter admitted the wrong records")
+    test.assert(contents[index]["event"] == "error_event", "finish lost or reordered a queued record")
+  end
+  local logger, output = captured(nil)
+  defer logger:close()
+  logger:emit("debug", "filtered")
+  log.emit(logger, "info", "default_info")
+  log.emit(nil, "error", "silent")
+  logger:close()
+  local contents = records(output:drain())
+  test.assert(#contents == 1 and contents[1]["event"] == "default_info")
+end
+
+function test_json_escaping_and_reserved_fields_are_snapshotted(_context: test.Context)
+  local logger, output = captured("debug")
+  defer logger:close()
+  local fields: {string: value} = {["detail"] = "quote\"\nline\r\t\0", ["count"] = 7,
+    ["level"] = "spoofed", ["event"] = "spoofed", ["timestamp"] = "spoofed"}
+  logger:emit("info", "escaped_event", fields)
+  fields["detail"] = "mutated after admission"
+  logger:close()
+  local source = output:drain()
+  test.assert(string.sub(source, -1) == "\n", "log record omitted its terminating newline")
+  local contents = records(source)
+  test.assert(#contents == 1, "escaped newline split the JSON record")
+  test.assert(contents[1]["detail"] == "quote\"\nline\r\t\0" and contents[1]["count"] == 7)
+  test.assert(contents[1]["level"] == "info" and contents[1]["event"] == "escaped_event" and
+    contents[1]["timestamp"] ~= "spoofed", "fields replaced reserved log metadata")
+  test.assert(fields["level"] == "spoofed", "logging mutated the caller's fields")
+end
+
+function test_admission_never_yields_and_overflow_is_reported(_context: test.Context)
+  local output = string.writer()
+  local entered = false
+  local logger = log.Logger("debug", function (text: string)
+    entered = true
+    timer.yield()
+    output:write(text)
+  end, 2)
+  defer logger:close()
+  logger:emit("info", "first")
+  logger:emit("info", "second")
+  logger:emit("info", "overflow")
+  test.assert(not entered, "logging entered its yielding writer inline")
+  logger:close()
+  local contents = records(output:drain())
+  test.assert(#contents == 3, "bounded logging lost its overflow report")
+  test.assert(contents[1]["event"] == "first" and contents[2]["event"] == "log_dropped" and
+    contents[2]["count"] == 1 and contents[3]["event"] == "second")
+end
+
+function test_slow_writer_does_not_block_other_tasks(_context: test.Context)
+  local output = string.writer()
+  local entered = false
+  local release = false
+  local logger = log.Logger("info", function (text: string)
+    entered = true
+    while not release do timer.yield() end
+    output:write(text)
+  end, 1)
+  defer do
+    release = true
+    logger:close()
+  end
+  logger:emit("info", "in_flight")
+  while not entered do timer.yield() end
+  logger:emit("info", "queued")
+  logger:emit("info", "overflow")
+  local progressed = false
+  local other = async.run<|nil, value|>(function (): nil progressed = true; return nil end)
+  case async.join(other)
+  when succeeded() then
+  else raise "unrelated Task failed while logger was blocked"
+  end
+  test.assert(progressed and output:drain() == "", "blocked logging prevented unrelated Task progress")
+  release = true
+  logger:close()
+  local contents = records(output:drain())
+  test.assert(#contents == 3 and contents[1]["event"] == "in_flight" and
+    contents[2]["event"] == "log_dropped" and contents[2]["count"] == 1 and
+    contents[3]["event"] == "queued", "slow writer violated its queue bound or order")
+end
+
+function test_sink_failure_is_isolated_and_stops_writes(_context: test.Context)
+  local writes = 0
+  local logger = log.Logger("debug", function (_text: string)
+    writes = writes + 1
+    raise "synthetic log sink failure"
+  end, 2)
+  defer logger:close()
+  logger:emit("info", "first")
+  logger:emit("info", "discarded")
+  logger:close()
+  logger:emit("error", "after_failure")
+  logger:close()
+  test.assert(writes == 1, "failed log sink was retried or escaped cleanup")
+  test.assert(logger.worker:status():has_succeeded(), "failed log sink escaped its writer Task")
+end
+
+function test_invalid_records_are_dropped_without_affecting_callers(_context: test.Context)
+  local logger, output = captured("debug")
+  defer logger:close()
+  logger:emit("info", "invalid_utf8", {["detail"] = string.char(255)})
+  logger:emit("info", "too_large", {["detail"] = string.rep("x", 16384)})
+  local cycle: {string: value} = {}
+  cycle["self"] = cycle
+  logger:emit("info", "cycle", cycle)
+  logger:emit("invalid", "bad_severity")
+  logger:emit("info", "survived")
+  logger:close()
+  local contents = records(output:drain())
+  test.assert(#contents == 2 and contents[1]["event"] == "survived" and
+    contents[2]["event"] == "log_dropped" and contents[2]["count"] == 4,
+    "invalid records escaped isolation or hid the drop count")
+end
+
+function test_queue_capacity_must_be_positive(_context: test.Context)
+  local rejected = false
+  do log.Logger("info", function (_text: string) end, 0)
+  catch
+    rejected = true
+    test.assert(error == "log queue capacity must be positive")
+  end
+  test.assert(rejected, "zero-capacity logger was accepted")
+end
+
+function test_finish_reports_drops_when_no_record_was_accepted(_context: test.Context)
+  local logger, output = captured("info")
+  defer logger:close()
+  logger:emit("info", "invalid_utf8", {["detail"] = string.char(255)})
+  logger:close()
+  local contents = records(output:drain())
+  test.assert(#contents == 1 and contents[1]["event"] == "log_dropped" and
+    contents[1]["count"] == 1, "finish hid drops without an accepted record")
+end
+
+function test_cancellation_does_not_interrupt_owned_writer_cleanup(_context: test.Context)
+  local output = string.writer()
+  local entered = false
+  local release = false
+  local logger = log.Logger("info", function (text: string)
+    entered = true
+    while not release do timer.yield() end
+    output:write(text)
+  end)
+  defer do
+    release = true
+    logger:close()
+  end
+  logger:emit("info", "accepted_before_close")
+  while not entered do timer.yield() end
+  local closing = async.run<|nil, value|>(function (): nil logger:close(); return nil end)
+  -- close waits for the writer's terminal state, after finish has stopped
+  -- admission. Cancellation must preserve that accepted sink ownership.
+  while closing:status():as_string() == "ready" do timer.yield() end
+  test.assert(closing:status():as_string() == "waiting", "close did not wait for its writer")
+  closing:cancel()
+  test.assert(not closing:status():has_finished(), "cancellation abandoned the active writer")
+  release = true
+  test.assert(async.join(closing):has_cancelled(), "close owner lost its cancellation")
+  local contents = records(output:drain())
+  test.assert(#contents == 1 and contents[1]["event"] == "accepted_before_close" and
+    logger.worker:status():has_succeeded(), "close cancellation lost an accepted log record")
+end

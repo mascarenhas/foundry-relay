@@ -63,6 +63,7 @@ function test_relocated_executable_runs_without_compiler_or_provider(_context: t
     os.with_env("RELAY_HOST", "127.0.0.1"),
     os.with_env("RELAY_PORT", "" .. port),
     os.with_env("RELAY_PUBLIC_URL", "ws://127.0.0.1:" .. port .. "/relay"),
+    os.with_env("RELAY_LOG_LEVEL", "info"),
     os.with_env("RELAY_CHROME", ""), os.with_env("RELAY_MAX_SESSIONS", "4"),
     os.with_env("RELAY_SESSION_TIMEOUT_MS", "120000"),
     os.with_env("TITAN_PATH_0_6", "/nonexistent-foundry-relay-provider"),
@@ -70,12 +71,17 @@ function test_relocated_executable_runs_without_compiler_or_provider(_context: t
     os.with_env("LUA_PATH", ""), os.with_env("LUA_CPATH", ""),
     os.with_env("PATH", "/nonexistent-foundry-relay-tools"))
   defer stop(process)
+  process.stdin:close()
+  local ready? = process.stderr:read_until("\n", true)
+  test.assert(ready ~= nil, "relocated executable exited before its startup record")
+  local started = wire.object(ready)
+  test.assert(wire.text(started, "event") == "server_started" and
+    wire.text(started, "level") == "info" and started["port"] == port,
+    "relocated static executable failed to start")
   local stderr = async.run<|string, value|>(function (): string return consume(process.stderr) end)
   defer hub.drain(stderr)
-  process.stdin:close()
-  local ready? = process.stdout:read_until("\n", true)
-  test.assert(ready == "Foundry relay listening on 127.0.0.1:" .. port,
-    "relocated static executable failed to start")
+  local stdout = async.run<|string, value|>(function (): string return consume(process.stdout) end)
+  defer hub.drain(stdout)
   local health = http.get("http://127.0.0.1:" .. port .. "/health")
   defer health:close()
   local health_body = string.writer()
@@ -122,13 +128,43 @@ function test_relocated_executable_runs_without_compiler_or_provider(_context: t
   test.assert(wire.text(removed, "channel") == "chat-events" and removed["count"] == 0,
     "closed SSE client retained its subscription")
   test.assert(async.join(sending):has_succeeded(), "SSE event producer did not finish")
-  world:shutdown(1000, "process regression complete", 1000)
+  -- Keep the world online so signal shutdown must record its disconnect before
+  -- draining the logger, even if the accepted HTTP handler retires later.
   process:kill("term")
   local exit = process:wait()
   test.assert(exit.code == 0 and exit.signal == nil, "server failed graceful SIGTERM shutdown")
   case async.join(stderr)
-  when succeeded(errors) then test.assert(errors == "", "standalone server emitted diagnostics: " .. errors)
+  when succeeded(lines) then
+    local requests = 0
+    local connected = 0
+    local disconnected = 0
+    for line in string.split(lines, "\n") do
+      if line ~= "" then
+        local entry = wire.object(line)
+        local event = wire.text(entry, "event")
+        local level = wire.text(entry, "level")
+        -- This test deliberately breaks an SSE response. Its failed write is
+        -- an expected error record; info still includes error severity.
+        test.assert(level == "info" or (level == "error" and event == "http_request_failed" and
+          wire.text(entry, "reason") == "io_failure"),
+          "standalone server emitted an unexpected event severity or failure")
+        if event == "http_request" then requests = requests + 1 end
+        if event == "websocket_connected" then connected = connected + 1 end
+        if event == "websocket_disconnected" then disconnected = disconnected + 1 end
+        test.assert(not string.find(line, "process-api-key", 1, true) and
+          not string.find(line, "TEST42", 1, true) and
+          not string.find(line, wire.text(credentials, "token"), 1, true),
+          "standalone log exposed a credential")
+      end
+    end
+    test.assert(requests == 4 and connected == 1 and disconnected == 1,
+      "standalone server omitted or duplicated request/session logs")
   when failed(failure) then failure:raise()
   else raise "stderr reader failed"
+  end
+  case async.join(stdout)
+  when succeeded(output) then test.assert(output == "", "server emitted non-JSON stdout diagnostics")
+  when failed(failure) then failure:raise()
+  else raise "stdout reader failed"
   end
 end

@@ -105,13 +105,19 @@ try {
     RELAY_ALLOWED_ORIGINS = 'http://127.0.0.1:30000'
     RELAY_REQUEST_TIMEOUT_MS = '1000'; RELAY_AUTH_TIMEOUT_MS = '10000'
     RELAY_HEARTBEAT_MS = '30000'; RELAY_MAX_PENDING = '128'
+    RELAY_LOG_LEVEL = 'info'; RELAY_CHROME = ''
   }
   $server = Start-NativeProcess "$relocated\bin\foundry-relay.exe" $cwd $settings
-  $diagnostics = $server.StandardError.ReadToEndAsync()
-  $ready = $server.StandardOutput.ReadLineAsync()
-  if (-not $ready.Wait(10000) -or $ready.Result -ne "Foundry relay listening on 127.0.0.1:$port") {
+  $applicationOutput = $server.StandardOutput.ReadToEndAsync()
+  $ready = $server.StandardError.ReadLineAsync()
+  if (-not $ready.Wait(10000) -or -not $ready.Result) {
     throw 'Relocated Windows application did not become ready'
   }
+  $started = $ready.Result | ConvertFrom-Json
+  if ($started.event -ne 'server_started' -or $started.level -ne 'info' -or
+      $started.port -ne $port) { throw 'Invalid Windows application startup log' }
+  $applicationLogs = New-Object 'Collections.Generic.List[string]'
+  $applicationLogs.Add($ready.Result)
   $health = Invoke-WebRequest "http://127.0.0.1:$port/health" -UseBasicParsing -TimeoutSec 5
   if ($health.StatusCode -ne 200 -or ($health.Content | ConvertFrom-Json).status -ne 'ok') {
     throw 'Native health check failed'
@@ -129,11 +135,40 @@ try {
     throw 'Native authenticated client listing failed'
   }
   Write-Output 'Relocated application passed health, pairing, and authenticated clients checks without SDK/toolchain PATH'
+  # Observe request records before terminating the smoke process so the
+  # bounded asynchronous logger cannot lose its final request to hard kill.
+  $loggedRequests = 0
+  for ($index = 0; $index -lt 32 -and $loggedRequests -lt 3; $index++) {
+    $next = $server.StandardError.ReadLineAsync()
+    if (-not $next.Wait(10000) -or -not $next.Result) {
+      throw 'Missing Windows application request log'
+    }
+    $applicationLogs.Add($next.Result)
+    $entry = $next.Result | ConvertFrom-Json
+    if ($entry.event -eq 'http_request') { $loggedRequests++ }
+  }
+  if ($loggedRequests -ne 3) { throw 'Missing Windows application request records' }
+  $diagnostics = $server.StandardError.ReadToEndAsync()
   $server.Kill()
   if (-not $server.WaitForExit(10000)) { throw 'Application did not terminate after smoke checks' }
-  if (-not $diagnostics.Wait(10000) -or $diagnostics.Result -ne '') {
-    throw "Application emitted diagnostics: $($diagnostics.Result)"
+  if (-not $diagnostics.Wait(10000) -or -not $applicationOutput.Wait(10000)) {
+    throw 'Windows application output did not close'
   }
+  if ($applicationOutput.Result -ne '') { throw 'Windows application wrote non-log stdout' }
+  foreach ($line in ($diagnostics.Result -split '\r?\n')) {
+    if ($line) { $applicationLogs.Add($line) }
+  }
+  foreach ($line in $applicationLogs) {
+    $entry = $line | ConvertFrom-Json
+    if ($entry.level -ne 'info' -or -not $entry.timestamp -or -not $entry.event) {
+      throw 'Invalid Windows application JSON log'
+    }
+    if ($line.Contains('windows-smoke-api-key') -or $line.Contains('WIN42A') -or
+        $line.Contains([string]$identity.token)) {
+      throw 'Windows application log exposed a credential'
+    }
+  }
+  Write-Output 'Relocated application emitted JSON startup/request logs without credentials'
   Stop-NativeProcess $server
   $server = $null
 

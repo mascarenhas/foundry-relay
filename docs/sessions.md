@@ -9,8 +9,7 @@ through Foundry's administration screen. See the [REST catalog](api.md) and
 
 ## Enable sessions
 
-Configure the ordinary relay executable; a separate headless executable or
-`.world` fixture is not required. Leave `RELAY_CHROME` unset to disable session
+Configure the ordinary relay executable. Leave `RELAY_CHROME` unset to disable session
 creation. Chrome remains a separate installed dependency, controlled by native
 Titan CDP; the relay does not invoke Node, Python, or the Titan compiler.
 
@@ -31,6 +30,9 @@ export RELAY_BROWSER_PROFILES="$PWD/build/browser-profiles"
 export RELAY_ALLOWED_ORIGINS='https://foundry.example.test'
 ./build/foundry-relay
 ```
+
+For a system Flatpak Chrome installation, the launcher can be
+`/var/lib/flatpak/exports/bin/com.google.Chrome`.
 
 Use a profile parent accessible to the selected launcher. A Flatpak Chrome
 launcher may not see the host's `/tmp`; an accessible directory under the

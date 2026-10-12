@@ -4,7 +4,7 @@ local async = import "async"
 local timer = import "timer"
 local string = import "string"
 local iteration = import "iteration"
-local os = import "os"
+local log = import "relay.log"
 local config = import "relay.config"
 local wire = import "relay.wire"
 local router = import "relay.router"
@@ -20,6 +20,7 @@ record Server
   local const database: store.Store
   local const routes: router.Router
   local const headless: sessions.Manager
+  local const logger: log.Logger?
   local listener: http.Server?
   local closed: boolean
 end
@@ -46,7 +47,8 @@ local function json_body(request: http.Request): {string: value}
 end
 
 function Server.new(settings: config.Config, headless_options: sessions.Options?,
-    launcher: (function(foundry.Options, string, string, hub.Hub, integer): sessions.Client)?): Server
+    launcher: (function(foundry.Options, string, string, hub.Hub, integer): sessions.Client)?,
+    logger: log.Logger?): Server
   local declarations = api.routes()
   local local_routes: {router.Route} = {
     router.Route("GET", "/health", "health"),
@@ -68,15 +70,15 @@ function Server.new(settings: config.Config, headless_options: sessions.Options?
     router.Route("GET", "/scene/subscribe", "sse:scene-events") }
   -- Specific local routes precede the upstream route table.
   for i = 1, #declarations do local_routes[#local_routes + 1] = declarations[i] end
-  local worlds = hub.Hub(settings.max_pending, settings.heartbeat)
+  local worlds = hub.Hub(settings.max_pending, settings.heartbeat, logger)
   local database = store.open(settings.database)
   local published = false
   defer if not published then database:close(); worlds:close() end
   local headless = sessions.Manager(headless_options or sessions.settings(), database, worlds,
-    settings.public_url, settings.origins, launcher)
+    settings.public_url, settings.origins, launcher, logger)
   local result: Server = { config = settings, worlds = worlds,
     database = database, routes = router.Router(local_routes), headless = headless,
-    listener = nil, closed = false }
+    logger = logger, listener = nil, closed = false }
   published = true
   return result
 end
@@ -140,6 +142,7 @@ local function Server:pair(request: http.Request, response: http.Response)
   if world_id == "" then router.error_response(response, 400, "worldId is required"); return end
   local client = self.database:pair(world_id, wire.text(data, "worldTitle", world_id),
     wire.text(data, "serverFingerprint"), wire.text(data, "serverOrigin"), wire.text(data, "existingClientId"))
+  log.emit(self.logger, "info", "pairing_created", {["client_id"] = client.client_id})
   local result: {string: value} = { ["token"] = client.token, ["clientId"] = client.client_id,
     ["relayUrl"] = self.config.public_url }
   router.json_response(response, 200, wire.encode(result))
@@ -149,6 +152,7 @@ local function Server:unpair(request: http.Request, response: http.Response)
   local data = json_body(request)
   local id? = self.database:revoke(wire.text(data, "token"))
   if not id then router.error_response(response, 401, "invalid pairing token"); return end
+  log.emit(self.logger, "info", "pairing_revoked", {["client_id"] = id})
   self.worlds:disconnect(id)
   router.json_response(response, 200, "{\"success\":true}")
 end
@@ -166,11 +170,17 @@ local function Server:websocket(request: http.Request, response: http.Response, 
   end)
   defer hub.drain(deadline)
   local kind?, text? = connection:read()
-  if not kind or kind ~= websocket.TEXT then return end
+  if not kind then return end
+  if kind ~= websocket.TEXT then
+    log.emit(self.logger, "error", "websocket_failed", {["reason"] = "authentication_requires_text"})
+    return
+  end
+  log.emit(self.logger, "debug", "websocket_message_received", {["type"] = "authentication", ["bytes"] = #text})
   local auth = wire.object(text)
   local token = wire.text(auth, "token")
   local client? = self.database:authenticate(id, token)
   if wire.text(auth, "type") ~= "auth" or not client then
+    log.emit(self.logger, "info", "websocket_authentication_rejected")
     connection:write(websocket.TEXT, "{\"type\":\"auth-failed\",\"error\":\"invalid pairing token\"}")
     connection:shutdown(1008, "authentication failed", 1000)
     return
@@ -184,6 +194,7 @@ local function Server:websocket(request: http.Request, response: http.Response, 
   -- ownership before any output can yield; unpair now always finds the session.
   client = self.database:authenticate(id, token)
   if not client then
+    log.emit(self.logger, "info", "websocket_authentication_rejected")
     connection:write(websocket.TEXT, "{\"type\":\"auth-failed\",\"error\":\"invalid pairing token\"}")
     connection:shutdown(1008, "authentication failed", 1000)
     return
@@ -192,7 +203,9 @@ local function Server:websocket(request: http.Request, response: http.Response, 
 catch
   -- The connection owns its transferred stream and all cleanup. A malformed
   -- module message or ordinary network loss affects only this world.
-  os.stderr:write("Foundry WebSocket session ended\n")
+  if not self.closed and not (error is async.CancellationReason) then
+    log.emit(self.logger, "error", "websocket_failed", {["reason"] = "handshake_or_authentication_failed"})
+  end
 end
 
 local function Server:clients(response: http.Response)
@@ -293,7 +306,7 @@ local function Server:forward(request: http.Request, response: http.Response, ma
   response:write(converted.body)
 end
 
-function Server:handle(request: http.Request, response: http.Response)
+local function Server:dispatch(request: http.Request, response: http.Response, resolution: router.Resolution)
   if self.closed then
     response:set_header("Connection", "close")
     router.error_response(response, 503, "relay is closed")
@@ -311,7 +324,6 @@ function Server:handle(request: http.Request, response: http.Response)
     response:set_status(204)
     return
   end
-  local resolution = self.routes:match(request.method, request.target)
   if resolution.status ~= 200 then
     if resolution.status == 405 then response:set_header("Allow", router.allow_header(resolution.allowed)) end
     router.error_response(response, resolution.status, resolution.error or "route not found")
@@ -335,6 +347,7 @@ function Server:handle(request: http.Request, response: http.Response)
   if match.action == "forget" then
     local id = match.params["clientId"]
     if not self.database:remove(id) then router.error_response(response, 404, "unknown client"); return end
+    log.emit(self.logger, "info", "client_removed", {["client_id"] = id})
     self.worlds:disconnect(id)
     router.json_response(response, 200, "{\"success\":true}")
     return
@@ -348,11 +361,32 @@ catch
     if error is sessions.Error then
       local problem: sessions.Error = error
       router.error_response(response, problem.status, problem.message)
-    else router.error_response(response, 400, "invalid request")
+    else
+      if error is async.OperationError then
+        log.emit(self.logger, "error", "http_request_failed", {["reason"] = "io_failure"})
+      elseif not (error is string) and not (error is async.CancellationReason) then
+        log.emit(self.logger, "error", "http_request_failed", {["reason"] = "internal_failure"})
+      end
+      router.error_response(response, 400, "invalid request")
     end
   catch
     response:abort()
   end
+end
+
+function Server:handle(request: http.Request, response: http.Response)
+  -- Admission is visible even for rejected requests and long-lived streams.
+  -- Only declaration templates enter logs: unknown targets may contain secrets
+  -- or bytes which are not valid UTF-8. Never copy query/parameter values.
+  local resolution = self.routes:match(request.method, request.target)
+  local route = "<unmatched>"
+  if resolution.match then route = resolution.match.route.pattern end
+  local method = request.method
+  if method ~= "GET" and method ~= "POST" and method ~= "PUT" and method ~= "PATCH" and
+     method ~= "DELETE" and method ~= "OPTIONS" and method ~= "HEAD" and
+     method ~= "CONNECT" and method ~= "TRACE" then method = "OTHER" end
+  log.emit(self.logger, "info", "http_request", {["method"] = method, ["route"] = route})
+  self:dispatch(request, response, resolution)
 end
 
 function Server:start()

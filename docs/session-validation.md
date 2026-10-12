@@ -1,7 +1,7 @@
 # Session API validation
 
 Validated on 2026-10-11. These checks extend the historical
-[relay validation](validation.md) and [headless spike](headless-spike.md).
+[relay validation](validation.md).
 The production server and native tests are Titan; the live experiment's
 temporary client driver is validation tooling under ignored `build/`.
 
