@@ -217,5 +217,8 @@ function Session:check(worlds: hub.Hub)
 end
 
 function Session:close()
+  -- Retire only the captured connection, including on failed browser cleanup.
+  -- A later authenticated reconnect belongs to a different Session owner.
+  defer self.relay:close()
   self.browser:close()
 end
