@@ -187,6 +187,22 @@ function test_origin_and_missing_pairing_validation(_context: test.Context)
   test.assert(fixture.probe.started == 0)
 end
 
+function test_foundry_origin_normalizes_default_ports_and_ipv6(_context: test.Context)
+  test.assert(sessions.foundry_origin("https://example.test:443/") == "https://example.test")
+  test.assert(sessions.foundry_origin("http://example.test:80/") == "http://example.test")
+  test.assert(sessions.foundry_origin("https://[::1]:443/") == "https://[::1]")
+  test.assert(sessions.foundry_origin("http://[::1]:30000/") == "http://[::1]:30000")
+end
+
+function test_foundry_origin_rejects_credentials_query_and_fragments(_context: test.Context)
+  local addresses: {string} = {"file:///private", "wss://example.test/",
+    "https://user:password@example.test/", "https://example.test/?secret=value",
+    "https://example.test/#secret"}
+  for index = 1, #addresses do
+    expect_error(function() sessions.foundry_origin(addresses[index]) end, 400)
+  end
+end
+
 function test_reservation_prevents_simultaneous_starts(_context: test.Context)
   local fixture = fixture()
   defer fixture:close()

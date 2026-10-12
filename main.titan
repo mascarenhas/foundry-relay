@@ -3,12 +3,16 @@ local async = import "async"
 local config = import "relay.config"
 local server = import "relay.server"
 local hub = import "relay.hub"
+local log = import "relay.log"
 
-function main(args: {string}): integer
+local function run(logger: log.Logger, phase: string): integer
   local settings = config.load()
-  local relay = server.Server(settings)
+  phase = "database_or_session_initialization_failed"
+  local relay = server.Server(settings, nil, nil, logger)
   defer relay:close()
+  phase = "listener_start_failed"
   relay:start()
+  phase = "serve_or_shutdown_failed"
   local shutdown_error: async.Error? = nil
   local close = function()
     relay:close()
@@ -27,15 +31,26 @@ function main(args: {string}): integer
     return nil
   end)
   defer hub.drain(interrupt)
-  os.stdout:write("Foundry relay listening on " .. settings.host .. ":" .. settings.port .. "\n")
+  log.emit(logger, "info", "server_started", {["port"] = settings.port})
   relay:serve()
   -- Listener closure can wake serve before browser retirement completes.
   -- Await both signal owners and preserve a failed retirement in our exit code.
   hub.drain(termination)
   hub.drain(interrupt)
   if shutdown_error then shutdown_error:raise() end
+  log.emit(logger, "info", "server_stopped")
   return 0
 catch
-  os.stderr:write("Foundry relay failed: check configuration and database access\n")
+  log.emit(logger, "error", "server_failed", {["reason"] = phase})
+  return 1
+end
+
+function main(args: {string}): integer
+  local logger = log.Logger(log.resolve_level(os.getenv("RELAY_LOG_LEVEL")))
+  -- The server and its controllers retire first; then flush their final logs.
+  defer logger:close()
+  return run(logger, "invalid_configuration")
+catch
+  log.fatal("server_failed", "invalid_log_configuration")
   return 1
 end

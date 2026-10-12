@@ -1,0 +1,378 @@
+local test = import "test"
+local async = import "async"
+local http = import "http"
+local net = import "net"
+local websocket = import "websocket"
+local timer = import "timer"
+local fs = import "fs"
+local os = import "os"
+local string = import "string"
+local log = import "relay.log"
+local server = import "relay.server"
+local config = import "relay.config"
+local sessions = import "relay.sessions"
+local wire = import "relay.wire"
+local hub = import "relay.hub"
+local integration = import "tests.integration_test.titan"
+
+local record Capture
+  const logger: log.Logger
+  const lines: {string}
+end
+
+local function capture(level: string): Capture
+  local lines: {string} = {}
+  local logger = log.Logger.new(level, function(line: string)
+    lines[#lines + 1] = line
+  end)
+  return Capture(logger, lines)
+end
+
+local function start(logger: log.Logger, database: string,
+                     timeout: integer?, heartbeat: integer?): integration.Fixture
+  local first_port = 52000 + (os.pid() % 100) * 100
+  for port = first_port, first_port + 99 do
+    local settings = config.Config {
+      host = "127.0.0.1", port = port, api_key = integration.api_key,
+      pairing_code = integration.pairing_code, database = database,
+      public_url = "ws://127.0.0.1:" .. port .. "/relay",
+      origins = {"http://127.0.0.1:30000"}, request_timeout = timeout or 3000,
+      heartbeat = heartbeat or 60000, auth_timeout = 1000, max_pending = 16 }
+    local instance = server.Server(settings, sessions.Options("", "/unused", 4, 120000),
+                                   nil, logger)
+    local failure: async.Error? = nil
+    do
+      instance:start()
+    catch
+      failure = async.Error(error, traceback)
+    end
+    if not failure then
+      local serving = async.run<|async.Error?, value|>(function (): async.Error?
+        instance:serve()
+        return nil
+      catch
+        return async.Error(error, traceback)
+      end)
+      return integration.Fixture(instance, serving, port, false)
+    end
+    instance:close()
+    if failure.error is async.OperationError then
+      local problem: async.OperationError = failure.error
+      if problem.name ~= "EADDRINUSE" then failure:raise() end
+    else
+      failure:raise()
+    end
+  end
+  raise "no available loopback port for logging tests"
+end
+
+local record RawPeer
+  const connection: net.Connection
+  buffered: string
+end
+
+local function RawPeer:take(count: integer): string
+  while #self.buffered < count do
+    local chunk? = self.connection:read()
+    if chunk == nil then raise "raw WebSocket peer reached unexpected EOF" end
+    self.buffered = self.buffered .. chunk
+  end
+  local result = string.sub(self.buffered, 1, count)
+  self.buffered = string.sub(self.buffered, count + 1)
+  return result
+end
+
+local function RawPeer:frame(): (integer, string)
+  local header = self:take(2)
+  local first = string.byte(header, 1)
+  local second = string.byte(header, 2)
+  test.assert((first & 128) ~= 0 and (second & 128) == 0,
+              "raw peer expected a final unmasked server frame")
+  local length = second & 127
+  if length == 126 then
+    local extended = self:take(2)
+    length = string.byte(extended, 1) * 256 + string.byte(extended, 2)
+  elseif length == 127 then
+    raise "raw peer received an unexpectedly large frame"
+  end
+  return first & 15, self:take(length)
+end
+
+local function RawPeer:send(opcode: integer, payload: string)
+  test.assert(#payload <= 125, "raw peer fixture requires a short frame")
+  local mask: {integer} = {17, 29, 43, 59}
+  local encoded = string.writer()
+  encoded:write(string.char(128 | opcode, 128 | #payload, ...mask))
+  for index = 1, #payload do
+    encoded:write(string.char(string.byte(payload, index) ~ mask[((index - 1) % 4) + 1]))
+  end
+  self.connection:write(encoded:drain())
+end
+
+local function event_count(recording: Capture, event: string): integer
+  local count = 0
+  for index = 1, #recording.lines do
+    if wire.text(wire.object(recording.lines[index]), "event") == event then count = count + 1 end
+  end
+  return count
+end
+
+local function wait_event(recording: Capture, event: string)
+  local observed = async.run<|nil, value|>(function (): nil
+    while event_count(recording, event) == 0 do timer.yield() end
+    return nil
+  end)
+  defer hub.drain(observed)
+  local deadline = async.run<|nil, value|>(function (): nil
+    timer.sleep(3000)
+    return nil
+  end)
+  defer hub.drain(deadline)
+  case async.any_two(observed, deadline)
+  when first() then
+  when second() then raise "expected log event did not arrive"
+  else raise "log event observer failed"
+  end
+end
+
+local function validate_lines(recording: Capture, level: string, secrets: {string})
+  test.assert(#recording.lines > 0, "relay did not emit any log records")
+  for index = 1, #recording.lines do
+    local line = recording.lines[index]
+    test.assert(string.sub(line, -1) == "\n", "log record is not newline terminated")
+    test.assert(not string.find(string.sub(line, 1, -2), "\n", 1, true),
+                "log record spans multiple physical lines")
+    local fields = wire.object(line)
+    test.assert(wire.text(fields, "event") ~= "", "log record omitted its event")
+    local severity = wire.text(fields, "level")
+    test.assert(severity == "error" or severity == "info" or severity == "debug",
+                "log record has an unknown level")
+    if level == "info" then test.assert(severity ~= "debug", "info emitted a debug event") end
+    if level == "error" then test.assert(severity == "error", "error emitted an info/debug event") end
+    for secret = 1, #secrets do
+      test.assert(not string.find(line, secrets[secret], 1, true),
+                  "log record leaked request, credential, or WebSocket content")
+    end
+  end
+end
+
+function test_info_logs_api_admission_and_world_lifecycle_without_contents(_context: test.Context)
+  local recording = capture("info")
+  defer recording.logger:close()
+  local database = fs.tmpname()
+  defer fs.unlink(database)
+  local fixture = start(recording.logger, database)
+  defer fixture:close()
+  test.assert(integration.call(fixture, "GET", "/health?secret=LEAK_QUERY", nil, nil).status == 200)
+  test.assert(integration.call(fixture, "GET", "/clients", nil, nil).status == 401)
+  test.assert(integration.call(fixture, "GET", "/LEAK_PATH?secret=LEAK_UNKNOWN_QUERY", nil,
+                               integration.api_key).status == 404)
+  test.assert(integration.call(fixture, "GET", "/%FFLEAK_UTF8_PATH", nil,
+                               integration.api_key).status == 404)
+  test.assert(integration.call(fixture, "POST", "/health", [[{"secret":"LEAK_BODY"}]],
+                               integration.api_key).status == 405)
+  -- llhttp accepts this extension method, but it is outside our log vocabulary.
+  test.assert(integration.call(fixture, "PROPFIND", "/health", nil, nil).status == 405)
+  test.assert(integration.call(fixture, "GET", "/clients?secret=%00LEAK_MALFORMED_QUERY", nil,
+                               integration.api_key).status == 400)
+  test.assert(integration.call(fixture, "OPTIONS", "/LEAK_PREFLIGHT_PATH", nil, nil).status == 204)
+  local rejected = http.get("http://127.0.0.1:" .. fixture.port .. "/clients",
+    http.headers({http.Header("Origin", "https://LEAK_ORIGIN.invalid"),
+                  http.Header("Authorization", "Bearer LEAK_HEADER")}))
+  defer rejected:close()
+  test.assert(rejected.status == 403)
+  integration.read_all(rejected)
+  local credentials = integration.pair(fixture, "LEAK_WORLD_TITLE")
+  local world = integration.dial(fixture, credentials)
+  defer world:close()
+  world:write(websocket.TEXT, [[{"type":"LEAK_MESSAGE_KIND","body":"LEAK_MESSAGE_BODY"}]])
+  world:write(websocket.TEXT, [[{"type":"ping"}]])
+  test.assert(wire.text(integration.message(world), "type") == "pong")
+  world:shutdown(1000, "LEAK_CLOSE_REASON", 1000)
+  local unpair: {string: value} = {["token"] = credentials.token}
+  test.assert(integration.call(fixture, "POST", "/api/self-unpair", wire.encode(unpair), nil).status == 200)
+  test.assert(integration.call(fixture, "DELETE", "/clients/" .. credentials.id, nil,
+                               integration.api_key).status == 200)
+  fixture:close()
+  recording.logger:close()
+  test.assert(event_count(recording, "http_request") == 13,
+              "handler-visible API requests were omitted or logged more than once")
+  test.assert(event_count(recording, "pairing_created") == 1)
+  test.assert(event_count(recording, "pairing_revoked") == 1)
+  test.assert(event_count(recording, "client_removed") == 1)
+  test.assert(event_count(recording, "websocket_connected") == 1)
+  test.assert(event_count(recording, "websocket_disconnected") == 1)
+  local health = false
+  local unmatched = false
+  local other_method = false
+  for index = 1, #recording.lines do
+    local fields = wire.object(recording.lines[index])
+    if wire.text(fields, "event") == "http_request" then
+      local route = wire.text(fields, "route")
+      test.assert(route ~= "", "API admission record omitted its safe route")
+      if route == "/health" then health = true end
+      if route == "<unmatched>" then unmatched = true end
+      if wire.text(fields, "method") == "OTHER" then other_method = true end
+    end
+  end
+  test.assert(health and unmatched and other_method,
+              "request logs did not use safe route and method categories")
+  validate_lines(recording, "info", {integration.api_key, integration.pairing_code, credentials.token,
+    "LEAK_QUERY", "LEAK_PATH", "LEAK_UNKNOWN_QUERY", "LEAK_UTF8_PATH", "LEAK_BODY", "LEAK_MALFORMED_QUERY", "PROPFIND",
+    "LEAK_PREFLIGHT_PATH", "LEAK_ORIGIN", "LEAK_HEADER", "LEAK_WORLD_TITLE",
+    "LEAK_MESSAGE_KIND", "LEAK_MESSAGE_BODY", "LEAK_CLOSE_REASON"})
+end
+
+function test_debug_logs_forwarding_and_websocket_metadata_without_payloads(_context: test.Context)
+  local recording = capture("debug")
+  defer recording.logger:close()
+  local database = fs.tmpname()
+  defer fs.unlink(database)
+  local fixture = start(recording.logger, database)
+  defer fixture:close()
+  local credentials = integration.pair(fixture, "LEAK_DEBUG_WORLD")
+  local world = integration.dial(fixture, credentials)
+  defer world:close()
+  local pending = integration.request(fixture, "/world-info?clientId=" .. credentials.id)
+  defer hub.drain(pending)
+  local requested = integration.message(world)
+  integration.answer(world, requested, {["result"] = "LEAK_RESULT_BODY"})
+  test.assert(integration.await_reply(pending).status == 200)
+  local subscriber = fixture.instance.worlds:subscribe(credentials.id, "chat-events")
+  defer fixture.instance.worlds:unsubscribe(subscriber)
+  test.assert(integration.message(world)["count"] == 1)
+  world:write(websocket.TEXT, [[{"type":"chat-event","data":{"secret":"LEAK_EVENT_BODY"}}]])
+  test.assert(subscriber:next() ~= nil)
+  fixture.instance.worlds:unsubscribe(subscriber)
+  test.assert(integration.message(world)["count"] == 0)
+  world:write(websocket.TEXT, [[{"type":"LEAK_DEBUG_KIND","body":"LEAK_DEBUG_BODY"}]])
+  world:write(websocket.TEXT, [[{"type":42,"body":"LEAK_NUMERIC_KIND_BODY"}]])
+  world:write(websocket.TEXT, [[{"type":"\u00ffLEAK_UTF8_KIND","body":"LEAK_UTF8_BODY"}]])
+  world:write(websocket.TEXT, [[{"type":"ping"}]])
+  test.assert(wire.text(integration.message(world), "type") == "pong")
+  world:shutdown(1000, "LEAK_DEBUG_CLOSE", 1000)
+  fixture:close()
+  recording.logger:close()
+  test.assert(event_count(recording, "websocket_message_received") > 0)
+  test.assert(event_count(recording, "websocket_message_sent") > 0)
+  test.assert(event_count(recording, "request_forwarded") == 1)
+  test.assert(event_count(recording, "request_result") == 1)
+  test.assert(event_count(recording, "subscription_changed") >= 2)
+  local unknown = false
+  for index = 1, #recording.lines do
+    local fields = wire.object(recording.lines[index])
+    if wire.text(fields, "event") == "websocket_message_received" and
+       wire.text(fields, "type") == "unknown" then unknown = true end
+  end
+  test.assert(unknown, "untrusted message types did not use a fixed category")
+  validate_lines(recording, "debug", {integration.api_key, integration.pairing_code, credentials.token,
+    "LEAK_DEBUG_WORLD", "LEAK_RESULT_BODY", "LEAK_EVENT_BODY", "LEAK_DEBUG_KIND", "LEAK_DEBUG_BODY",
+    "LEAK_NUMERIC_KIND_BODY", "LEAK_UTF8_KIND", "LEAK_UTF8_BODY", "LEAK_DEBUG_CLOSE"})
+end
+
+function test_error_logs_timeout_and_protocol_failure_without_raw_errors(_context: test.Context)
+  local recording = capture("error")
+  defer recording.logger:close()
+  local database = fs.tmpname()
+  defer fs.unlink(database)
+  local fixture = start(recording.logger, database, 20)
+  defer fixture:close()
+  local credentials = integration.pair(fixture, "LEAK_ERROR_WORLD")
+  local world = integration.dial(fixture, credentials)
+  defer world:close()
+  local pending = integration.request(fixture, "/world-info?clientId=" .. credentials.id)
+  defer hub.drain(pending)
+  integration.message(world)
+  test.assert(integration.await_reply(pending).status == 408)
+  world:write(websocket.TEXT, "LEAK_MALFORMED_JSON")
+  wait_event(recording, "websocket_failed")
+  fixture:close()
+  recording.logger:close()
+  test.assert(event_count(recording, "request_timeout") == 1)
+  test.assert(event_count(recording, "websocket_failed") == 1)
+  validate_lines(recording, "error", {integration.api_key, integration.pairing_code, credentials.token,
+                                      "LEAK_ERROR_WORLD", "LEAK_MALFORMED_JSON"})
+end
+
+function test_sse_request_is_logged_while_its_response_remains_open(_context: test.Context)
+  local recording = capture("info")
+  defer recording.logger:close()
+  local database = fs.tmpname()
+  defer fs.unlink(database)
+  local fixture = start(recording.logger, database)
+  defer fixture:close()
+  local world = integration.dial(fixture, integration.pair(fixture, "world"))
+  defer world:close()
+  local stream = http.get("http://127.0.0.1:" .. fixture.port .. "/chat/subscribe",
+    http.headers({http.Header("x-api-key", integration.api_key)}))
+  defer stream:close()
+  test.assert(stream.status == 200)
+  test.assert(stream:read_until("\n\n", true) ~= nil)
+  test.assert(integration.message(world)["count"] == 1)
+  -- Draining the borrowed logger leaves the SSE connection and subscription
+  -- active, proving admission logging does not wait for handler completion.
+  recording.logger:close()
+  local found = 0
+  for index = 1, #recording.lines do
+    local fields = wire.object(recording.lines[index])
+    if wire.text(fields, "event") == "http_request" and
+       wire.text(fields, "route") == "/chat/subscribe" then found = found + 1 end
+  end
+  test.assert(found == 1, "live SSE request did not emit exactly one admission record")
+  fixture:close()
+end
+
+local function close_during_heartbeat(close_payload: string)
+  local recording = capture("debug")
+  defer recording.logger:close()
+  local database = fs.tmpname()
+  defer fs.unlink(database)
+  local fixture = start(recording.logger, database, nil, 1)
+  defer fixture:close()
+  local credentials = integration.pair(fixture, "heartbeat-world")
+  local connection = net.connect("127.0.0.1", fixture.port)
+  defer connection:close()
+  connection:write("GET /relay?id=" .. credentials.id .. " HTTP/1.1\r\nHost: 127.0.0.1:" ..
+    fixture.port .. "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ..
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+  local opening? = connection:read_until("\r\n\r\n", true)
+  test.assert(opening ~= nil and string.find(opening, "HTTP/1.1 101", 1, true) == 1)
+  local peer = RawPeer(connection, "")
+  peer:send(1, wire.encode({["type"] = "auth", ["token"] = credentials.token}))
+  local received_ping = false
+  while not received_ping do
+    local opcode = peer:frame()
+    test.assert(opcode == 1 or opcode == 9, "unexpected server frame before heartbeat")
+    if opcode == 9 then received_ping = true end
+  end
+  -- A raw peer deliberately omits Pong and sends a valid Close instead.
+  -- Ordinary websocket.Connection:read would automatically answer the Ping.
+  peer:send(8, close_payload)
+  local received_close = false
+  while not received_close do
+    local opcode = peer:frame()
+    test.assert(opcode == 1 or opcode == 8, "unexpected server frame while closing")
+    if opcode == 8 then received_close = true end
+  end
+  wait_event(recording, "websocket_disconnected")
+  fixture:close()
+  recording.logger:close()
+  test.assert(event_count(recording, "websocket_connected") == 1 and
+              event_count(recording, "websocket_disconnected") == 1)
+  test.assert(event_count(recording, "websocket_ping") == 1,
+              "fixture did not interrupt an outstanding heartbeat")
+  for index = 1, #recording.lines do
+    test.assert(wire.text(wire.object(recording.lines[index]), "level") ~= "error",
+                "valid peer Close was classified as a heartbeat failure")
+  end
+  validate_lines(recording, "debug", {credentials.token, "LEAK_HEARTBEAT_CLOSE"})
+end
+
+function test_peer_close_during_heartbeat_is_a_normal_disconnect(context: test.Context)
+  context:run("empty_close", function(_child: test.Context)
+    close_during_heartbeat("")
+  end)
+  context:run("normal_close", function(_child: test.Context)
+    close_during_heartbeat(string.char(3, 232) .. "LEAK_HEARTBEAT_CLOSE")
+  end)
+end

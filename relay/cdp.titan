@@ -52,7 +52,7 @@ local function Connection:exchange(request: string, id: integer,
       end
       return envelope["result"]
     end
-    -- Notifications are not queued: the spike observes readiness explicitly.
+    -- Notifications are not queued: the session observes readiness explicitly.
     if not (envelope["method"] is string) then raise Failure("Invalid CDP notification") end
   end
 end

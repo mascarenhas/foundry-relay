@@ -4,6 +4,14 @@ local websocket = import "websocket"
 local iteration = import "iteration"
 local wire = import "relay.wire"
 local store = import "relay.store"
+local log = import "relay.log"
+local api = import "relay.api"
+
+local const message_types: {string: boolean}?
+
+local function message_type(kind: string): string
+  return message_types[kind] and kind or "unknown"
+end
 
 record Reply
   const status: integer
@@ -29,6 +37,7 @@ end
 local record Outgoing
   text: string
   request_id: string?
+  kind: string?
 end
 
 local function Outgoing:should_send(pending_requests: {string: Pending}): boolean
@@ -49,6 +58,7 @@ record Session
   local closed: boolean
   local retirement: async.Task<|nil, value|>?
   local const max_pending: integer
+  local const logger: log.Logger?
 end
 
 record Subscriber
@@ -67,10 +77,12 @@ record Hub
   local const maximum: integer
   local const heartbeat: integer
   local closed: boolean
+  local const logger: log.Logger?
 end
 
-function Hub.new(maximum: integer, heartbeat: integer): Hub
-  return { sessions = {}, subscribers = {}, maximum = maximum, heartbeat = heartbeat, closed = false }
+function Hub.new(maximum: integer, heartbeat: integer, logger: log.Logger?): Hub
+  return { sessions = {}, subscribers = {}, maximum = maximum, heartbeat = heartbeat, closed = false,
+    logger = logger }
 end
 
 local function await_terminal<|A|>(task: async.Task<|A, value|>)
@@ -92,7 +104,7 @@ function drain<|A|>(task: async.Task<|A, value|>)
   await_terminal(task)
 end
 
-local function Session.new(id: string, connection: websocket.Connection, maximum: integer): Session
+local function Session.new(id: string, connection: websocket.Connection, maximum: integer, logger: log.Logger?): Session
   local publish: (function (Outgoing): (boolean))? = nil
   local finish: (function (): (boolean))? = nil
   local outbox = async.BufferedSubscription<|Outgoing, string|>(function (p, _fail, f)
@@ -102,19 +114,23 @@ local function Session.new(id: string, connection: websocket.Connection, maximum
   end)
   return { id = id, connection = connection, pending = {}, outbox = outbox,
     publish = publish, finish = finish, count = 0, queued = 0, closed = false, retirement = nil,
-    max_pending = maximum }
+    max_pending = maximum, logger = logger }
 end
 
-local function Session:enqueue(text: string, request_id: string?)
+local function Session:enqueue(text: string, request_id: string?, kind: string?)
   if self.closed then raise "Foundry world is disconnected" end
   if self.queued >= self.max_pending + 16 then raise "Foundry output queue is full" end
-  if not self.publish(Outgoing(text, request_id)) then raise "Foundry output queue is closed" end
+  if not self.publish(Outgoing(text, request_id, message_type(kind or "unknown"))) then raise "Foundry output queue is closed" end
   self.queued = self.queued + 1
 end
 
 local function Session:stop()
   if self.closed then return end
   self.closed = true
+  -- Record the logical offline transition before transport retirement yields.
+  -- HTTP handler Tasks can outlive listener shutdown and logger drainage.
+  local code? = self.connection:close_status()
+  log.emit(self.logger, "info", "websocket_disconnected", {["client_id"] = self.id, ["close_code"] = code})
   self.finish()
   for _, pending in iteration.pairs(self.pending) do
     pending:complete(Reply(503, wire.error_body("Foundry world disconnected")))
@@ -130,6 +146,7 @@ end
 local function Session:replace()
   if self.closed then return end
   self:stop()
+  log.emit(self.logger, "debug", "websocket_replaced", {["client_id"] = self.id})
   self.retirement = async.run<|nil, value|>(function(): nil
     defer self.connection:close()
     self.connection:shutdown(1000, "Replaced by reconnect", 1000)
@@ -146,6 +163,22 @@ local function Session:retire()
   self:close()
 end
 
+local function Session:log_failure(reason: string, cause: value)
+  if self.closed or cause is async.CancellationReason then return end
+  if cause is websocket.Error then
+    local failure: websocket.Error = cause
+    -- A peer Close (including an empty Close) wakes Ping/data waiters before
+    -- the reader finishes its reciprocal Close and retires this Session.
+    -- These exclusive operation owners encounter state errors during closing;
+    -- wire/protocol, timeout and transport failures remain error events.
+    if failure.kind == "state" then
+      log.emit(self.logger, "debug", "websocket_closing", {["client_id"] = self.id})
+      return
+    end
+  end
+  log.emit(self.logger, "error", "websocket_failed", {["client_id"] = self.id, ["reason"] = reason})
+end
+
 local function Session:write_loop(): nil
   while not self.closed do
     case self.outbox:next()
@@ -154,12 +187,18 @@ local function Session:write_loop(): nil
       if self.closed then return nil end
       if item:should_send(self.pending) then
         self.connection:write(websocket.TEXT, item.text)
+        log.emit(self.logger, "debug", "websocket_message_sent", {["client_id"] = self.id,
+          ["type"] = item.kind or "unknown", ["bytes"] = #item.text})
+      else
+        log.emit(self.logger, "debug", "websocket_message_discarded", {["client_id"] = self.id,
+          ["type"] = item.kind or "unknown", ["reason"] = "request_retired"})
       end
     else return nil
     end
   end
   return nil
 catch
+  self:log_failure("write_failed", error)
   if not self.retirement then self:close() end
   return nil
 end
@@ -167,10 +206,15 @@ end
 local function Session:heartbeat_loop(milliseconds: integer): nil
   while not self.closed do
     timer.sleep(milliseconds)
-    if not self.closed then self.connection:ping(5000) end
+    if not self.closed then
+      log.emit(self.logger, "debug", "websocket_ping", {["client_id"] = self.id})
+      self.connection:ping(5000)
+      log.emit(self.logger, "debug", "websocket_pong", {["client_id"] = self.id})
+    end
   end
   return nil
 catch
+  self:log_failure("heartbeat_failed", error)
   if not self.retirement then self:close() end
   return nil
 end
@@ -194,13 +238,19 @@ function Session:request(action: string, payload: {string: value}, timeout: inte
   end
   deadline = async.run<|nil, value|>(function (): nil
     timer.sleep(timeout)
+    if not pending.reply then
+      log.emit(self.logger, "error", "request_timeout", {["client_id"] = self.id,
+        ["type"] = message_type(action)})
+    end
     pending:complete(Reply(408, wire.error_body("Foundry request timed out")))
     return nil
   end)
   payload["type"] = action
   payload["requestId"] = id
   payload["clientId"] = nil
-  self:enqueue(wire.encode(payload), id)
+  self:enqueue(wire.encode(payload), id, action)
+  log.emit(self.logger, "debug", "request_forwarded", {["client_id"] = self.id,
+    ["type"] = message_type(action), ["pending"] = self.count})
   if not pending.reply then
     pending.waiter = async.running()
     async.suspend(pending.token, function () pending.waiter = nil end)
@@ -245,8 +295,10 @@ end
 local function Hub:receive(session: Session, text: string)
   local message = wire.object(text)
   local kind = wire.text(message, "type")
+  log.emit(self.logger, "debug", "websocket_message_received", {["client_id"] = session.id,
+    ["type"] = message_type(kind), ["bytes"] = #text})
   if kind == "ping" then
-    session:enqueue("{\"type\":\"pong\"}", nil)
+    session:enqueue("{\"type\":\"pong\"}", nil, "pong")
     return
   end
   local channel? = event_channel(kind)
@@ -258,6 +310,8 @@ local function Hub:receive(session: Session, text: string)
         if subscriber.queued >= 128 then
           subscriber.closed = true
           subscriber.finish()
+          log.emit(self.logger, "debug", "subscription_overflow", {["client_id"] = session.id,
+            ["channel"] = channel})
           changed = true
         elseif subscriber.publish(text) then
           subscriber.queued = subscriber.queued + 1
@@ -273,6 +327,11 @@ local function Hub:receive(session: Session, text: string)
     local status = 200
     if message["error"] ~= nil then status = 400 end
     pending:complete(Reply(status, text))
+    log.emit(self.logger, "debug", "request_result", {["client_id"] = session.id,
+      ["type"] = message_type(kind), ["status"] = status})
+  else
+    log.emit(self.logger, "debug", "websocket_message_ignored", {["client_id"] = session.id,
+      ["type"] = message_type(kind)})
   end
 end
 
@@ -290,7 +349,9 @@ local function Hub:notify_subscriptions(id: string, channel: string)
   if session and not session.closed then
     local payload: {string: value} = { ["type"] = "event-subscription-update",
       ["channel"] = channel, ["count"] = self:subscription_count(id, channel) }
-    session:enqueue(wire.encode(payload), nil)
+    session:enqueue(wire.encode(payload), nil, "event-subscription-update")
+    log.emit(self.logger, "debug", "subscription_changed", {["client_id"] = id,
+      ["channel"] = channel, ["count"] = self:subscription_count(id, channel)})
   end
 end
 
@@ -346,36 +407,58 @@ end
 
 function Hub:run(id: string, connection: websocket.Connection)
   if self.closed then return end
-  local session = Session(id, connection, self.maximum)
+  local session = Session(id, connection, self.maximum, self.logger)
   local old? = self.sessions[id]
   self.sessions[id] = session
+  log.emit(self.logger, "info", "websocket_connected", {["client_id"] = id})
   defer do
     if self.sessions[id] == session then self.sessions[id] = nil end
     session:retire()
     session.outbox:close()
   end
   if old then old:replace() end
+  session:serve(self)
+end
+
+local function Session:serve(worlds: Hub)
+  local connection = self.connection
   -- Register the session before this write yields, and finish the auth frame
   -- before starting the sole data writer. Revocation can now abort admission.
   connection:write(websocket.TEXT, "{\"type\":\"auth-success\"}")
-  if session.closed then return end
-  local writer = async.run<|nil, value|>(session:write_loop)
-  local heartbeat = async.run<|nil, value|>(function (): nil return session:heartbeat_loop(self.heartbeat) end)
+  log.emit(self.logger, "debug", "websocket_message_sent", {["client_id"] = self.id,
+    ["type"] = "auth-success", ["bytes"] = 23})
+  if self.closed then return end
+  local writer = async.run<|nil, value|>(self:write_loop)
+  local heartbeat = async.run<|nil, value|>(function (): nil return self:heartbeat_loop(worlds.heartbeat) end)
   defer do
-    session:retire()
+    self:retire()
     drain(heartbeat)
     drain(writer)
-    session.outbox:close()
+    self.outbox:close()
   end
   -- The module retains active channels across reconnect; explicit zero counts
   -- clear stale hooks as well as enabling channels with surviving SSE readers.
-  self:notify_all_subscriptions(id)
-  while not session.closed do
-    local kind?, data? = connection:read()
+  worlds:notify_all_subscriptions(self.id)
+  self:read_loop(worlds)
+catch
+  -- Revocation/replacement can abort the initial auth write. The Session owns
+  -- that closed state; Server cannot distinguish it from a transport failure.
+  self:log_failure("connection_failed", error)
+end
+
+local function Session:read_loop(worlds: Hub)
+  while not self.closed do
+    local kind?, data? = self.connection:read()
     if not kind then break end
-    if kind ~= websocket.TEXT then raise "Foundry protocol requires text messages" end
-    self:receive(session, data)
+    if kind ~= websocket.TEXT then
+      log.emit(self.logger, "error", "websocket_failed", {["client_id"] = self.id,
+        ["reason"] = "text_messages_required"})
+      return
+    end
+    worlds:receive(self, data)
   end
+catch
+  self:log_failure("message_or_transport_failed", error)
 end
 
 function Hub:disconnect(id: string)
@@ -390,5 +473,16 @@ function Hub:close()
   for i = 1, #self.subscribers do
     local subscriber? = self.subscribers[i]
     if subscriber then subscriber.closed = true; subscriber.finish() end
+  end
+end
+
+do
+  message_types = { ["ping"] = true, ["pong"] = true, ["auth-success"] = true,
+    ["event-subscription-update"] = true, ["chat-event"] = true, ["roll-data"] = true,
+    ["hook-event"] = true, ["combat-event"] = true, ["actor-event"] = true, ["scene-event"] = true }
+  local endpoints = api.definitions()
+  for index = 1, #endpoints do
+    message_types[endpoints[index].action] = true
+    message_types[endpoints[index].action .. "-result"] = true
   end
 end

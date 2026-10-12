@@ -6,13 +6,15 @@ local math = import "math"
 local os = import "os"
 local timer = import "timer"
 local uv = import "uv"
+local string = import "string"
+local url = import "url"
 local config = import "relay.config"
 local crypto = import "relay.session_crypto"
 local foundry = import "relay.foundry_session"
-local input = import "relay.spike_input"
 local hub = import "relay.hub"
 local store = import "relay.store"
 local wire = import "relay.wire"
+local log = import "relay.log"
 
 record Error
   const status: integer
@@ -73,6 +75,7 @@ record Manager
   local const entries: {string: Entry}
   local const reservations: {string: Entry}
   local closed: boolean
+  local const logger: log.Logger?
 end
 
 local function number(name: string, fallback: integer, maximum: integer): integer
@@ -90,7 +93,8 @@ end
 
 function Manager.new(options: Options, database: store.Store, worlds: hub.Hub,
                      relay_url: string, origins: {string},
-                     launcher: (function(foundry.Options, string, string, hub.Hub, integer): Client)?): Manager
+                     launcher: (function(foundry.Options, string, string, hub.Hub, integer): Client)?,
+                     logger: log.Logger?): Manager
   if options.maximum < 1 or options.maximum > 64 or options.timeout_ms < 1 or
      options.timeout_ms > 600000 then raise "Invalid headless session configuration" end
   local key: crypto.Key? = nil
@@ -103,7 +107,7 @@ function Manager.new(options: Options, database: store.Store, worlds: hub.Hub,
   local result: Manager = {options = options, database = database, worlds = worlds,
     relay_url = relay_url, origins = origins, launcher = launcher or default_launcher,
     instance_id = store.secure_token(16), key = key, handshakes = {}, entries = {},
-    reservations = {}, closed = false}
+    reservations = {}, closed = false, logger = logger}
   transferred = true
   return result
 end
@@ -120,19 +124,29 @@ local function Manager:prune()
   end
 end
 
+local function foundry_origin(address: string): string
+  local parsed?, _diagnostic? = url.parse(address)
+  if not parsed or (parsed.scheme ~= "http" and parsed.scheme ~= "https") or
+     parsed.query ~= nil then raise Error(400, "Invalid Foundry URL") end
+  local authority = parsed.host
+  if string.find(authority, ":") then authority = "[" .. authority .. "]" end
+  local default_port = false
+  if parsed.scheme == "https" then default_port = parsed.port == 443
+  else default_port = parsed.port == 80
+  end
+  if not default_port then authority = authority .. ":" .. parsed.port end
+  return parsed.scheme .. "://" .. authority
+end
+
 function Manager:handshake(address: string, user: string, world: string): {string: value}
   self:available()
   if #address > 4096 or #user < 1 or #user > 256 or #world > 256 then
     raise Error(400, "Invalid Foundry URL, username, or world")
   end
-  -- Input normalizes the origin without interpreting credentials as code. A
-  -- missing world is resolved at start from exactly one existing pairing.
-  local parsed: input.Input? = nil
-  do parsed = input.Input(address, world ~= "" and world or "unspecified", user, "")
-  catch raise Error(400, "Invalid Foundry URL")
-  end
+  -- A missing world is resolved at start from exactly one existing pairing.
+  local origin = foundry_origin(address)
   local allowed = false
-  for index = 1, #self.origins do if self.origins[index] == parsed.origin then allowed = true end end
+  for index = 1, #self.origins do if self.origins[index] == origin then allowed = true end end
   if not allowed then raise Error(403, "Foundry origin is not allowed") end
   self:prune()
   local count = 0
@@ -140,7 +154,7 @@ function Manager:handshake(address: string, user: string, world: string): {strin
   if count >= 32 then raise Error(429, "Too many pending session handshakes") end
   local token = store.secure_token()
   local nonce = store.secure_token(16)
-  self.handshakes[token] = Handshake(address, parsed.origin, user, world, nonce, uv.hrtime() + 300000000000)
+  self.handshakes[token] = Handshake(address, origin, user, world, nonce, uv.hrtime() + 300000000000)
   return {["token"] = token, ["publicKey"] = self.key.public_key, ["nonce"] = nonce,
     ["instanceId"] = self.instance_id, ["foundryUrl"] = address, ["username"] = user,
     ["expires"] = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time() + 300)}
@@ -163,11 +177,13 @@ local function Manager:retire(entry: Entry, client: Client?)
     -- Retain admission when retirement could not be proved. A failed cleanup
     -- must not admit a second browser for the same world or hide the resource.
     entry.state = "cleanup-failed"
-    os.stderr:write("Headless session cleanup failed; owned browser may require recovery\n")
+    log.emit(self.logger, "error", "headless_session_cleanup_failed", {["client_id"] = entry.client_id,
+      ["reason"] = "browser_retirement_failed"})
   else
     entry.state = "stopped"
     self.entries[entry.session_id] = nil
     if self.reservations[entry.client_id] == entry then self.reservations[entry.client_id] = nil end
+    log.emit(self.logger, "info", "headless_session_stopped", {["client_id"] = entry.client_id})
   end
   entry:notify()
 end
@@ -211,6 +227,7 @@ function Manager:begin(data: {string: value}): Entry
   -- Reserve synchronously before creating the controller or yielding again.
   self.entries[entry.session_id] = entry
   self.reservations[entry.client_id] = entry
+  log.emit(self.logger, "info", "headless_session_starting", {["client_id"] = entry.client_id})
   local pending: foundry.Options? = foundry.Options(handshake.address, handshake.origin,
     selected.world_id, handshake.user, credentials["password"], selected, self.relay_url)
   entry.worker = async.run<|nil, value|>(function (): nil
@@ -231,6 +248,10 @@ function Manager:begin(data: {string: value}): Entry
       end
     catch
       pending = nil
+      if not self.closed and entry.state ~= "stopping" and not (error is async.CancellationReason) then
+        log.emit(self.logger, "error", "headless_session_failed", {["client_id"] = entry.client_id,
+          ["reason"] = entry.state == "starting" and "startup_failed" or "connection_lost"})
+      end
       if error == "Browser cleanup failed" then entry.state = "cleanup-failed" end
       return nil
     end
@@ -252,6 +273,7 @@ end
 function Manager:publish(entry: Entry)
   if self.closed or entry.state ~= "active" then raise Error(503, "Headless session is no longer active") end
   entry.published = true
+  log.emit(self.logger, "info", "headless_session_started", {["client_id"] = entry.client_id})
 end
 
 function Manager:discard(entry: Entry)

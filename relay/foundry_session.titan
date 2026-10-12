@@ -82,7 +82,7 @@ local function binding_script(options: Options): string
     ["token"] = options.client.token, ["relay"] = options.relay_url }
   return "(() => { const cfg=" .. wire.encode(config) .. [=[;
     if (location.origin !== cfg.origin) return;
-    const state = globalThis.__titanFoundrySpike = {phase:'waiting'};
+    const state = globalThis.__titanFoundrySession = {phase:'waiting'};
     const normalize = u => String(u).replace(/\/relay\/?$/, '');
     let installed=false, bound=false, authorized=false, ticks=0;
     const bind = () => {
@@ -126,7 +126,7 @@ end
 
 local function page_state(instance: browser.Browser, timeout_ms: integer): string
   local value = instance:cdp():evaluate([=[(() => {
-    const phase=globalThis.__titanFoundrySpike?.phase;
+    const phase=globalThis.__titanFoundrySession?.phase;
     if (phase === 'authenticated' &&
         !globalThis.game?.modules?.get('foundry-rest-api')?.api?.isRelayConnected())
       return 'disconnected';
