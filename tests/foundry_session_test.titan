@@ -155,7 +155,7 @@ exec /bin/sleep 30]])
   do foundry.start(options, process.executable, process.directory, worlds, 1000)
   catch failure = error
   end
-  test.assert(failure == "Browser startup failed", "Browser activation failure escaped startup sanitization")
+  test.assert(failure == "Browser startup timed out", "Browser activation lost its deadline classification")
   test.assert((uv.hrtime() - started) // 1000000 < 6000,
     "Foundry's total startup budget did not include browser initialization")
   peer:finish()

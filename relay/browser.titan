@@ -15,6 +15,30 @@ local record Failure
   const message: string
 end
 
+local function profile_failure(name: string): Failure
+  if name == "ENOENT" then return Failure("Browser profile parent is missing") end
+  if name == "ENOTDIR" then return Failure("Browser profile parent is not a directory") end
+  if name == "EACCES" or name == "EPERM" then
+    return Failure("Browser profile parent permission denied")
+  end
+  return Failure("Browser profile parent is unavailable")
+end
+
+local function resolve_profile_parent(path: string): string
+  local parent = fs.realpath(path)
+  local entry? = fs.stat(parent)
+  if not entry then raise Failure("Browser profile parent is missing") end
+  if entry.kind ~= "directory" then raise Failure("Browser profile parent is not a directory") end
+  return parent
+catch
+  if error is async.CancellationReason or error is Failure then raise end
+  if error is async.OperationError then
+    local problem: async.OperationError = error
+    raise profile_failure(problem.name)
+  end
+  raise Failure("Browser profile parent is unavailable")
+end
+
 record Browser
   local const directory: string
   local process: os.Process?
@@ -42,9 +66,8 @@ end
 local function new_profile(parent: string): string
   local request = uv.fs_t()
   defer uv.fs_req_cleanup(request)
-  if uv.fs_mkdtemp(nil, request, parent .. "/foundry-cdp-XXXXXX", nil) < 0 then
-    raise Failure("Browser profile creation failed")
-  end
+  local result = uv.fs_mkdtemp(nil, request, parent .. "/foundry-cdp-XXXXXX", nil)
+  if result < 0 then raise profile_failure(uv.err_name(result)) end
   local directory? = uv.fs_get_path(request)
   if not directory then raise Failure("Browser profile creation failed") end
   return directory
@@ -292,7 +315,7 @@ function start(executable: string, profile_parent: string, headless: boolean,
   local timeout = startup_timeout_ms or 15000
   if timeout < 1 then raise "Browser startup timeout must be positive" end
   if executable == "" or profile_parent == "" then raise "Browser executable and profile parent are required" end
-  local parent = fs.realpath(profile_parent)
+  local parent = resolve_profile_parent(profile_parent)
   local browser = Browser { directory = new_profile(parent), process = nil, connection = nil,
     debugging_endpoint = nil,
     target_session = "", output = nil, diagnostics = nil, retirement = nil, closed = false }
@@ -302,7 +325,13 @@ function start(executable: string, profile_parent: string, headless: boolean,
   published = true
   return browser
 catch
+  if error is async.CancellationReason then raise end
   if error == "Browser cleanup failed" then raise end
+  if error == "CDP command timed out" then raise "Browser startup timed out" end
+  if error is websocket.Error then
+    local problem: websocket.Error = error
+    if problem.kind == "timeout" then raise "Browser startup timed out" end
+  end
   if error is Failure then
     local failure: Failure = error
     raise failure.message

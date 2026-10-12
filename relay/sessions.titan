@@ -60,6 +60,7 @@ record Entry
   local waiter: async.Task?
   local const wake: async.ResumeToken
   local worker: async.Task<|nil, value|>?
+  local failure_status: integer
 end
 
 record Manager
@@ -164,6 +165,51 @@ local function Entry:notify()
   if self.waiter then self.waiter:resume(self.wake) end
 end
 
+-- Only exact relay-authored messages become diagnostics. Never serialize an
+-- arbitrary error, OS diagnostic, evaluated expression, or browser output.
+local function startup_failure(problem: value): (integer, string, string)
+  if problem == "Browser profile parent is missing" then
+    return 500, "browser_profile", "profile_parent_missing"
+  end
+  if problem == "Browser profile parent is not a directory" then
+    return 500, "browser_profile", "profile_parent_not_directory"
+  end
+  if problem == "Browser profile parent permission denied" then
+    return 500, "browser_profile", "profile_parent_permission_denied"
+  end
+  if problem == "Browser profile parent is unavailable" then
+    return 500, "browser_profile", "profile_parent_unavailable"
+  end
+  if problem == "Browser profile creation failed" then
+    return 500, "browser_profile", "profile_creation_failed"
+  end
+  if problem == "Browser startup timed out" then return 408, "browser_startup", "deadline_expired" end
+  if problem == "Foundry readiness timed out" then
+    return 408, "foundry_readiness", "deadline_expired"
+  end
+  if problem == "CDP command timed out" then return 408, "browser_protocol", "deadline_expired" end
+  if problem == "Browser exited during startup" or problem == "Headless browser exited" then
+    return 500, "browser_startup", "browser_exited"
+  end
+  if problem == "Invalid browser debugging endpoint" then
+    return 500, "browser_startup", "invalid_debugging_endpoint"
+  end
+  if problem == "Browser startup failed" then return 500, "browser_startup", "startup_failed" end
+  if problem == "Foundry pairing settings do not match" then
+    return 500, "foundry_readiness", "pairing_mismatch"
+  end
+  if problem == "Foundry loaded a different world" then
+    return 500, "foundry_readiness", "wrong_world"
+  end
+  if problem == "Foundry user is not the configured full GM" then
+    return 500, "foundry_readiness", "wrong_user"
+  end
+  if problem == "Foundry requires setup or an active REST API module" then
+    return 500, "foundry_readiness", "setup_or_module_required"
+  end
+  return 500, "startup", "startup_failed"
+end
+
 local function Manager:retire(entry: Entry, client: Client?)
   if self.entries[entry.session_id] ~= entry then return end
   local failed = entry.state == "cleanup-failed"
@@ -223,7 +269,7 @@ function Manager:begin(data: {string: value}): Entry
   if count >= self.options.maximum then raise Error(429, "Headless session limit reached") end
   local entry = Entry(store.secure_token(16), selected.client_id, handshake.address,
     handshake.user, selected.world_id, os.time() * 1000, os.time() * 1000, {},
-    "starting", false, false, nil, async.ResumeToken("relay.sessions.ready"), nil)
+    "starting", false, false, nil, async.ResumeToken("relay.sessions.ready"), nil, 500)
   -- Reserve synchronously before creating the controller or yielding again.
   self.entries[entry.session_id] = entry
   self.reservations[entry.client_id] = entry
@@ -232,6 +278,7 @@ function Manager:begin(data: {string: value}): Entry
     selected.world_id, handshake.user, credentials["password"], selected, self.relay_url)
   entry.worker = async.run<|nil, value|>(function (): nil
     entry.entered = true
+    local started = uv.hrtime()
     local client: Client? = nil
     defer self:retire(entry, client)
     do
@@ -249,8 +296,16 @@ function Manager:begin(data: {string: value}): Entry
     catch
       pending = nil
       if not self.closed and entry.state ~= "stopping" and not (error is async.CancellationReason) then
-        log.emit(self.logger, "error", "headless_session_failed", {["client_id"] = entry.client_id,
-          ["reason"] = entry.state == "starting" and "startup_failed" or "connection_lost"})
+        local fields: {string: value} = {["client_id"] = entry.client_id,
+          ["reason"] = entry.state == "starting" and "startup_failed" or "connection_lost"}
+        if entry.state == "starting" then
+          local status, stage, cause = startup_failure(error)
+          entry.failure_status = status
+          fields["stage"] = stage
+          fields["cause"] = cause
+          fields["elapsed_ms"] = (uv.hrtime() - started) // 1000000
+        end
+        log.emit(self.logger, "error", "headless_session_failed", fields)
       end
       if error == "Browser cleanup failed" then entry.state = "cleanup-failed" end
       return nil
@@ -267,7 +322,7 @@ function Manager:ready(entry: Entry)
     async.suspend(entry.wake)
   end
   if self.closed then raise Error(503, "Session manager is closed") end
-  if entry.state ~= "active" then raise Error(408, "Failed to start headless Foundry session") end
+  if entry.state ~= "active" then raise Error(entry.failure_status, "Failed to start headless Foundry session") end
 end
 
 function Manager:publish(entry: Entry)
