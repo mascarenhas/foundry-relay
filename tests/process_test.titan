@@ -17,6 +17,24 @@ local function consume(stream: os.InputStream): string
   return output:drain()
 end
 
+local function assert_stdout(output: string)
+  local report? = os.getenv("RELAY_TEST_COVERAGE_REPORT")
+  if not report then
+    test.assert(output == "", "server emitted non-JSON stdout diagnostics")
+    return
+  end
+  local ending? = string.find(output, "\n", 1)
+  test.assert(ending ~= nil, "covered server omitted its coverage summary")
+  local summary = string.sub(output, 1, ending - 1)
+  test.assert(string.match(summary,
+    "^Titan executable lines: [0-9]+/[0-9]+ \\([0-9]+\\.[0-9]+%\\)$") ~= nil,
+    "covered server emitted an invalid coverage summary")
+  test.assert(string.sub(output, ending + 1) ==
+    "Coverage report: " .. report .. "/coverage.gcov\n" ..
+    "(INFO) Reading coverage data...\n(INFO) Writing coverage report...\n",
+    "covered server emitted unexpected stdout diagnostics")
+end
+
 local function stop(process: os.Process)
   if process:is_running() then process:kill("kill") end
   process:wait()
@@ -163,7 +181,7 @@ function test_relocated_executable_runs_without_compiler_or_provider(_context: t
   else raise "stderr reader failed"
   end
   case async.join(stdout)
-  when succeeded(output) then test.assert(output == "", "server emitted non-JSON stdout diagnostics")
+  when succeeded(output) then assert_stdout(output)
   when failed(failure) then failure:raise()
   else raise "stdout reader failed"
   end

@@ -8,6 +8,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+import sys
 
 
 def audit_tests(root, logfile):
@@ -15,14 +16,23 @@ def audit_tests(root, logfile):
     runs = re.findall(r"^\[ RUN      \] (.+)$", text, re.M)
     selected = re.findall(r"^\[==========\] (\d+) tests? ran\.$", text, re.M)
     passed = re.findall(r"^\[  PASSED  \] (\d+) tests?\.$", text, re.M)
+    skips = re.findall(r"^\[  SKIPPED \] (.+)$", text, re.M)
+    windows_skip = ("tests.browser_test."
+                    "test_windows_endpoint_treats_exclusive_publisher_as_pending"
+                    " (platform: exclusive Windows file sharing)")
+    platform_skip = (sys.platform == "linux" and
+                     len(skips) == 2 and set(skips) == {windows_skip, "1 test."})
     expected = {".".join(path.relative_to(root).with_suffix("").parts) + "." + name
                 for path in (root / "tests").rglob("*.titan")
                 for name in re.findall(r"^function (test_\w+)\(", path.read_text(), re.M)}
-    if (len(selected) != 1 or selected != passed or not runs or
+    if (len(selected) != 1 or len(passed) != 1 or not runs or
+            int(selected[0]) != int(passed[0]) + int(platform_skip) or
             int(selected[0]) != len(runs) or len(set(runs)) != len(runs) or
             not expected or not expected <= set(runs) or
-            re.search(r"^\[ (?: SKIPPED | FAILED  )\]", text, re.M)):
-        raise ValueError("Coverage requires the complete passing native suite without skips")
+            (skips and not platform_skip) or
+            re.search(r"^\[  FAILED  \]", text, re.M)):
+        raise ValueError("Coverage requires the complete passing native suite; "
+                         "only the Linux Windows-exclusive-sharing skip is allowed")
 
 
 def normalize(root, stage, tracefile, expected):
@@ -34,7 +44,7 @@ def normalize(root, stage, tracefile, expected):
         path = Path(source["file"])
         path = (stage / path).resolve() if not path.is_absolute() else path.resolve()
         if not path.is_relative_to(stage):
-            continue  # Source-owned SDK test support is outside the application.
+            continue  # Installed SDK modules are outside the application.
         relative = path.relative_to(stage)
         if relative not in expected:
             raise ValueError("Unexpected application source: " + str(relative))

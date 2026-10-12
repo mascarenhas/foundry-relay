@@ -15,11 +15,12 @@ $ReadObj = (Resolve-Path $ReadObj).Path
 
 # --coff-imports includes both regular imports and delay imports. Inspect every
 # image in both payloads, including the standard provider and native DLLs.
-$private = @('lua-5.5.1.dll', 'libuv-1.dll', 'libllhttp-9.4.dll',
+$private = @('lua55.dll', 'libuv-1.dll', 'libllhttp-9.4.dll',
   'libsqlite3-0.dll', 'libcrypto-3-x64.dll', 'libssl-3-x64.dll')
 $system = @('kernel32.dll', 'ucrtbase.dll', 'advapi32.dll', 'user32.dll',
   'psapi.dll', 'iphlpapi.dll', 'userenv.dll', 'ws2_32.dll', 'dbghelp.dll',
-  'ole32.dll', 'shell32.dll', 'gdi32.dll', 'crypt32.dll', 'bcrypt.dll')
+  'ole32.dll', 'shell32.dll', 'gdi32.dll', 'crypt32.dll', 'bcrypt.dll',
+  'api-ms-win-core-synch-l1-2-0.dll')
 foreach ($payload in @($Application, $TestPayload)) {
   foreach ($name in $private) {
     if (-not (Test-Path "$payload\bin\$name" -PathType Leaf)) {
