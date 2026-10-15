@@ -1,4 +1,4 @@
-# Final executable/runner artifacts, configuration stamps, and coverage stages.
+# Generated compiler files, payloads, configuration stamps, and coverage outputs.
 /build/
 .titan-ls/
 
@@ -13,8 +13,8 @@
 /relay.sqlite3
 /relay.sqlite3-*
 
-# Titan-generated companions for authored module stems.
-# Keep these exact stems in sync with Makefile.modules; authored C/H stays visible.
+# Legacy source-adjacent companions; current builds use build/.
+# Exact historical stems keep authored C/H visible.
 /main.[co]
 /main.ffi.h
 /main.titan.h

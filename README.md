@@ -6,7 +6,7 @@ The server and tests are Titan. On POSIX, application modules and the Titan stan
 
 ## Build and test
 
-Use a prepared Titan installation containing `http`, `websocket`, `sqlite3`, `json`, and `peg`, including HTTP `Response:abort()` and the compiled `titan.test.Case`/`run` API from [Titan PR #218](https://github.com/mascarenhas/titan/pull/218). GNU Make 4.3 or newer is required for grouped module outputs. [TITAN_REVISION](TITAN_REVISION) pins that producer commit for the production line-coverage workflow. Earlier Linux x86_64 and local Windows x64 validation used commit `4987078d`; those historical checks are recorded in [validation](docs/validation.md).
+Use a prepared Titan installation containing `http`, `websocket`, `sqlite3`, `json`, and `peg`, including HTTP `Response:abort()`, the compiled `titan.test.Case`/`run` API, and `--output` support from [Titan PR #236](https://github.com/mascarenhas/titan/pull/236). GNU Make 4.3 or newer is required for grouped module outputs. [TITAN_REVISION](TITAN_REVISION) pins that producer commit for the production line-coverage workflow. Earlier Linux x86_64 and local Windows x64 validation used commit `4987078d`; those historical checks are recorded in [validation](docs/validation.md).
 
 ```sh
 export PATH=/path/to/titan-prefix/bin:$PATH
@@ -29,20 +29,20 @@ the OpenSSL objects already carried by the SDK and does not invoke `pkg-config`.
 `OPENSSL_MODE` must match the installed SDK; it does not rebuild or reconfigure
 that SDK.
 
-`build/foundry-relay` is the server. `build/relay-tests` is one native `titan.test` runner containing routing, storage, API, protocol, integration, and executable tests. Titan generates C, objects, and headers beside the authored `.titan` sources. The application and tests share those production module objects and the same compiled Titan standard provider. Final links, generated runners, and entrypoints live under `build`; ordinary builds copy no sources.
+`build/foundry-relay` is the server. `build/relay-tests` is one native `titan.test` runner containing routing, storage, API, protocol, integration, and executable tests. All compiler-generated files live under `build`, preserving the source hierarchy. The application and tests share production module objects and the same compiled Titan standard provider. Builds compile authored sources directly without copying them.
 
-Both phases use `--source-first --static --incremental`. Make compiles changed modules separately with `-c`, then links the executable from current objects. An unchanged `make` performs no compilation or linking. `make test` builds only missing or stale application/test outputs before running the suite. Only test-owner objects receive Titan's test traceback flag; production modules use the same flags in both images.
+Both phases use `--static --incremental --output build`. Make compiles changed modules separately with `-c`, then links the executable from current objects in that output tree. An unchanged `make` performs no compilation or linking. `make test` builds only missing or stale application/test outputs before running the suite. Only test-owner objects receive Titan's test traceback flag; production modules use the same flags in both images.
 
-`Makefile.modules` records each module's project imports so an edited producer rebuilds its consumers before relinking. Keep it and the exact generated stems in `.gitignore` current when adding or renaming modules or changing imports. The build configuration stamp tracks source inventory and caller settings; compiler, SDK, selected provider, native tool, and OpenSSL files are ordinary Make prerequisites. SDK replacement and flag changes rebuild the shared objects. `make clean` removes the current modules' generated companions and `build`.
+`Makefile.modules` records each module's project imports so an edited producer rebuilds its consumers before relinking. Keep it current when adding or renaming modules or changing imports. The build configuration stamp tracks source inventory and caller settings; compiler, SDK, selected provider, native tool, and OpenSSL files are ordinary Make prerequisites. SDK replacement and flag changes rebuild the shared objects. `make clean` removes `build`; legacy source-adjacent artifacts are left untouched.
 
 `TITANC=/absolute/path/bin/titanc` selects a compiler and its SDK prefix. `TITAN_STDLIB=/absolute/path/lib/titan/0.6` overrides the standard-provider directory; the test command also supplies it to child fixtures through `TITAN_PATH_0_6`. Both ordinary POSIX executables embed the selected standard archive. On a restricted development host, set `CCACHE_DIR` to a writable location; `TITAN_PROBE_CACHE_DISABLE=1` is useful after a failed sandboxed native-header probe.
 
 `make coverage` runs the full Titan suite with native executable-line coverage,
-including the covered relay child launched by the process test. It combines
-both images' results across production modules, retaining zero-hit
-lines. See [the coverage workflow](docs/coverage.md) for the prepared SDK,
-matching GCC/gcov, Python and gcovr requirements, separate build/run targets,
-and reports under `build/coverage-report`.
+including the covered relay child launched by the process test. Titan produces
+its summary and annotated report for each executable directly, retaining zero-hit
+lines. No Python, gcovr, or relay-specific report processing is required.
+See [the coverage workflow](docs/coverage.md) for the matching GCC/gcov requirement,
+separate build/run targets, and native report locations.
 
 ## Run
 
@@ -162,7 +162,7 @@ make -f Makefile.windows PREFIX=/c/Titan/sdk
 make -f Makefile.windows test PREFIX=/c/Titan/sdk
 ```
 
-Windows builds use a launcher EXE and application DLL. The application payload is `build/windows/app`: run `bin/foundry-relay.exe` and retain the entire `bin`, `lib`, and license layout. Its six runtime DLLs live beside the EXE; `lib/titan/0.6` contains the application and Titan standard providers. The payload contains no Titan compiler. The build copies runtime files from the SDK and does not modify that SDK. Application and test links reuse one source-adjacent object set in that NTFS checkout, with incremental module dependencies and SDK/settings invalidation as on POSIX. Unix and Windows objects must not share a checkout.
+Windows builds use a launcher EXE and application DLL. The application payload is `build/windows/app`: run `bin/foundry-relay.exe` and retain the entire `bin`, `lib`, and license layout. Its six runtime DLLs live beside the EXE; `lib/titan/0.6` contains the application and Titan standard providers. The payload contains no Titan compiler. The build copies runtime files from the SDK and does not modify that SDK. Application and test links use `--incremental --output` and share the generated objects under `build/windows/out`, with module dependencies and SDK/settings invalidation as on POSIX. Final compiler outputs are copied into the application and test payloads. Use a separate local NTFS checkout for native Windows validation.
 
 The Windows test target compiles routing, storage, API, protocol, integration,
 CDP, browser, and session tests into a native Titan runner. The POSIX database
