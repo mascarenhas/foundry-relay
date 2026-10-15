@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Check that the coverage gate admits only the documented platform skip."""
+"""Check coverage suite auditing and authored-source report normalization."""
+import json
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 
 sys.dont_write_bytecode = True
-from coverage import audit_tests
+from coverage import audit_tests, normalize
 
 
 class CoverageAuditTest(unittest.TestCase):
@@ -68,6 +69,46 @@ class CoverageAuditTest(unittest.TestCase):
     def test_failure_is_rejected(self):
         self.reject(self.runs + self.skip + self.summary +
                     f"[  FAILED  ] {self.normal}\n")
+
+
+class CoveragePathsTest(unittest.TestCase):
+    def setUp(self):
+        self.workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(self.workspace.cleanup)
+        self.root = Path(self.workspace.name) / "source"
+        self.root.mkdir()
+        self.trace = Path(self.workspace.name) / "trace.json"
+        self.expected = {Path("main.titan"), Path("relay/service.titan")}
+
+    def normalize(self, files):
+        self.trace.write_text(json.dumps({"gcovr/format_version": "0.14", "files": files}))
+        return normalize(self.root, self.trace, self.expected)
+
+    def source(self, name, count=0):
+        return {"file": str(name), "lines": [{"line_number": 3, "count": count}]}
+
+    def test_original_paths_and_zero_hits_without_source_copies(self):
+        files = self.normalize([
+            self.source("main.titan"),
+            self.source(self.root / "relay/service.titan", 7),
+            self.source(Path(self.workspace.name) / "sdk/titan/http.titan", 11),
+        ])
+        self.assertEqual(set(files), self.expected)
+        self.assertEqual(files[Path("main.titan")]["file"], str(self.root / "main.titan"))
+        self.assertEqual(files[Path("main.titan")]["lines"], [
+            {"line_number": 3, "count": 0, "branches": []}])
+        self.assertEqual(files[Path("relay/service.titan")]["lines"][0]["count"], 7)
+
+    def test_missing_production_source_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Production inventory mismatch"):
+            self.normalize([self.source("main.titan")])
+
+    def test_duplicate_relative_and_absolute_source_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Duplicate source"):
+            self.normalize([
+                self.source("main.titan"), self.source(self.root / "main.titan"),
+                self.source("relay/service.titan"),
+            ])
 
 
 if __name__ == "__main__":

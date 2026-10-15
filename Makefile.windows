@@ -7,15 +7,17 @@ TITANC = "$(TITAN_LUA)" "$(WINDOWS_PREFIX)/lib/luarocks/rocks-5.5/titan/0.6.0-1/
 TITAN_JOBS := 1
 WINDOWS_ROOT := $(shell cygpath -m "$(abspath .)")
 WINDOWS_PREFIX := $(shell cygpath -m "$(abspath $(PREFIX))")
+OUTPUT_DIR := build/windows/out
+WINDOWS_OUTPUT := $(shell cygpath -m "$(abspath $(OUTPUT_DIR))")
 APP_SOURCES := main.titan $(sort $(wildcard relay/*.titan))
 TEST_SOURCES := $(filter-out tests/process_test.titan,$(sort $(wildcard tests/*.titan)))
 SOURCES := $(APP_SOURCES) $(TEST_SOURCES)
 MODULES := $(SOURCES:.titan=)
-APP_OBJECTS := $(APP_SOURCES:.titan=.o)
-TEST_OBJECTS := $(filter-out main.o,$(SOURCES:.titan=.o))
+APP_OBJECTS := $(addprefix $(OUTPUT_DIR)/,$(APP_SOURCES:.titan=.o))
+TEST_OBJECTS := $(addprefix $(OUTPUT_DIR)/,$(filter-out main.o,$(SOURCES:.titan=.o)))
 CORE_ROOTS := tests.router_test tests.store_test tests.api_test tests.protocol_test tests.integration_test tests.cdp_test tests.browser_test tests.foundry_session_test tests.session_crypto_test tests.sessions_test tests.session_http_test tests.log_test tests.logging_http_test
 RUNTIME_DLLS := lua55.dll libuv-1.dll libllhttp-9.4.dll libsqlite3-0.dll libcrypto-3-x64.dll libssl-3-x64.dll
-BUILD_FLAGS := --source-first --incremental
+BUILD_FLAGS := --incremental --output "$(WINDOWS_OUTPUT)"
 BUILD_CONFIG := build/windows/config
 
 export CC := clang
@@ -64,10 +66,10 @@ $(BUILD_CONFIG): FORCE | require-clang64
 		$(call shell_quote,SDK_INPUTS=$(SDK_INPUTS)) $(call shell_quote,TOOL_INPUTS=$(TOOL_INPUTS)) > "$@.tmp"
 	@if test -r "$@" && cmp -s "$@.tmp" "$@"; then rm "$@.tmp"; else mv "$@.tmp" "$@"; fi
 
-# Both final images reuse these source-adjacent module objects in this NTFS tree.
+# Both final images reuse module objects and headers in this owned output tree.
 define module_rule
-$(1).o $(1).c $(1).ffi.h &: $(1).titan $$(BUILD_INPUTS) \
-	$$(foreach dependency,$$(MODULE_IMPORTS_$(1)),$$(dependency).o $$(dependency).ffi.h)
+$(OUTPUT_DIR)/$(1).o $(OUTPUT_DIR)/$(1).c $(OUTPUT_DIR)/$(1).ffi.h &: $(1).titan $$(BUILD_INPUTS) \
+	$$(foreach dependency,$$(MODULE_IMPORTS_$(1)),$$(OUTPUT_DIR)/$$(dependency).o $$(OUTPUT_DIR)/$$(dependency).ffi.h)
 	$$(TITANC) $$(BUILD_FLAGS) -j $$(TITAN_JOBS) \
 		$$(if $$(filter tests/%,$(1)),--test) -c $$(subst /,.,$(1))
 endef
@@ -82,7 +84,9 @@ $(APP_PAYLOAD) &: $(APP_OBJECTS) THIRD_PARTY_NOTICES.md $(BUILD_INPUTS)
 	mkdir -p build/windows/app/licenses
 	cp "$(PREFIX)/share/titan/LICENSE" "$(PREFIX)/share/titan/THIRD_PARTY_NOTICES.md" build/windows/app/licenses/
 	cp -R "$(PREFIX)/share/titan/LICENSES" build/windows/app/licenses/
-	cd build/windows/app && $(TITANC) $(BUILD_FLAGS) -j 1 --launcher-name foundry-relay --tree "$(WINDOWS_ROOT)" main
+	$(TITANC) $(BUILD_FLAGS) -j 1 --launcher-name foundry-relay main
+	cp "$(OUTPUT_DIR)/bin/foundry-relay.exe" build/windows/app/bin/
+	cp "$(OUTPUT_DIR)/lib/titan/0.6/main.dll" build/windows/app/lib/titan/0.6/
 
 core-test-build: $(TEST_PAYLOAD)
 
@@ -90,11 +94,13 @@ $(TEST_PAYLOAD) &: $(TEST_OBJECTS) $(BUILD_INPUTS)
 	mkdir -p build/windows/test/bin build/windows/test/lib/titan/0.6
 	set -e; for name in $(RUNTIME_DLLS); do cp "$(PREFIX)/bin/$$name" build/windows/test/bin/; done
 	cp "$(PREFIX)/lib/titan/0.6/titan.dll" build/windows/test/lib/titan/0.6/
-	cd build/windows/test && $(TITANC) $(BUILD_FLAGS) -j 1 --launcher-name relay-tests --test --tree "$(WINDOWS_ROOT)" $(CORE_ROOTS)
+	$(TITANC) $(BUILD_FLAGS) -j 1 --launcher-name relay-tests --test $(CORE_ROOTS)
+	cp "$(OUTPUT_DIR)/bin/relay-tests.exe" build/windows/test/bin/
+	mkdir -p build/windows/test/lib/titan/0.6/tests
+	cp "$(OUTPUT_DIR)/lib/titan/0.6/tests/router_test.dll" build/windows/test/lib/titan/0.6/tests/
 
 test: all core-test-build
 	powershell.exe -NoProfile -NonInteractive -File "$(WINDOWS_ROOT)/scripts/check-windows.ps1" -Application "$(WINDOWS_ROOT)/build/windows/app" -TestPayload "$(WINDOWS_ROOT)/build/windows/test" -ReadObj "$$(cygpath -m "$$(command -v llvm-readobj)")"
 
 clean:
-	rm -f $(foreach module,$(MODULES),$(module).o $(module).c $(module).ffi.h $(module).titan.h)
 	rm -rf build/windows

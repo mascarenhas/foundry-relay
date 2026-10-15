@@ -41,7 +41,8 @@ make coverage CC=/usr/bin/gcc COVERAGE_GCOV=/usr/bin/gcov \
 
 Use `make coverage-check` to check the report's test-audit gate,
 `make coverage-build` to compile separately and `make coverage-run` to run
-the existing binaries and report without recompiling. Supply the same SDK and
+the existing binaries and report without recompiling. Keep authored sources
+unchanged between those commands. Supply the same SDK and
 tool settings to both commands. `TITANC`, `TITAN_STDLIB`, `TITAN_JOBS` and
 `OPENSSL_MODE` work as for ordinary builds; `TITAN_JOBS` defaults to two.
 
@@ -55,21 +56,22 @@ report formats. For example, `COVERAGE_FORMATS=html` requests only HTML in
 addition to the merged line JSON. Each executable still produces the native
 line JSON needed for merging, so gcovr remains required.
 
-The two covered executables and their sources are separate:
+Both covered executables compile the authored source tree directly, without
+`--source-first` or staged source copies. They have separate output directories:
 
-| Image | Staged sources | Executable |
+| Image | Compiler output directory | Executable |
 | --- | --- | --- |
-| Full native test runner | `build/coverage-src` | `build/coverage-src/tests/router_test` |
-| Relay child | `build/coverage-app-src` | `build/coverage-app-src/main` |
+| Full native test runner | `build/coverage-tests` | `build/coverage-tests/tests/router_test` |
+| Relay child | `build/coverage-app` | `build/coverage-app/main` |
 
 Coverage-generated C, headers and objects live in `.coverage` subdirectories
-inside those stages. Ordinary application and test links share the
-uninstrumented objects beside the authored sources; switching to an ordinary
-build requires no coverage artifact swap. Coverage retains two private source
-stages because the running runner and relay child reset and dump counters
+inside those output trees. Ordinary application and test links share the
+uninstrumented objects under `build`; switching to an ordinary
+build requires no coverage artifact swap. Coverage uses two output trees
+because the running runner and relay child reset and dump counters
 independently. Sharing their
 instrumented objects would also share `.gcda` paths and lose that ownership
-boundary. Keep the covered stages at their original absolute
+boundary. Keep the covered outputs at their original absolute
 paths while executing them, and serialize coverage runs that share those paths.
 
 `coverage-run` always runs the complete suite, ignores `TEST_ARGS`, and clears
@@ -89,10 +91,10 @@ it permits exactly the Windows-exclusive-sharing case's platform skip; that
 case remains selected and present in the test log. Missing Chromium capability
 and every other skip still fail collection.
 
-Each image's native report is under its stage's `.coverage/report`. The small
-`scripts/coverage.py` helper checks the staged production sources against the
-project originals, requires complete matching executable-line inventories,
-and maps the two line reports back to project paths. gcovr then merges those
+Each image's native report is under its output tree's `.coverage/report`. The small
+`scripts/coverage.py` helper requires complete matching executable-line inventories
+from the authored production sources and normalizes the report paths against the
+repository root. gcovr then merges those
 reports into `build/coverage-report`:
 
 - `lines.json`: combined executable lines and counts;
@@ -100,7 +102,7 @@ reports into `build/coverage-report`:
 - `coverage.info`: LCOV;
 - `coverage.xml`: Cobertura.
 
-The last three files follow `COVERAGE_FORMATS`. Retain both covered stages,
+The last three files follow `COVERAGE_FORMATS`. Retain both covered output trees,
 native reports and counters alongside the merged report for review.
 
 ## Scope
@@ -140,7 +142,7 @@ by original source line and includes each executable line once in the total.
 
 ## Incremental build verification
 
-Linux x86_64 validation with the pinned Titan `1f068186` SDK passed all 335
+Earlier Linux x86_64 validation with the Titan `1f068186` SDK passed all 335
 applicable cases out of 336 selected, including installed Chromium lifecycle
 tests. The sole skip was the Windows-exclusive-sharing platform case. The
 combined current fourteen-file report covered **1,822 of 1,962 executable lines

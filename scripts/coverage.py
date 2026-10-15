@@ -2,7 +2,8 @@
 """Normalize direct executable reports for an external gcovr merge.
 
 Keep production sources, including zero-hit lines. The compiler owns builds,
-counter reset/dump, and collection; this helper only verifies and maps copies.
+counter reset/dump, and collection; this helper verifies the production inventory
+and normalizes report paths against the authored source root.
 """
 import argparse
 import json
@@ -35,23 +36,21 @@ def audit_tests(root, logfile):
                          "only the Linux Windows-exclusive-sharing skip is allowed")
 
 
-def normalize(root, stage, tracefile, expected):
+def normalize(root, tracefile, expected):
     trace = json.loads(tracefile.read_text())
     if trace.get("gcovr/format_version") != "0.14":
         raise ValueError("Expected gcovr 8.4 trace format")
     files = {}
     for source in trace["files"]:
         path = Path(source["file"])
-        path = (stage / path).resolve() if not path.is_absolute() else path.resolve()
-        if not path.is_relative_to(stage):
+        path = (root / path).resolve() if not path.is_absolute() else path.resolve()
+        if not path.is_relative_to(root):
             continue  # Installed SDK modules are outside the application.
-        relative = path.relative_to(stage)
+        relative = path.relative_to(root)
         if relative not in expected:
             raise ValueError("Unexpected application source: " + str(relative))
         if relative in files:
             raise ValueError("Duplicate source: " + str(relative))
-        if path.read_bytes() != (root / relative).read_bytes():
-            raise ValueError("Staged source differs: " + str(relative))
         lines = {}
         for line in source["lines"]:
             number, count = line["line_number"], line["count"]
@@ -72,13 +71,13 @@ def main():
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--test-log", type=Path, required=True)
-    parser.add_argument("--input", nargs=2, action="append", type=Path, required=True,
-                        metavar=("SOURCE_TREE", "TRACEFILE"))
+    parser.add_argument("--input", action="append", type=Path, required=True,
+                        metavar="TRACEFILE")
     args = parser.parse_args()
     root = args.root.resolve()
     audit_tests(root, args.test_log)
     expected = {Path("main.titan")} | {p.relative_to(root) for p in (root / "relay").rglob("*.titan")}
-    traces = [normalize(root, stage.resolve(), trace, expected) for stage, trace in args.input]
+    traces = [normalize(root, trace, expected) for trace in args.input]
     for relative in expected:
         inventories = [{line["line_number"] for line in trace[relative]["lines"]} for trace in traces]
         if any(lines != inventories[0] for lines in inventories[1:]):
