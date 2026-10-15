@@ -38,11 +38,11 @@ Both phases use `--static --incremental --output build`. Make compiles changed m
 `TITANC=/absolute/path/bin/titanc` selects a compiler and its SDK prefix. `TITAN_STDLIB=/absolute/path/lib/titan/0.6` overrides the standard-provider directory; the test command also supplies it to child fixtures through `TITAN_PATH_0_6`. Both ordinary POSIX executables embed the selected standard archive. On a restricted development host, set `CCACHE_DIR` to a writable location; `TITAN_PROBE_CACHE_DISABLE=1` is useful after a failed sandboxed native-header probe.
 
 `make coverage` runs the full Titan suite with native executable-line coverage,
-including the covered relay child launched by the process test. It combines
-both images' results across production modules, retaining zero-hit
-lines. See [the coverage workflow](docs/coverage.md) for the prepared SDK,
-matching GCC/gcov, Python and gcovr requirements, separate build/run targets,
-and reports under `build/coverage-report`.
+including the covered relay child launched by the process test. Titan produces
+its summary and annotated report for each executable directly, retaining zero-hit
+lines. No Python, gcovr, or relay-specific report processing is required.
+See [the coverage workflow](docs/coverage.md) for the matching GCC/gcov requirement,
+separate build/run targets, and native report locations.
 
 ## Run
 

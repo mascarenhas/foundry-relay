@@ -36,14 +36,10 @@ BUILD_INPUTS := Makefile Makefile.modules $(BUILD_CONFIG) $(SDK_INPUTS) $(OPENSS
 shell_quote = '$(subst ','"'"',$(1))'
 
 COVERAGE_GCOV ?= $(shell command -v gcov)
-COVERAGE_GCOVR ?= $(shell command -v gcovr)
-COVERAGE_FORMATS ?= html lcov cobertura
-PYTHON ?= python3
-COVERAGE_OPTIONS = --coverage --coverage-gcov "$(COVERAGE_GCOV)" --coverage-gcovr "$(COVERAGE_GCOVR)" $(foreach format,$(sort lcov $(COVERAGE_FORMATS)),--coverage-format $(format))
-COVERAGE_RENDER = $(if $(filter html,$(COVERAGE_FORMATS)),--html-details build/coverage-report/coverage.html --html-single-page static --html-template-dir build/coverage-tests/.coverage/report --html-title 'Foundry relay executable-line coverage') $(if $(filter lcov,$(COVERAGE_FORMATS)),--lcov build/coverage-report/coverage.info) $(if $(filter cobertura,$(COVERAGE_FORMATS)),--cobertura build/coverage-report/coverage.xml)
+COVERAGE_OPTIONS = --coverage --coverage-gcov "$(COVERAGE_GCOV)"
 
 .DELETE_ON_ERROR:
-.PHONY: all test clean check-sdk check-openssl FORCE coverage coverage-check coverage-build coverage-run
+.PHONY: all test clean check-sdk check-openssl FORCE coverage coverage-build coverage-run
 all: build/foundry-relay
 
 check-sdk:
@@ -100,25 +96,16 @@ test: build/foundry-relay build/relay-tests
 # Coverage objects live in .coverage directories; ordinary builds are unaffected.
 # These two images reset/dump counters independently while the suite is active,
 # so each has its own output tree for separate .gcda ownership.
-coverage-check:
-	$(PYTHON) scripts/coverage_test.py
-
-coverage-build: $(SOURCES) Makefile | check-sdk check-openssl coverage-check
-	test -n "$(COVERAGE_GCOV)" && test -n "$(COVERAGE_GCOVR)"
+coverage-build: $(SOURCES) Makefile | check-sdk check-openssl
+	test -n "$(COVERAGE_GCOV)"
 	rm -rf build/coverage-app build/coverage-tests
 	env -u GCOV_PREFIX -u GCOV_PREFIX_STRIP $(TITANC) --output build/coverage-app --static -j $(TITAN_JOBS) $(COVERAGE_OPTIONS) main
 	env -u GCOV_PREFIX -u GCOV_PREFIX_STRIP $(TITANC) --output build/coverage-tests --static -j $(TITAN_JOBS) $(COVERAGE_OPTIONS) --test $(TEST_ROOTS) main
 
 coverage-run:
-	rm -rf build/coverage-report build/coverage-tests/.coverage/report build/coverage-app/.coverage/report
-	mkdir -p build/coverage-report build/coverage-tests/.coverage/report build/coverage-app/.coverage/report
-	env -u TITAN_FILTER -u GCOV_PREFIX -u GCOV_PREFIX_STRIP TITAN_PATH_0_6="$(TITAN_STDLIB)" RELAY_TEST_EXECUTABLE="$(ROOT)/build/coverage-app/main" RELAY_TEST_COVERAGE_REPORT="$(ROOT)/build/coverage-app/.coverage/report" timeout 120s build/coverage-tests/tests/router_test > build/coverage-report/tests.log 2>&1 || { cat build/coverage-report/tests.log; exit 1; }
-	cat build/coverage-report/tests.log
-	$(PYTHON) scripts/coverage.py --root "$(ROOT)" --output build/coverage-report --test-log build/coverage-report/tests.log --input build/coverage-tests/.coverage/report/lines.json --input build/coverage-app/.coverage/report/lines.json
-	$(COVERAGE_GCOVR) --config build/coverage-report/gcovr.cfg --root "$(ROOT)" --add-tracefile build/coverage-report/trace-0.json --add-tracefile build/coverage-report/trace-1.json --no-markers --no-exclude-noncode-lines --json build/coverage-report/lines.json $(COVERAGE_RENDER)
-ifneq ($(filter lcov,$(COVERAGE_FORMATS)),)
-	sed -i -e '/^FN/d' -e '/^BR/d' -e '/^DA:/s/,None$$//' build/coverage-report/coverage.info
-endif
+	rm -rf build/coverage-tests/.coverage/report build/coverage-app/.coverage/report
+	mkdir -p build/coverage-tests/.coverage/report build/coverage-app/.coverage/report
+	env -u TITAN_FILTER -u GCOV_PREFIX -u GCOV_PREFIX_STRIP TITAN_PATH_0_6="$(TITAN_STDLIB)" RELAY_TEST_EXECUTABLE="$(ROOT)/build/coverage-app/main" RELAY_TEST_COVERAGE_REPORT="$(ROOT)/build/coverage-app/.coverage/report" timeout 120s build/coverage-tests/tests/router_test
 
 coverage: coverage-build
 	$(MAKE) coverage-run

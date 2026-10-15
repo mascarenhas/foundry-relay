@@ -30,8 +30,7 @@ local function assert_stdout(output: string)
     "^Titan executable lines: [0-9]+/[0-9]+ \\([0-9]+\\.[0-9]+%\\)$") ~= nil,
     "covered server emitted an invalid coverage summary")
   test.assert(string.sub(output, ending + 1) ==
-    "Coverage report: " .. report .. "/coverage.gcov\n" ..
-    "(INFO) Reading coverage data...\n(INFO) Writing coverage report...\n",
+    "Coverage report: " .. report .. "/coverage.gcov\n",
     "covered server emitted unexpected stdout diagnostics")
 end
 
