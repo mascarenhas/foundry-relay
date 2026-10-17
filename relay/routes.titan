@@ -1,0 +1,27 @@
+local api = import "relay.api"
+local router = import "relay.router"
+
+function create(): router.Router
+  local declarations = api.routes()
+  local local_routes: {router.Route} = {
+    router.Route("GET", "/health", "health"),
+    router.Route("POST", "/auth/pair", "pair"),
+    router.Route("POST", "/api/self-unpair", "unpair"),
+    router.Route("GET", "/api/clients/:clientId/active", "active"),
+    router.Route("GET", "/relay", "relay"),
+    router.Route("GET", "/clients", "clients"),
+    router.Route("DELETE", "/clients/:clientId", "forget"),
+    router.Route("POST", "/session-handshake", "session-handshake"),
+    router.Route("POST", "/start-session", "session-start"),
+    router.Route("DELETE", "/end-session", "session-end"),
+    router.Route("GET", "/session", "session-list"),
+    router.Route("GET", "/chat/subscribe", "sse:chat-events"),
+    router.Route("GET", "/rolls/subscribe", "sse:roll-events"),
+    router.Route("GET", "/hooks/subscribe", "sse:hooks"),
+    router.Route("GET", "/encounters/subscribe", "sse:combat-events"),
+    router.Route("GET", "/actor/subscribe", "sse:actor-events"),
+    router.Route("GET", "/scene/subscribe", "sse:scene-events") }
+  -- Specific local routes precede the upstream route table.
+  for i = 1, #declarations do local_routes[#local_routes + 1] = declarations[i] end
+  return router.Router(local_routes)
+end

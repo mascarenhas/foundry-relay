@@ -69,7 +69,10 @@ The default listener is `127.0.0.1:3010`. SQLite credentials and metadata live i
 | `RELAY_AUTH_TIMEOUT_MS` | `10000` | First-message WebSocket authentication deadline |
 | `RELAY_HEARTBEAT_MS` | `30000` | WebSocket Ping interval; Pong progress has a five-second deadline |
 | `RELAY_MAX_PENDING` | `128` | Maximum pending REST requests per world |
+| `RELAY_API_CONCURRENCY` | `1` | Positive number of API worker OS threads; requests use round-robin dispatch |
 | `RELAY_LOG_LEVEL` | `info` | JSON logging threshold: `error`, `info`, or `debug` |
+
+Each world WebSocket connection has its own OS thread. API workers own their HTTP connections, query SQLite independently, and use four exclusive reply-channel leases each. See [thread ownership and request flow](docs/threading.md) for keep-alive dispatch, reconnects, failure handling, and the channel benchmark.
 
 Headless sessions are available in the same executable when `RELAY_CHROME` is
 configured. Pair the already running world first, then use the authenticated

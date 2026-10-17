@@ -22,7 +22,7 @@ SOURCES := $(APP_SOURCES) $(TEST_SOURCES)
 MODULES := $(SOURCES:.titan=)
 APP_OBJECTS := $(addprefix build/,$(APP_SOURCES:.titan=.o))
 TEST_OBJECTS := $(addprefix build/,$(filter-out main.o,$(SOURCES:.titan=.o)))
-TEST_ROOTS := tests.router_test tests.store_test tests.api_test tests.protocol_test tests.integration_test tests.process_test tests.cdp_test tests.browser_test tests.foundry_session_test tests.session_crypto_test tests.sessions_test tests.session_http_test tests.log_test tests.logging_http_test
+TEST_ROOTS := tests.router_test tests.store_test tests.api_test tests.protocol_test tests.integration_test tests.process_test tests.cdp_test tests.browser_test tests.foundry_session_test tests.session_crypto_test tests.sessions_test tests.session_http_test tests.log_test tests.logging_http_test tests.store_concurrency_test tests.replies_test tests.threading_test
 BUILD_FLAGS := --static --incremental --output build
 BUILD_CONFIG := build/config
 

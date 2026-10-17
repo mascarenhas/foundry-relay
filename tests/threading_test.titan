@@ -1,0 +1,302 @@
+local async = import "async"
+local fs = import "fs"
+local http = import "http"
+local iteration = import "iteration"
+local net = import "net"
+local os = import "os"
+local string = import "string"
+local test = import "test"
+local thread = import "thread"
+local timer = import "timer"
+local websocket = import "websocket"
+local config = import "relay.config"
+local control = import "relay.control"
+local messages = import "relay.messages"
+local server = import "relay.server.titan"
+local sessions = import "relay.sessions"
+local tasks = import "relay.tasks"
+local wire = import "relay.wire"
+
+local const api_key = "threading-api-key"
+
+local record Fixture
+  const instance: server.Server
+  const serving: async.Task<|async.Error?, value|>
+  const port: integer
+  closed: boolean
+end
+
+local record Reply
+  const status: integer
+  const body: string
+end
+
+local record Credential
+  const id: string
+  const token: string
+end
+
+local function bounded<|T|>(task: async.Task<|T, value|>, message: string): T
+  local deadline = async.run<|nil, value|>(function(): nil timer.sleep(5000); return nil end)
+  defer tasks.drain(deadline)
+  case async.race_two(task, deadline)
+  when first(status) then
+    case status
+    when succeeded(result) then return result
+    when failed(failure) then failure:raise()
+    when cancelled(reason) then raise reason
+    else raise "observed Task was not terminal"
+    end
+  when second() then raise message
+  end
+  raise "unreachable bounded Task status"
+end
+
+local function Fixture:close()
+  if self.closed then return end
+  self.closed = true
+  defer tasks.drain(self.serving)
+  self.instance:close()
+end
+
+local function start(context: test.Context): Fixture
+  local database = fs.tmpname()
+  context:cleanup(function() if fs.stat(database) then fs.unlink(database) end end)
+  local first_port = 53000 + (os.pid() % 100) * 30
+  for port = first_port, first_port + 29 do
+    local settings = config.Config {
+      host = "127.0.0.1", port = port, api_key = api_key, pairing_code = "123ABC",
+      database = database, public_url = "ws://127.0.0.1:" .. port .. "/relay",
+      origins = {"http://127.0.0.1:30000"}, request_timeout = 3000,
+      heartbeat = 60000, auth_timeout = 1000, max_pending = 16, api_concurrency = 3 }
+    local instance = server.Server(settings, sessions.Options("", "/unused", 4, 120000))
+    local failure: async.Error? = nil
+    do instance:start() catch failure = async.Error(error, traceback) end
+    if not failure then
+      local serving = async.run<|async.Error?, value|>(function(): async.Error?
+        instance:serve()
+        return nil
+      catch
+        return async.Error(error, traceback)
+      end)
+      local result = Fixture(instance, serving, port, false)
+      context:cleanup(function() result:close() end)
+      return result
+    end
+    instance:close()
+    if failure.error is async.OperationError then
+      if (failure.error as async.OperationError).name ~= "EADDRINUSE" then failure:raise() end
+    else failure:raise() end
+  end
+  raise "no available loopback port for threading tests"
+end
+
+local function request(fixture: Fixture, method: string, path: string, body: string?): Reply
+  local headers = http.headers({http.Header("x-api-key", api_key)})
+  if body then headers:add("Content-Type", "application/json") end
+  local response = http.request(method, "http://127.0.0.1:" .. fixture.port .. path, headers, body)
+  defer response:close()
+  local output = string.writer()
+  for chunk in response:read do output:write(chunk) end
+  return Reply(response.status, output:drain())
+end
+
+local function pair(fixture: Fixture, name: string): Credential
+  local response = request(fixture, "POST", "/auth/pair", wire.encode({
+    ["code"] = "123ABC", ["worldId"] = name, ["worldTitle"] = name,
+    ["serverFingerprint"] = "threading-foundry", ["serverOrigin"] = "http://localhost:30000"}))
+  test.assert(response.status == 200, "threaded pairing failed")
+  local data = wire.object(response.body)
+  return Credential(wire.text(data, "clientId"), wire.text(data, "token"))
+end
+
+local function message(connection: websocket.Connection): {string: value}
+  local reading = async.run<|{string: value}, value|>(function(): {string: value}
+    local kind?, text? = connection:read()
+    test.assert(kind == websocket.TEXT, "world did not receive a text message")
+    return wire.object(text)
+  end)
+  defer tasks.drain(reading)
+  return bounded(reading, "mock world did not receive its protocol message")
+end
+
+local function dial(fixture: Fixture, credential: Credential): websocket.Connection
+  local connection = websocket.connect("ws://127.0.0.1:" .. fixture.port .. "/relay?id=" .. credential.id,
+    websocket.DialOptions {read_limit = 16777216, handshake_timeout = 2000})
+  local published = false
+  defer if not published then connection:close() end
+  connection:write(websocket.TEXT, wire.encode({["type"] = "auth", ["token"] = credential.token}))
+  test.assert(wire.text(message(connection), "type") == "auth-success")
+  for _ = 1, 6 do
+    test.assert(wire.text(message(connection), "type") == "event-subscription-update")
+  end
+  connection:write(websocket.TEXT, "{\"type\":\"ping\"}")
+  test.assert(wire.text(message(connection), "type") == "pong")
+  published = true
+  return connection
+end
+
+local function world_worker(fixture: Fixture, id: string): thread.Thread<|nil|>
+  for _, entry in iteration.pairs(fixture.instance.world_workers) do
+    if entry.handle.client_id == id then return entry.worker end
+  end
+  raise "authenticated world has no owned thread"
+end
+
+local function forward(fixture: Fixture, id: string): async.Task<|Reply, value|>
+  return async.run<|Reply, value|>(function(): Reply
+    return request(fixture, "GET", "/world-info?clientId=" .. id, nil)
+  end)
+end
+
+local function answer(connection: websocket.Connection, original: {string: value}, label: string)
+  connection:write(websocket.TEXT, wire.encode({
+    ["type"] = wire.text(original, "type") .. "-result",
+    ["requestId"] = wire.text(original, "requestId"), ["result"] = label}))
+end
+
+local function options(connection: net.Connection)
+  connection:write("OPTIONS /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+  local headers? = connection:read_until("\r\n\r\n", true)
+  test.assert(headers ~= nil and string.sub(headers, 1, 12) == "HTTP/1.1 204",
+              "keepalive OPTIONS response was not complete")
+end
+
+function test_three_api_workers_advance_per_request_including_keepalive(context: test.Context)
+  local fixture = start(context)
+  test.assert(#fixture.instance.api_workers == 3 and fixture.instance.next_api == 1,
+              "configured API worker count or initial dispatch index is wrong")
+  for index = 1, 3 do
+    local connection = net.connect("127.0.0.1", fixture.port)
+    defer connection:close()
+    options(connection)
+    test.assert(fixture.instance.next_api == index % 3 + 1,
+                "new connections did not advance round-robin dispatch")
+  end
+  local retained = net.connect("127.0.0.1", fixture.port)
+  defer retained:close()
+  for index = 1, 7 do
+    options(retained)
+    test.assert(fixture.instance.next_api == index % 3 + 1,
+                "keepalive requests were pinned to a previous API worker")
+  end
+  for index = 1, 3 do
+    test.assert(not fixture.instance.api_workers[index].worker:task():status():has_finished(),
+                "an API worker ended during round-robin requests")
+  end
+end
+
+function test_world_connections_use_independent_threads(context: test.Context)
+  local fixture = start(context)
+  local first = pair(fixture, "first")
+  local second = pair(fixture, "second")
+  local left = dial(fixture, first)
+  defer left:close()
+  local right = dial(fixture, second)
+  defer right:close()
+  test.assert(world_worker(fixture, first.id) ~= world_worker(fixture, second.id),
+              "two world connections share a worker thread")
+  local held = forward(fixture, first.id)
+  defer tasks.drain(held)
+  local proceeding = forward(fixture, second.id)
+  defer tasks.drain(proceeding)
+  local left_request = message(left)
+  local right_request = message(right)
+  answer(right, right_request, "second")
+  local second_reply = bounded(proceeding, "second world was blocked by the first")
+  test.assert(second_reply.status == 200 and wire.text(wire.object(second_reply.body), "result") == "second")
+  test.assert(not held:status():has_finished(), "unanswered first world request finished early")
+  answer(left, left_request, "first")
+  test.assert(bounded(held, "first world reply was lost").status == 200)
+end
+
+function test_world_worker_termination_settles_pending_api_with_503(context: test.Context)
+  local fixture = start(context)
+  local credential = pair(fixture, "world")
+  local connection = dial(fixture, credential)
+  defer connection:close()
+  local pending = forward(fixture, credential.id)
+  defer tasks.drain(pending)
+  message(connection)
+  world_worker(fixture, credential.id):cancel()
+  test.assert(bounded(pending, "terminated world retained a pending API request").status == 503,
+              "world worker termination did not become an explicit offline response")
+  test.assert(not fixture.instance.closed and request(fixture, "GET", "/health", nil).status == 200,
+              "one world termination stopped unrelated API service")
+end
+
+function test_api_worker_termination_explicitly_fails_the_server(context: test.Context)
+  local fixture = start(context)
+  fixture.instance.api_workers[2].worker:cancel()
+  local failure? = bounded(fixture.serving, "API worker termination left Server:serve running")
+  test.assert(failure ~= nil and fixture.instance.closed,
+              "API worker termination silently reduced concurrency")
+  for index = 1, 3 do
+    test.assert(fixture.instance.api_workers[index].worker:task():status():has_finished(),
+                "Server failure left an API worker alive")
+  end
+end
+
+function test_shutdown_retires_accepted_idle_keepalive_connections(context: test.Context)
+  local fixture = start(context)
+  local connections: {net.Connection} = {}
+  defer for index = 1, #connections do connections[index]:close() end
+  for index = 1, 3 do
+    local connection = net.connect("127.0.0.1", fixture.port)
+    connections[index] = connection
+    options(connection)
+  end
+  local closing = async.run<|nil, value|>(function(): nil fixture.instance:close(); return nil end)
+  defer tasks.drain(closing)
+  bounded(closing, "Server shutdown retained accepted keepalive handlers")
+  for index = 1, #connections do
+    local connection = connections[index]
+    local reading = async.run<|string?, value|>(function(): string? return connection:read() end)
+    defer tasks.drain(reading)
+    test.assert(bounded(reading, "accepted keepalive transport survived shutdown") == nil)
+  end
+  test.assert(bounded(fixture.serving, "closed Server:serve did not finish") == nil,
+              "ordinary shutdown became a Server failure")
+end
+
+function test_cancelled_subscription_reply_retires_its_unpublished_owner(context: test.Context)
+  local fixture = start(context)
+  local credential = pair(fixture, "world")
+  local connection = dial(fixture, credential)
+  defer connection:close()
+  local tx, rx = thread.channel<|messages.ControlReply|>(1)
+  defer tx:close()
+  defer rx:close()
+  rx:close()
+  local id = "closed-subscription-reply"
+  fixture.instance.controls:send(messages.ControlRequest(id, 1, "subscribe",
+    wire.encode({["clientId"] = credential.id, ["channel"] = "chat-events"}), nil, nil, tx))
+  local barrier = control.call(fixture.instance.controls, 1, "online", "{}", nil, nil)
+  test.assert(barrier.status == 200 and fixture.instance.unclaimed[id] == nil)
+  test.assert(#fixture.instance.worlds:subscription_snapshot(credential.id).targets == 0,
+              "failed reply publication leaked its subscription")
+end
+
+function test_cancel_after_queued_subscription_reply_retires_unclaimed_owner(context: test.Context)
+  local fixture = start(context)
+  local credential = pair(fixture, "world")
+  local connection = dial(fixture, credential)
+  defer connection:close()
+  local tx, rx = thread.channel<|messages.ControlReply|>(1)
+  defer tx:close()
+  defer rx:close()
+  local id = "abandoned-subscription-reply"
+  fixture.instance.controls:send(messages.ControlRequest(id, 1, "subscribe",
+    wire.encode({["clientId"] = credential.id, ["channel"] = "chat-events"}), nil, nil, tx))
+  local receiving = async.run<|messages.ControlReply, value|>(function(): messages.ControlReply return rx:receive() end)
+  defer tasks.drain(receiving)
+  local offered = bounded(receiving, "coordinator did not offer its subscription")
+  test.assert(offered.subscription ~= nil and fixture.instance.unclaimed[id] ~= nil,
+              "reply publication did not retain the unclaimed subscription owner")
+  rx:close()
+  fixture.instance.controls:send(messages.ControlRequest(id, 1, "cancel", "{}", nil, nil, nil))
+  local barrier = control.call(fixture.instance.controls, 1, "online", "{}", nil, nil)
+  test.assert(barrier.status == 200 and fixture.instance.unclaimed[id] == nil)
+  test.assert(#fixture.instance.worlds:subscription_snapshot(credential.id).targets == 0,
+              "cancel after publication leaked an unclaimed subscription")
+end

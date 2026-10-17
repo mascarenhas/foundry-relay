@@ -1,0 +1,41 @@
+local async = import "async"
+local thread = import "thread"
+local messages = import "relay.messages"
+local protocol = import "relay.world_protocol"
+local store = import "relay.store"
+local tasks = import "relay.tasks"
+
+-- Cancellation notifications must survive the request Task that sends them.
+function notify(sender: thread.Sender<|messages.ControlRequest|>, worker_id: integer,
+    operation: string, body: string, request_id: string?,
+    subscription: protocol.Subscription?)
+  local sending = async.run<|nil, value|>(function (): nil
+    sender:send(messages.ControlRequest(request_id or store.secure_token(16),
+      worker_id, operation, body, nil, subscription, nil))
+    return nil
+  catch
+    -- Coordinator shutdown closes admission and cleans up its owned entries.
+    return nil
+  end)
+  tasks.await_terminal(sending)
+end
+
+function call(sender: thread.Sender<|messages.ControlRequest|>, worker_id: integer,
+    operation: string, body: string, world: protocol.WorldHandle?,
+    subscription: protocol.Subscription?): messages.ControlReply
+  local tx, rx = thread.channel<|messages.ControlReply|>(1)
+  local id = store.secure_token(16)
+  local completed = false
+  defer do
+    rx:close()
+    tx:close()
+    if not completed then notify(sender, worker_id, "cancel", "{}", id, nil) end
+  end
+  sender:send(messages.ControlRequest(id, worker_id, operation, body, world, subscription, tx))
+  local reply = rx:receive()
+  if reply.subscription then
+    notify(sender, worker_id, "claim", "{}", id, nil)
+  end
+  completed = true
+  return reply
+end

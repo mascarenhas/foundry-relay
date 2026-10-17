@@ -1,0 +1,376 @@
+local async = import "async"
+local http = import "http"
+local thread = import "thread"
+local timer = import "timer"
+local iteration = import "iteration"
+local string = import "string"
+local config = import "relay.config"
+local store = import "relay.store"
+local router = import "relay.router"
+local routes = import "relay.routes"
+local api = import "relay.api"
+local wire = import "relay.wire"
+local log = import "relay.log"
+local tasks = import "relay.tasks"
+local messages = import "relay.messages"
+local protocol = import "relay.world_protocol"
+local control = import "relay.control"
+local replies = import "relay.replies"
+
+record Bootstrap
+  const worker_id: integer
+  const settings: config.Config
+  const inbox: thread.Receiver<|messages.Handoff|>
+  const returned: thread.Sender<|messages.Handoff|>
+  const coordinator: thread.Sender<|messages.ControlRequest|>
+  const ready: thread.Sender<|boolean|>
+  const log_level: string
+  const log_lines: thread.Sender<|string|>?
+end
+
+local record Worker
+  const id: integer
+  const settings: config.Config
+  const database: store.Store
+  const routes: router.Router
+  const coordinator: thread.Sender<|messages.ControlRequest|>
+  const returned: thread.Sender<|messages.Handoff|>
+  const pool: replies.Pool
+  const logger: log.Logger?
+end
+
+local function Worker:ask(operation: string, data: {string: value},
+    subscription: protocol.Subscription?): messages.ControlReply
+  return control.call(self.coordinator, self.id, operation, wire.encode(data), nil, subscription)
+end
+
+local function body(request: http.Request): string
+  local output = string.writer()
+  local length = 0
+  for chunk in request:read do
+    length = length + #chunk
+    if length > 16777216 then raise "request body exceeds 16 MiB" end
+    output:write(chunk)
+  end
+  return output:drain()
+end
+
+local function json_body(request: http.Request): {string: value}
+  local source = body(request)
+  if source == "" then return {} end
+  local content_type = string.lower(request.headers:get("Content-Type") or "")
+  if string.sub(content_type, 1, 16) ~= "application/json" then
+    raise "request body must use application/json"
+  end
+  return wire.object(source)
+end
+
+
+local function Worker:origin_allowed(request: http.Request): boolean
+  local origins = request.headers:values("Origin")
+  if #origins == 0 then return true end
+  if #origins ~= 1 then return false end
+  local origin = origins[1]
+  if origin == request.url.scheme .. "://" .. request.url.authority then return true end
+  for i = 1, #self.settings.origins do if origin == self.settings.origins[i] then return true end end
+  return false
+end
+
+local function Worker:authorized(request: http.Request): boolean
+  local keys = request.headers:values("x-api-key")
+  return #keys == 1 and config.secret_equal(keys[1], self.settings.api_key)
+end
+
+local function Worker:pair(request: http.Request, response: http.Response)
+  local data = json_body(request)
+  local code = wire.text(data, "code")
+  if not config.secret_equal(code, self.settings.pairing_code) then
+    router.error_response(response, 401, "invalid pairing code")
+    return
+  end
+  local world_id = wire.text(data, "worldId")
+  if world_id == "" then router.error_response(response, 400, "worldId is required"); return end
+  local client = self.database:pair(world_id, wire.text(data, "worldTitle", world_id),
+    wire.text(data, "serverFingerprint"), wire.text(data, "serverOrigin"), wire.text(data, "existingClientId"))
+  log.emit(self.logger, "info", "pairing_created", {["client_id"] = client.client_id})
+  local result: {string: value} = { ["token"] = client.token, ["clientId"] = client.client_id,
+    ["relayUrl"] = self.settings.public_url }
+  router.json_response(response, 200, wire.encode(result))
+end
+
+
+local function sse_name(channel: string, data: {string: value}): string
+  local event_type = wire.text(data, "eventType", "create")
+  if channel == "roll-events" then return "roll" end
+  if channel == "hooks" then return wire.text(data, "hook", wire.text(data, "hookName", "hook")) end
+  local prefix = "chat"
+  if channel == "combat-events" then prefix = "combat" end
+  if channel == "actor-events" then prefix = "actor" end
+  if channel == "scene-events" then prefix = "scene" end
+  local name = prefix .. "-" .. event_type
+  if string.find(name, "\n") or string.find(name, "\r") then return prefix end
+  return name
+end
+
+
+local function Worker:forward(request: http.Request, response: http.Response, match: router.Match)
+  local endpoint = api.endpoint_for(match.action)
+  local data: {string: value} = {}
+  local content_type = request.headers:get("Content-Type") or "application/octet-stream"
+  if endpoint.special == "upload" and string.sub(string.lower(content_type), 1, 16) ~= "application/json" then
+    -- Binary upload metadata comes from the declared query parameters.
+    data["fileData"] = "data:" .. content_type .. ";base64," .. api.encode_base64(body(request))
+  else
+    data = json_body(request)
+  end
+  local payload = api.build_payload(endpoint, match, data)
+  local client_id? = match.query["clientId"]
+  if not client_id and data["clientId"] is string then client_id = data["clientId"] as string end
+  local selected = self:ask("select", {["clientId"] = client_id}, nil)
+  if selected.status ~= 200 or not selected.world then
+    router.json_response(response, selected.status, selected.body)
+    return
+  end
+  local timeout = self.settings.request_timeout
+  if timeout == 0 then timeout = endpoint.timeout_ms end
+  local reply = self.pool:request(selected.world, endpoint.action, payload, timeout)
+  if reply.status ~= 200 then router.json_response(response, reply.status, reply.body); return end
+  local converted = api.response(endpoint, wire.object(reply.body), match.query["format"])
+  response:set_status(converted.status)
+  response:set_header("Content-Type", converted.content_type)
+  for key, content in iteration.pairs(converted.headers) do response:set_header(key, content) end
+  response:write(converted.body)
+end
+
+
+local function Worker:clients(response: http.Response)
+  local clients = self.database:list()
+  local snapshot = self:ask("online", {}, nil)
+  if snapshot.status ~= 200 then router.json_response(response, snapshot.status, snapshot.body); return end
+  local online = wire.object(snapshot.body)
+  local results: {value} = {}
+  for index = 1, #clients do
+    local client = clients[index]
+    local metadata = wire.object(client.metadata_json)
+    local item: {string: value} = {["id"] = client.client_id, ["clientId"] = client.client_id,
+      ["worldId"] = client.world_id, ["worldTitle"] = client.world_title,
+      ["version"] = client.module_version, ["lastSeen"] = client.last_seen,
+      ["connected"] = online[client.client_id] == true}
+    for key, content in iteration.pairs(metadata) do
+      if key ~= "id" and key ~= "token" and key ~= "clientId" and key ~= "connected" then item[key] = content end
+    end
+    results[index] = item
+  end
+  router.json_response(response, 200, wire.encode(results))
+end
+
+local function next_event(subscription: protocol.Subscription): string?
+  case subscription.events:receive_result()
+  when message(text) then return text
+  else return nil
+  end
+end
+
+local function Worker:stream(response: http.Response, match: router.Match)
+  local channel = string.sub(match.action, 5)
+  local reply = self:ask("subscribe", {["clientId"] = match.query["clientId"], ["channel"] = channel}, nil)
+  if reply.status ~= 200 or not reply.subscription then
+    router.json_response(response, reply.status, reply.body)
+    return
+  end
+  local subscription = reply.subscription
+  defer do
+    subscription.events:close()
+    control.notify(self.coordinator, self.id, "unsubscribe", "{}", nil, subscription)
+  end
+  response:set_header("Content-Type", "text/event-stream")
+  response:set_header("Cache-Control", "no-cache")
+  response:set_header("X-Accel-Buffering", "no")
+  response:write("event: connected\ndata: " .. wire.encode({["clientId"] = subscription.client_id}) .. "\n\n")
+  local reading: async.Task<|string?, value|>? = nil
+  defer if reading then tasks.drain(reading) end
+  while true do
+    if not reading then reading = async.run<|string?, value|>(function (): string? return next_event(subscription) end) end
+    local keepalive = async.run<|nil, value|>(function (): nil timer.sleep(15000); return nil end)
+    defer tasks.drain(keepalive)
+    case async.race_two(reading, keepalive)
+    when first(status) then
+      case status
+      when succeeded(text) then
+        if not text then return end
+        local envelope = wire.object(text)
+        local data: {string: value} = envelope
+        if envelope["data"] is {string: value} then data = envelope["data"] as {string: value} end
+        local name = sse_name(channel, data)
+        if string.find(name, "\n") or string.find(name, "\r") then name = "event" end
+        response:write("event: " .. name .. "\ndata: " .. wire.encode(data) .. "\n\n")
+        reading = nil
+      else return
+      end
+    when second() then response:write(": keepalive\n\n")
+    end
+  end
+end
+
+local function single_header(request: http.Request, name: string, required: boolean): string
+  local values = request.headers:values(name)
+  if #values > 1 or (required and (#values ~= 1 or values[1] == "")) then
+    raise "invalid session header"
+  end
+  return #values == 1 and values[1] or ""
+end
+
+local function Worker:session_request(request: http.Request, response: http.Response, match: router.Match)
+  response:set_header("Cache-Control", "no-store")
+  local data: {string: value} = {}
+  if match.action == "session-handshake" then
+    data = {["address"] = single_header(request, "x-foundry-url", true),
+      ["user"] = single_header(request, "x-username", true),
+      ["world"] = single_header(request, "x-world-name", false)}
+  elseif match.action == "session-start" then
+    data = json_body(request)
+    local key = store.secure_token(16)
+    data["requestKey"] = key
+    defer control.notify(self.coordinator, self.id, "session-discard",
+      wire.encode({["requestKey"] = key}), nil, nil)
+    local reply = self:ask("session-start", data, nil)
+    router.json_response(response, reply.status, reply.body)
+    if reply.status == 200 then
+      local published = self:ask("session-publish", {["requestKey"] = key}, nil)
+      if published.status ~= 200 then response:abort() end
+    end
+    return
+  elseif match.action == "session-end" then
+    local id = match.query["sessionId"] or ""
+    if id == "" then id = wire.text(json_body(request), "sessionId") end
+    data = {["sessionId"] = id}
+  end
+  local reply = self:ask(match.action, data, nil)
+  router.json_response(response, reply.status, reply.body)
+end
+
+local function Worker:dispatch(request: http.Request, response: http.Response, resolution: router.Resolution)
+  if not self:origin_allowed(request) then router.error_response(response, 403, "origin is not allowed"); return end
+  local origin? = request.headers:get("Origin")
+  if origin then
+    response:set_header("Access-Control-Allow-Origin", origin)
+    response:set_header("Vary", "Origin")
+  end
+  if request.method == "OPTIONS" then
+    response:set_header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+    response:set_header("Access-Control-Allow-Headers", "Content-Type,X-API-Key,X-Foundry-Url,X-Username,X-World-Name")
+    response:set_status(204)
+    return
+  end
+  if resolution.status ~= 200 then
+    if resolution.status == 405 then response:set_header("Allow", router.allow_header(resolution.allowed)) end
+    router.error_response(response, resolution.status, resolution.error or "route not found")
+    return
+  end
+  local match = resolution.match
+  if match.action == "health" then router.json_response(response, 200, "{\"status\":\"ok\"}"); return end
+  if match.action == "pair" then self:pair(request, response); return end
+  if match.action == "relay" then router.error_response(response, 400, "id is required"); return end
+  if match.action == "unpair" then
+    local reply = self:ask("revoke", json_body(request), nil)
+    router.json_response(response, reply.status, reply.body)
+    return
+  end
+  if match.action == "active" then
+    local id = match.params["clientId"]
+    if not self.database:get(id) then router.error_response(response, 404, "unknown client"); return end
+    local snapshot = self:ask("online", {}, nil)
+    if snapshot.status ~= 200 then router.json_response(response, snapshot.status, snapshot.body); return end
+    router.json_response(response, 200, wire.encode({["active"] = wire.object(snapshot.body)[id] == true}))
+    return
+  end
+  if not self:authorized(request) then router.error_response(response, 401, "invalid API key"); return end
+  if string.sub(match.action, 1, 8) == "session-" then self:session_request(request, response, match); return end
+  if match.action == "clients" then self:clients(response); return end
+  if match.action == "forget" then
+    local reply = self:ask("delete", {["clientId"] = match.params["clientId"]}, nil)
+    router.json_response(response, reply.status, reply.body)
+    return
+  end
+  if string.sub(match.action, 1, 4) == "sse:" then self:stream(response, match); return end
+  self:forward(request, response, match)
+catch
+  do
+    if error is async.OperationError then
+      log.emit(self.logger, "error", "http_request_failed", {["reason"] = "io_failure"})
+    elseif not (error is string) and not (error is async.CancellationReason) then
+      log.emit(self.logger, "error", "http_request_failed", {["reason"] = "internal_failure"})
+    end
+    router.error_response(response, 400, "invalid request")
+  catch
+    response:abort()
+  end
+end
+
+local function Worker:handle(request: http.Request, response: http.Response)
+  local resolution = self.routes:match(request.method, request.target)
+  local route = "<unmatched>"
+  if resolution.match then route = resolution.match.route.pattern end
+  local method = request.method
+  if method ~= "GET" and method ~= "POST" and method ~= "PUT" and method ~= "PATCH" and
+     method ~= "DELETE" and method ~= "OPTIONS" and method ~= "HEAD" and
+     method ~= "CONNECT" and method ~= "TRACE" then method = "OTHER" end
+  log.emit(self.logger, "info", "http_request", {["method"] = method, ["route"] = route})
+  self:dispatch(request, response, resolution)
+end
+
+function run(bootstrap: Bootstrap): nil
+  local database = store.attach(bootstrap.settings.database)
+  defer database:close()
+  local logger? = log.forward(bootstrap.log_level, bootstrap.log_lines)
+  defer if logger then logger:close() end
+  local pool = replies.Pool(4)
+  defer pool:close()
+  local worker = Worker(bootstrap.worker_id, bootstrap.settings, database, routes.create(),
+    bootstrap.coordinator, bootstrap.returned, pool, logger)
+  local active: {string: async.Task<|nil, value|>} = {}
+  defer do
+    local children: {async.Task<|nil, value|>} = {}
+    for _, child in iteration.pairs(active) do children[#children + 1] = child end
+    for index = 1, #children do children[index]:cancel() end
+    for index = 1, #children do tasks.await_terminal(children[index]) end
+    -- No child can adopt another queued payload after this point.
+    while true do
+      local available, opening? = bootstrap.inbox:try_receive()
+      if not available then break end
+      http.Exchange.discard_transfer_payload(opening.payload)
+    end
+  end
+  bootstrap.ready:send(true)
+  for _, opening in bootstrap.inbox:incoming() do
+    -- Dequeue/adoption has no intervening yield: the worker owns these bytes.
+    local exchange = http.Exchange.from_transfer_payload(opening.payload)
+    local key = opening.delivery_id
+    local handling = async.run<|nil, value|>(function (): nil
+      defer active[key] = nil
+      local first = true
+      exchange:serve(function (request: http.Request, response: http.Response)
+        if first then
+          first = false
+          worker:handle(request, response)
+        else
+          -- Each later request returns to the main dispatcher, which advances
+          -- the API worker index or starts a dedicated /relay world thread.
+          async.yield()
+          local payload = http.Exchange(request, response):to_transfer_payload()
+          local accepted = false
+          defer if not accepted then http.Exchange.discard_transfer_payload(payload) end
+          local opening = messages.Handoff(store.secure_token(16), payload, request.method, request.target)
+          bootstrap.returned:send(opening)
+          accepted = true
+        end
+      end, 10000)
+      return nil
+    catch
+      -- A request-local network/cancellation failure retires only its transport.
+      return nil
+    end)
+    active[key] = handling
+  end
+  return nil
+end

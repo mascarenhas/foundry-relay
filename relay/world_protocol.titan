@@ -1,0 +1,64 @@
+-- Cross-thread world addressing and messages. Only public transfer DTOs live here.
+local thread = import "thread"
+
+record WorldReply
+  const request_id: string
+  const status: integer
+  const body: string
+end
+
+record WorldRequest
+  const request_id: string
+  const action: string
+  -- Complete wire JSON: type/requestId are set and clientId is removed.
+  const payload_json: string
+  const deadline_ns: integer
+  const reply: thread.Sender<|WorldReply|>
+end
+
+record Subscription
+  const key: string
+  const client_id: string
+  const channel: string
+  const events: thread.Receiver<|string|>
+end
+
+record SubscriptionTarget
+  const key: string
+  const channel: string
+  const events: thread.Sender<|string|>
+end
+
+record ChannelCount
+  const channel: string
+  const count: integer
+end
+
+record Activation
+  const targets: {SubscriptionTarget}
+  const counts: {ChannelCount}
+end
+
+union WorldCommand
+  quiesce(reason: string, ack: thread.Sender<|boolean|>)
+  stop(graceful: boolean)
+  cancel(request_id: string)
+  subscribe(target: SubscriptionTarget, count: integer)
+  unsubscribe(key: string, channel: string, count: integer)
+end
+
+record WorldHandle
+  const key: string
+  const client_id: string
+  const requests: thread.Sender<|WorldRequest|>
+  const commands: thread.Sender<|WorldCommand|>
+  -- Main alone closes the health Sender, after actual worker join.
+  const health: thread.Receiver<|nil|>
+end
+
+function Subscription:next(): string?
+  case self.events:receive_result()
+  when message(text) then return text
+  when closed() then return nil
+  end
+end

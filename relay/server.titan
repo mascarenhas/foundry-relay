@@ -1,18 +1,55 @@
 local http = import "http"
-local websocket = import "websocket"
 local async = import "async"
-local timer = import "timer"
-local string = import "string"
+local thread = import "thread"
 local iteration = import "iteration"
+local string = import "string"
 local log = import "relay.log"
 local config = import "relay.config"
 local wire = import "relay.wire"
 local router = import "relay.router"
+local routes = import "relay.routes"
 local store = import "relay.store"
 local hub = import "relay.hub"
-local api = import "relay.api"
+local world = import "relay.world"
+local protocol = import "relay.world_protocol"
+local api_worker = import "relay.api_worker"
+local messages = import "relay.messages"
+local tasks = import "relay.tasks"
 local sessions = import "relay.sessions"
 local foundry = import "relay.foundry_session"
+
+local record ApiWorker
+  const id: integer
+  const worker: thread.Thread<|nil|>
+  const sender: thread.Sender<|messages.Handoff|>
+  const inbox: thread.Receiver<|messages.Handoff|>
+  monitor: async.Task<|nil, value|>?
+end
+
+local record WorldWorker
+  const id: integer
+  const handle: protocol.WorldHandle
+  const worker: thread.Thread<|nil|>
+  const sender: thread.Sender<|world.Opening|>
+  const inbox: thread.Receiver<|world.Opening|>
+  const health: thread.Sender<|nil|>
+  monitor: async.Task<|nil, value|>?
+end
+
+local record Operation
+  const worker_id: integer
+  const task: async.Task<|nil, value|>
+end
+
+local record Provisional
+  const worker_id: integer
+  const entry: sessions.Entry
+end
+
+local record Unclaimed
+  const worker_id: integer
+  const subscription: protocol.Subscription
+end
 
 record Server
   const config: config.Config
@@ -23,393 +60,483 @@ record Server
   local const logger: log.Logger?
   local listener: http.Server?
   local closed: boolean
-end
-
-local function body(request: http.Request): string
-  local output = string.writer()
-  local length = 0
-  for chunk in request:read do
-    length = length + #chunk
-    if length > 16777216 then raise "request body exceeds 16 MiB" end
-    output:write(chunk)
-  end
-  return output:drain()
-end
-
-local function json_body(request: http.Request): {string: value}
-  local source = body(request)
-  if source == "" then return {} end
-  local content_type = string.lower(request.headers:get("Content-Type") or "")
-  if string.sub(content_type, 1, 16) ~= "application/json" then
-    raise "request body must use application/json"
-  end
-  return wire.object(source)
+  local started: boolean
+  local next_api: integer
+  local next_worker: integer
+  local const api_workers: {ApiWorker}
+  local const world_workers: {string: WorldWorker}
+  local const operations: {string: Operation}
+  local const provisional: {string: Provisional}
+  local const unclaimed: {string: Unclaimed}
+  local const controls: thread.Sender<|messages.ControlRequest|>
+  local const control_inbox: thread.Receiver<|messages.ControlRequest|>
+  local const returned: thread.Sender<|messages.Handoff|>
+  local const return_inbox: thread.Receiver<|messages.Handoff|>
+  local const log_lines: thread.Sender<|string|>
+  local const log_inbox: thread.Receiver<|string|>
+  local control_task: async.Task<|nil, value|>?
+  local return_task: async.Task<|nil, value|>?
+  local log_task: async.Task<|nil, value|>?
+  local retirement: async.Task<|async.Error?, value|>?
+  local failure: async.Error?
 end
 
 function Server.new(settings: config.Config, headless_options: sessions.Options?,
     launcher: (function(foundry.Options, string, string, hub.Hub, integer): sessions.Client)?,
     logger: log.Logger?): Server
-  local declarations = api.routes()
-  local local_routes: {router.Route} = {
-    router.Route("GET", "/health", "health"),
-    router.Route("POST", "/auth/pair", "pair"),
-    router.Route("POST", "/api/self-unpair", "unpair"),
-    router.Route("GET", "/api/clients/:clientId/active", "active"),
-    router.Route("GET", "/relay", "relay"),
-    router.Route("GET", "/clients", "clients"),
-    router.Route("DELETE", "/clients/:clientId", "forget"),
-    router.Route("POST", "/session-handshake", "session-handshake"),
-    router.Route("POST", "/start-session", "session-start"),
-    router.Route("DELETE", "/end-session", "session-end"),
-    router.Route("GET", "/session", "session-list"),
-    router.Route("GET", "/chat/subscribe", "sse:chat-events"),
-    router.Route("GET", "/rolls/subscribe", "sse:roll-events"),
-    router.Route("GET", "/hooks/subscribe", "sse:hooks"),
-    router.Route("GET", "/encounters/subscribe", "sse:combat-events"),
-    router.Route("GET", "/actor/subscribe", "sse:actor-events"),
-    router.Route("GET", "/scene/subscribe", "sse:scene-events") }
-  -- Specific local routes precede the upstream route table.
-  for i = 1, #declarations do local_routes[#local_routes + 1] = declarations[i] end
+  if settings.api_concurrency < 1 then raise "invalid RELAY_API_CONCURRENCY" end
   local worlds = hub.Hub(settings.max_pending, settings.heartbeat, logger)
   local database = store.open(settings.database)
   local published = false
   defer if not published then database:close(); worlds:close() end
   local headless = sessions.Manager(headless_options or sessions.settings(), database, worlds,
     settings.public_url, settings.origins, launcher, logger)
-  local result: Server = { config = settings, worlds = worlds,
-    database = database, routes = router.Router(local_routes), headless = headless,
-    logger = logger, listener = nil, closed = false }
+  local controls, control_inbox = thread.channel<|messages.ControlRequest|>(256)
+  local returned, return_inbox = thread.channel<|messages.Handoff|>(128)
+  local log_lines, log_inbox = thread.channel<|string|>(1024)
+  local result: Server = {config = settings, worlds = worlds, database = database,
+    routes = routes.create(), headless = headless, logger = logger, listener = nil,
+    closed = false, started = false, next_api = 1, next_worker = settings.api_concurrency + 1,
+    api_workers = {}, world_workers = {}, operations = {}, provisional = {}, unclaimed = {},
+    controls = controls, control_inbox = control_inbox, returned = returned, return_inbox = return_inbox,
+    log_lines = log_lines, log_inbox = log_inbox, control_task = nil, return_task = nil,
+    log_task = nil, retirement = nil, failure = nil}
   published = true
   return result
 end
 
-local function single_header(request: http.Request, name: string, required: boolean): string
-  local values = request.headers:values(name)
-  if #values > 1 or (required and (#values ~= 1 or values[1] == "")) then
-    raise sessions.Error(400, "Invalid or missing session header")
-  end
-  return #values == 1 and values[1] or ""
+local function reply(status: integer, body: string, selected: protocol.WorldHandle?,
+    subscription: protocol.Subscription?, activation: protocol.Activation?): messages.ControlReply
+  return messages.ControlReply(status, body, selected, subscription, activation)
 end
 
-local function Server:session_request(request: http.Request, response: http.Response, match: router.Match)
-  response:set_header("Cache-Control", "no-store")
-  if match.action == "session-handshake" then
-    local result = self.headless:handshake(single_header(request, "x-foundry-url", true),
-      single_header(request, "x-username", true), single_header(request, "x-world-name", false))
-    router.json_response(response, 200, wire.encode(result))
-  elseif match.action == "session-start" then
-    local entry = self.headless:begin(json_body(request))
-    defer self.headless:discard(entry)
+local function error_reply(status: integer, text: string): messages.ControlReply
+  return reply(status, wire.error_body(text), nil, nil, nil)
+end
+
+local function Server:discard_provisional(key: string, worker_id: integer)
+  local pending? = self.provisional[key]
+  if not pending or pending.worker_id ~= worker_id then return end
+  self.provisional[key] = nil
+  self.headless:discard(pending.entry)
+end
+
+local function Server:coordinate(request: messages.ControlRequest): messages.ControlReply
+  local operation = request.operation
+  local data = wire.object(request.body)
+  if operation == "session-discard" then
+    self:discard_provisional(wire.text(data, "requestKey"), request.worker_id)
+    return reply(200, "{}", nil, nil, nil)
+  end
+  if operation == "unsubscribe" then
+    if request.subscription then self.worlds:unsubscribe(request.subscription.key) end
+    return reply(200, "{}", nil, nil, nil)
+  end
+  if operation == "drop-subscription" then
+    self.worlds:unsubscribe(wire.text(data, "key"))
+    return reply(200, "{}", nil, nil, nil)
+  end
+  if self.closed then return error_reply(503, "relay is closed") end
+  if operation == "auth-publish" then
+    local handle? = request.world
+    if not handle then return error_reply(400, "missing world") end
+    local slot? = self.world_workers[handle.key]
+    if not slot or slot.id ~= request.worker_id or slot.handle.client_id ~= handle.client_id then
+      return error_reply(503, "Foundry world disconnected")
+    end
+    return self.worlds:transition<|messages.ControlReply|>(function (): messages.ControlReply
+      local client? = self.database:authenticate(handle.client_id, wire.text(data, "token"))
+      if not client then return error_reply(401, "invalid pairing token") end
+      if handle.health:is_closed() or (request.reply and request.reply:is_closed()) then
+        return error_reply(503, "Foundry world disconnected")
+      end
+      local _session, activation = self.worlds:publish_authenticated(slot.handle)
+      return reply(200, "{}", slot.handle, nil, activation)
+    end)
+  end
+  if operation == "online" then
+    local ids = self.worlds:online_ids()
+    local online: {string: value} = {}
+    for index = 1, #ids do online[ids[index]] = true end
+    return reply(200, wire.encode(online), nil, nil, nil)
+  end
+  if operation == "select" or operation == "subscribe" then
+    return self.worlds:transition<|messages.ControlReply|>(function (): messages.ControlReply
+      local selected?, problem? = self.worlds:select(wire.text(data, "clientId"))
+      if not selected then
+        local status = operation == "select" and problem == "multiple worlds are online; specify clientId" and 400 or 503
+        return error_reply(status, problem)
+      end
+      if operation == "subscribe" then
+        local subscription = self.worlds:subscribe(selected.id, wire.text(data, "channel"))
+        self.unclaimed[request.request_id] = Unclaimed(request.worker_id, subscription)
+        return reply(200, "{}", selected.world, subscription, nil)
+      end
+      return reply(200, "{}", selected.world, nil, nil)
+    end)
+  end
+  if operation == "revoke" or operation == "delete" then
+    local retired: hub.Session? = nil
+    local response = self.worlds:transition<|messages.ControlReply|>(function (): messages.ControlReply
+      local id: string? = nil
+      if operation == "revoke" then
+        id = self.database:revoke(wire.text(data, "token"))
+        if not id then return error_reply(401, "invalid pairing token") end
+        log.emit(self.logger, "info", "pairing_revoked", {["client_id"] = id})
+      else
+        id = wire.text(data, "clientId")
+        if not self.database:remove(id) then return error_reply(404, "unknown client") end
+        log.emit(self.logger, "info", "client_removed", {["client_id"] = id})
+      end
+      retired = self.worlds:disconnect(id)
+      return reply(200, "{\"success\":true}", nil, nil, nil)
+    end)
+    if retired then retired:close() end
+    return response
+  end
+  if operation == "session-handshake" then
+    local result = self.headless:handshake(wire.text(data, "address"), wire.text(data, "user"), wire.text(data, "world"))
+    return reply(200, wire.encode(result), nil, nil, nil)
+  end
+  if operation == "session-start" then
+    local key = wire.text(data, "requestKey")
+    if key == "" or self.provisional[key] then return error_reply(400, "invalid session request") end
+    local entry = self.worlds:transition<|sessions.Entry|>(function (): sessions.Entry return self.headless:begin(data) end)
+    self.provisional[key] = Provisional(request.worker_id, entry)
+    local delivered = false
+    defer if not delivered then self:discard_provisional(key, request.worker_id) end
     self.headless:ready(entry)
-    local result: {string: value} = {["success"] = true, ["sessionId"] = entry.session_id,
-      ["clientId"] = entry.client_id}
-    router.json_response(response, 200, wire.encode(result))
-    self.headless:publish(entry)
-  elseif match.action == "session-end" then
-    local id = match.query["sessionId"] or ""
-    if id == "" then id = wire.text(json_body(request), "sessionId") end
-    if id == "" then raise sessions.Error(400, "sessionId is required") end
+    if request.reply and request.reply:is_closed() then return error_reply(503, "session request cancelled") end
+    delivered = true
+    return reply(200, wire.encode({["success"] = true, ["sessionId"] = entry.session_id,
+      ["clientId"] = entry.client_id}), nil, nil, nil)
+  end
+  if operation == "session-publish" then
+    local key = wire.text(data, "requestKey")
+    local pending? = self.provisional[key]
+    if not pending or pending.worker_id ~= request.worker_id then return error_reply(503, "session is no longer available") end
+    self.headless:publish(pending.entry)
+    self.provisional[key] = nil
+    return reply(200, "{}", nil, nil, nil)
+  end
+  if operation == "session-end" then
+    local id = wire.text(data, "sessionId")
+    if id == "" then return error_reply(400, "sessionId is required") end
     self.headless:finish(id)
-    router.json_response(response, 200, "{\"status\":\"ok\",\"message\":\"Session ended\"}")
-  else
-    router.json_response(response, 200, wire.encode(self.headless:list()))
+    return reply(200, "{\"status\":\"ok\",\"message\":\"Session ended\"}", nil, nil, nil)
+  end
+  if operation == "session-list" then return reply(200, wire.encode(self.headless:list()), nil, nil, nil) end
+  return error_reply(400, "unknown coordinator operation")
+catch
+  if error is sessions.Error then
+    local failure: sessions.Error = error
+    return error_reply(failure.status, failure.message)
+  end
+  if error is async.CancellationReason then return error_reply(503, "request cancelled") end
+  log.emit(self.logger, "error", "http_request_failed", {["reason"] = "coordinator_failure"})
+  return error_reply(400, "invalid request")
+end
+
+local function Server:control_loop(): nil
+  for _, request in self.control_inbox:incoming() do
+    if request.operation == "claim" then
+      local unclaimed? = self.unclaimed[request.request_id]
+      if unclaimed and unclaimed.worker_id == request.worker_id then self.unclaimed[request.request_id] = nil end
+    elseif request.operation == "cancel" then
+      local pending? = self.operations[request.request_id]
+      if pending and pending.worker_id == request.worker_id then pending.task:cancel() end
+      local unclaimed? = self.unclaimed[request.request_id]
+      if unclaimed and unclaimed.worker_id == request.worker_id then
+        self.unclaimed[request.request_id] = nil
+        self.worlds:unsubscribe(unclaimed.subscription.key)
+      end
+    else
+      local id = request.request_id
+      local working = async.run<|nil, value|>(function (): nil
+        defer self.operations[id] = nil
+        local result = self:coordinate(request)
+        if request.reply then
+          local accepted = false
+          do accepted = request.reply:try_send(result) catch end
+          if not accepted and request.operation == "session-start" then
+            local data = wire.object(request.body)
+            self:discard_provisional(wire.text(data, "requestKey"), request.worker_id)
+          end
+          if not accepted and result.subscription then
+            self.unclaimed[id] = nil
+            self.worlds:unsubscribe(result.subscription.key)
+          end
+        end
+        return nil
+      end)
+      self.operations[id] = Operation(request.worker_id, working)
+    end
+  end
+  return nil
+catch
+  self.controls:close()
+  self.failure = async.Error(error, traceback)
+  self:begin_close()
+  return nil
+end
+
+local function discard_handoffs(inbox: thread.Receiver<|messages.Handoff|>)
+  while true do
+    local available, opening? = inbox:try_receive()
+    if not available then return end
+    http.Exchange.discard_transfer_payload(opening.payload)
   end
 end
 
-local function Server:origin_allowed(request: http.Request): boolean
-  local origins = request.headers:values("Origin")
-  if #origins == 0 then return true end
-  if #origins ~= 1 then return false end
-  local origin = origins[1]
-  if origin == request.url.scheme .. "://" .. request.url.authority then return true end
-  for i = 1, #self.config.origins do if origin == self.config.origins[i] then return true end end
-  return false
-end
-
-local function Server:authorized(request: http.Request): boolean
-  local keys = request.headers:values("x-api-key")
-  return #keys == 1 and config.secret_equal(keys[1], self.config.api_key)
-end
-
-local function Server:pair(request: http.Request, response: http.Response)
-  local data = json_body(request)
-  local code = wire.text(data, "code")
-  if not config.secret_equal(code, self.config.pairing_code) then
-    router.error_response(response, 401, "invalid pairing code")
-    return
+local function discard_openings(inbox: thread.Receiver<|world.Opening|>)
+  while true do
+    local available, opening? = inbox:try_receive()
+    if not available then return end
+    http.Exchange.discard_transfer_payload(opening.payload)
   end
-  local world_id = wire.text(data, "worldId")
-  if world_id == "" then router.error_response(response, 400, "worldId is required"); return end
-  local client = self.database:pair(world_id, wire.text(data, "worldTitle", world_id),
-    wire.text(data, "serverFingerprint"), wire.text(data, "serverOrigin"), wire.text(data, "existingClientId"))
-  log.emit(self.logger, "info", "pairing_created", {["client_id"] = client.client_id})
-  local result: {string: value} = { ["token"] = client.token, ["clientId"] = client.client_id,
-    ["relayUrl"] = self.config.public_url }
-  router.json_response(response, 200, wire.encode(result))
 end
 
-local function Server:unpair(request: http.Request, response: http.Response)
-  local data = json_body(request)
-  local id? = self.database:revoke(wire.text(data, "token"))
-  if not id then router.error_response(response, 401, "invalid pairing token"); return end
-  log.emit(self.logger, "info", "pairing_revoked", {["client_id"] = id})
-  self.worlds:disconnect(id)
-  router.json_response(response, 200, "{\"success\":true}")
+local function wait_ready<|T|>(ready: thread.Receiver<|boolean|>, worker: thread.Thread<|T|>)
+  local waiting = async.run<|boolean, value|>(function (): boolean return ready:receive() end)
+  defer tasks.drain(waiting)
+  case async.race_two(waiting, worker:task())
+  when first(status) then
+    case status
+    when succeeded(ok) then if not ok then raise "worker initialization failed" end
+    when failed(failure) then failure:raise()
+    else raise "worker initialization cancelled"
+    end
+  else raise "worker terminated during initialization"
+  end
 end
 
-local function Server:websocket(request: http.Request, response: http.Response, match: router.Match)
-  local id? = match.query["id"]
-  if not id or id == "" then router.error_response(response, 400, "id is required"); return end
-  local connection = websocket.accept(request, response, websocket.AcceptOptions {
-    allowed_origins = self.config.origins, read_limit = 16777216, handshake_timeout = self.config.auth_timeout })
-  defer connection:close()
-  local deadline = async.run<|nil, value|>(function (): nil
-    timer.sleep(self.config.auth_timeout)
-    connection:close()
+local function Server:log_level(): string
+  return self.logger and self.logger:level() or "info"
+end
+
+local function Server:log_sender(): thread.Sender<|string|>?
+  if self.logger then return self.log_lines end
+  return nil
+end
+
+local function Server:start_api_workers()
+  for index = 1, self.config.api_concurrency do
+    local sender, inbox = thread.channel<|messages.Handoff|>(128)
+    local ready_tx, ready_rx = thread.channel<|boolean|>(1)
+    defer ready_tx:close()
+    defer ready_rx:close()
+    local worker = thread.spawn_one(api_worker.run, api_worker.Bootstrap(index, self.config,
+      inbox, self.returned, self.controls, ready_tx, self:log_level(), self:log_sender()))
+    local slot = ApiWorker(index, worker, sender, inbox, nil)
+    self.api_workers[#self.api_workers + 1] = slot
+    slot.monitor = async.run<|nil, value|>(function (): nil
+      local status = worker:join()
+      sender:close()
+      discard_handoffs(inbox)
+      if not self.closed then
+        case status
+        when failed(failure) then self.failure = async.Error(failure.error, failure.traceback)
+        else self.failure = async.Error("API worker terminated", "")
+        end
+        log.emit(self.logger, "error", "server_failed", {["reason"] = "api_worker_failed"})
+        self:begin_close()
+      end
+      return nil
+    end)
+    wait_ready(ready_rx, worker)
+  end
+end
+
+local function Server:start_world(match: router.Match): WorldWorker
+  local id = self.next_worker
+  self.next_worker = id + 1
+  local requests_tx, requests_rx = thread.channel<|protocol.WorldRequest|>(self.config.max_pending)
+  local commands_tx, commands_rx = thread.channel<|protocol.WorldCommand|>(256)
+  local health_tx, health_rx = thread.channel<|nil|>(1)
+  local sender, inbox = thread.channel<|world.Opening|>(1)
+  local ready_tx, ready_rx = thread.channel<|boolean|>(1)
+  defer ready_tx:close()
+  defer ready_rx:close()
+  local handle = protocol.WorldHandle(store.secure_token(16), match.query["id"], requests_tx, commands_tx, health_rx)
+  local worker = thread.spawn_one(world.run, world.Bootstrap(id, self.config, handle,
+    requests_rx, commands_rx, inbox, ready_tx, self.controls, self:log_level(), self:log_sender()))
+  local slot = WorldWorker(id, handle, worker, sender, inbox, health_tx, nil)
+  self.world_workers[handle.key] = slot
+  slot.monitor = async.run<|nil, value|>(function (): nil
+    worker:join()
+    -- Health closure may wake quiescence while its caller holds the Hub gate.
+    health_tx:close()
+    sender:close()
+    discard_openings(inbox)
+    inbox:close()
+    requests_tx:close()
+    commands_tx:close()
+    self.worlds:retire(handle.client_id, handle.key)
+    self.world_workers[handle.key] = nil
     return nil
   end)
-  defer hub.drain(deadline)
-  local kind?, text? = connection:read()
-  if not kind then return end
-  if kind ~= websocket.TEXT then
-    log.emit(self.logger, "error", "websocket_failed", {["reason"] = "authentication_requires_text"})
-    return
-  end
-  log.emit(self.logger, "debug", "websocket_message_received", {["type"] = "authentication", ["bytes"] = #text})
-  local auth = wire.object(text)
-  local token = wire.text(auth, "token")
-  local client? = self.database:authenticate(id, token)
-  if wire.text(auth, "type") ~= "auth" or not client then
-    log.emit(self.logger, "info", "websocket_authentication_rejected")
-    connection:write(websocket.TEXT, "{\"type\":\"auth-failed\",\"error\":\"invalid pairing token\"}")
-    connection:shutdown(1008, "authentication failed", 1000)
-    return
-  end
-  hub.drain(deadline)
-  local metadata: {string: value} = {}
-  for key, item in iteration.pairs(match.query) do metadata[key] = item end
-  self.database:update(client.client_id, client.world_id,
-    match.query["worldTitle"] or client.world_title, match.query["version"] or "", wire.encode(metadata))
-  -- Metadata publication suspends. Recheck revocation, then let Hub register
-  -- ownership before any output can yield; unpair now always finds the session.
-  client = self.database:authenticate(id, token)
-  if not client then
-    log.emit(self.logger, "info", "websocket_authentication_rejected")
-    connection:write(websocket.TEXT, "{\"type\":\"auth-failed\",\"error\":\"invalid pairing token\"}")
-    connection:shutdown(1008, "authentication failed", 1000)
-    return
-  end
-  self.worlds:run(client.client_id, connection)
-catch
-  -- The connection owns its transferred stream and all cleanup. A malformed
-  -- module message or ordinary network loss affects only this world.
-  if not self.closed and not (error is async.CancellationReason) then
-    log.emit(self.logger, "error", "websocket_failed", {["reason"] = "handshake_or_authentication_failed"})
-  end
+  local ready = false
+  defer if not ready then worker:cancel(); tasks.await_terminal(slot.monitor) end
+  wait_ready(ready_rx, worker)
+  ready = true
+  return slot
 end
 
-local function Server:clients(response: http.Response)
-  local clients = self.database:list()
-  local results: {value} = {}
-  for i = 1, #clients do
-    local client = clients[i]
-    local metadata = wire.object(client.metadata_json)
-    local item: {string: value} = { ["id"] = client.client_id, ["clientId"] = client.client_id,
-      ["worldId"] = client.world_id, ["worldTitle"] = client.world_title,
-      ["version"] = client.module_version, ["lastSeen"] = client.last_seen,
-      ["connected"] = self.worlds:online(client.client_id) }
-    for key, content in iteration.pairs(metadata) do
-      if key ~= "id" and key ~= "token" and key ~= "clientId" and key ~= "connected" then item[key] = content end
+local function Server:classify(method: string, target: string): router.Match?
+  local resolution = self.routes:match(method, target)
+  local match? = resolution.match
+  if resolution.status == 200 and match and match.action == "relay" and
+      match.query["id"] and match.query["id"] ~= "" then return match end
+  return nil
+end
+
+local function Server:deliver(opening: messages.Handoff)
+  local consumed = false
+  defer if not consumed then http.Exchange.discard_transfer_payload(opening.payload) end
+  if self.closed then return end
+  local match? = self:classify(opening.method, opening.target)
+  if match then
+    local slot = self:start_world(match)
+    defer if not consumed then slot.worker:cancel(); tasks.await_terminal(slot.monitor) end
+    if self.closed then return end
+    local metadata: {string: value} = {}
+    for key, item in iteration.pairs(match.query) do metadata[key] = item end
+    log.emit(self.logger, "info", "http_request", {["method"] = "GET", ["route"] = "/relay"})
+    if not slot.sender:try_send(world.Opening(opening.delivery_id, opening.payload,
+        match.query["worldTitle"] or "", match.query["version"] or "", wire.encode(metadata))) then
+      raise "world opening inbox is full"
     end
-    results[i] = item
-  end
-  router.json_response(response, 200, wire.encode(results))
-end
-
-local function sse_name(channel: string, data: {string: value}): string
-  local event_type = wire.text(data, "eventType", "create")
-  if channel == "roll-events" then return "roll" end
-  if channel == "hooks" then return wire.text(data, "hook", wire.text(data, "hookName", "hook")) end
-  local prefix = "chat"
-  if channel == "combat-events" then prefix = "combat" end
-  if channel == "actor-events" then prefix = "actor" end
-  if channel == "scene-events" then prefix = "scene" end
-  local name = prefix .. "-" .. event_type
-  if string.find(name, "\n") or string.find(name, "\r") then return prefix end
-  return name
-end
-
-local function Server:stream(response: http.Response, match: router.Match)
-  local session?, problem? = self.worlds:select(match.query["clientId"])
-  if not session then router.error_response(response, 503, problem); return end
-  local channel = string.sub(match.action, 5)
-  local subscriber = self.worlds:subscribe(session.id, channel)
-  defer self.worlds:unsubscribe(subscriber)
-  response:set_header("Content-Type", "text/event-stream")
-  response:set_header("Cache-Control", "no-cache")
-  response:set_header("X-Accel-Buffering", "no")
-  local initial: {string: value} = { ["clientId"] = session.id }
-  response:write("event: connected\ndata: " .. wire.encode(initial) .. "\n\n")
-  local reading: async.Task<|string?, value|>? = nil
-  defer if reading then hub.drain(reading) end
-  while true do
-    if not reading then reading = async.run<|string?, value|>(subscriber:next) end
-    local keepalive = async.run<|nil, value|>(function (): nil timer.sleep(15000); return nil end)
-    defer hub.drain(keepalive)
-    case async.race_two(reading, keepalive)
-    when first(status) then
-      case status
-      when succeeded(text) then
-        if not text then return end
-        local envelope = wire.object(text)
-        local data: {string: value} = envelope
-        if envelope["data"] is {string: value} then data = envelope["data"] as {string: value} end
-        local name = sse_name(channel, data)
-        if string.find(name, "\n") or string.find(name, "\r") then name = "event" end
-        response:write("event: " .. name .. "\ndata: " .. wire.encode(data) .. "\n\n")
-        reading = nil
-      else return
-      end
-    when second() then response:write(": keepalive\n\n")
-    end
-  end
-end
-
-local function Server:forward(request: http.Request, response: http.Response, match: router.Match)
-  local endpoint = api.endpoint_for(match.action)
-  local data: {string: value} = {}
-  local content_type = request.headers:get("Content-Type") or "application/octet-stream"
-  if endpoint.special == "upload" and string.sub(string.lower(content_type), 1, 16) ~= "application/json" then
-    -- Binary upload metadata comes from the declared query parameters.
-    data["fileData"] = "data:" .. content_type .. ";base64," .. api.encode_base64(body(request))
+    consumed = true
   else
-    data = json_body(request)
-  end
-  local payload = api.build_payload(endpoint, match, data)
-  local client_id? = match.query["clientId"]
-  if not client_id and data["clientId"] is string then client_id = data["clientId"] as string end
-  local session?, problem? = self.worlds:select(client_id)
-  if not session then
-    local status = 503
-    if problem == "multiple worlds are online; specify clientId" then status = 400 end
-    router.error_response(response, status, problem)
-    return
-  end
-  local timeout = self.config.request_timeout
-  if timeout == 0 then timeout = endpoint.timeout_ms end
-  local reply = session:request(endpoint.action, payload, timeout)
-  if reply.status ~= 200 then router.json_response(response, reply.status, reply.body); return end
-  local converted = api.response(endpoint, wire.object(reply.body), match.query["format"])
-  response:set_status(converted.status)
-  response:set_header("Content-Type", converted.content_type)
-  for key, content in iteration.pairs(converted.headers) do response:set_header(key, content) end
-  response:write(converted.body)
-end
-
-local function Server:dispatch(request: http.Request, response: http.Response, resolution: router.Resolution)
-  if self.closed then
-    response:set_header("Connection", "close")
-    router.error_response(response, 503, "relay is closed")
-    return
-  end
-  if not self:origin_allowed(request) then router.error_response(response, 403, "origin is not allowed"); return end
-  local origin? = request.headers:get("Origin")
-  if origin then
-    response:set_header("Access-Control-Allow-Origin", origin)
-    response:set_header("Vary", "Origin")
-  end
-  if request.method == "OPTIONS" then
-    response:set_header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-    response:set_header("Access-Control-Allow-Headers", "Content-Type,X-API-Key,X-Foundry-Url,X-Username,X-World-Name")
-    response:set_status(204)
-    return
-  end
-  if resolution.status ~= 200 then
-    if resolution.status == 405 then response:set_header("Allow", router.allow_header(resolution.allowed)) end
-    router.error_response(response, resolution.status, resolution.error or "route not found")
-    return
-  end
-  local match = resolution.match
-  if match.action == "health" then router.json_response(response, 200, "{\"status\":\"ok\"}"); return end
-  if match.action == "pair" then self:pair(request, response); return end
-  if match.action == "relay" then self:websocket(request, response, match); return end
-  if match.action == "unpair" then self:unpair(request, response); return end
-  if match.action == "active" then
-    local id = match.params["clientId"]
-    if not self.database:get(id) then router.error_response(response, 404, "unknown client"); return end
-    local data: {string: value} = { ["active"] = self.worlds:online(id) }
-    router.json_response(response, 200, wire.encode(data))
-    return
-  end
-  if not self:authorized(request) then router.error_response(response, 401, "invalid API key"); return end
-  if string.sub(match.action, 1, 8) == "session-" then self:session_request(request, response, match); return end
-  if match.action == "clients" then self:clients(response); return end
-  if match.action == "forget" then
-    local id = match.params["clientId"]
-    if not self.database:remove(id) then router.error_response(response, 404, "unknown client"); return end
-    log.emit(self.logger, "info", "client_removed", {["client_id"] = id})
-    self.worlds:disconnect(id)
-    router.json_response(response, 200, "{\"success\":true}")
-    return
-  end
-  if string.sub(match.action, 1, 4) == "sse:" then self:stream(response, match); return end
-  self:forward(request, response, match)
-catch
-  -- Validation failures are request-local; never serialize internal traces or
-  -- credentials into HTTP errors. Network failures after commit close the stream.
-  do
-    if error is sessions.Error then
-      local problem: sessions.Error = error
-      router.error_response(response, problem.status, problem.message)
-    else
-      if error is async.OperationError then
-        log.emit(self.logger, "error", "http_request_failed", {["reason"] = "io_failure"})
-      elseif not (error is string) and not (error is async.CancellationReason) then
-        log.emit(self.logger, "error", "http_request_failed", {["reason"] = "internal_failure"})
-      end
-      router.error_response(response, 400, "invalid request")
-    end
-  catch
-    response:abort()
+    local slot = self.api_workers[self.next_api]
+    self.next_api = self.next_api % #self.api_workers + 1
+    -- Sender.send returns immediately after enqueue commits; cancellation while
+    -- waiting for space unregisters its waiter without committing the message.
+    slot.sender:send(opening)
+    consumed = true
   end
 end
 
 function Server:handle(request: http.Request, response: http.Response)
-  -- Admission is visible even for rejected requests and long-lived streams.
-  -- Only declaration templates enter logs: unknown targets may contain secrets
-  -- or bytes which are not valid UTF-8. Never copy query/parameter values.
-  local resolution = self.routes:match(request.method, request.target)
-  local route = "<unmatched>"
-  if resolution.match then route = resolution.match.route.pattern end
-  local method = request.method
-  if method ~= "GET" and method ~= "POST" and method ~= "PUT" and method ~= "PATCH" and
-     method ~= "DELETE" and method ~= "OPTIONS" and method ~= "HEAD" and
-     method ~= "CONNECT" and method ~= "TRACE" then method = "OTHER" end
-  log.emit(self.logger, "info", "http_request", {["method"] = method, ["route"] = route})
-  self:dispatch(request, response, resolution)
+  if self.closed then response:abort(); return end
+  -- Yield out of the final native read callback before detaching on Windows.
+  async.yield()
+  local payload = http.Exchange(request, response):to_transfer_payload()
+  self:deliver(messages.Handoff(store.secure_token(16), payload, request.method, request.target))
 end
 
 function Server:start()
   if self.closed then raise "relay server is closed" end
-  if self.listener then return end
+  if self.started then return end
+  self.started = true
+  local published = false
+  defer if not published then self:close() end
+  self.control_task = async.run<|nil, value|>(self:control_loop)
+  self.return_task = async.run<|nil, value|>(function (): nil
+    for _, opening in self.return_inbox:incoming() do
+      do self:deliver(opening)
+      catch
+        if not self.closed then
+          log.emit(self.logger, "error", "http_request_failed", {["reason"] = "handoff_failed"})
+        end
+      end
+    end
+    return nil
+  catch
+    self.failure = async.Error(error, traceback)
+    self:begin_close()
+    return nil
+  end)
+  self.log_task = async.run<|nil, value|>(function (): nil
+    for _, text in self.log_inbox:incoming() do if self.logger then self.logger:accept(text) end end
+    return nil
+  end)
+  self:start_api_workers()
   local listener = http.listen(self.config.host, self:handle, self.config.port, 128, 10000)
+  listener:read_ahead(false)
   self.listener = listener
+  published = true
 end
 
 function Server:serve()
   self:start()
-  local listener = self.listener
-  defer listener:close()
-  listener:serve()
+  self.listener:serve()
+  if self.retirement then self:close() end
+  if self.failure then self.failure:raise() end
+end
+
+local function Server:shutdown(): async.Error?
+  local failure: async.Error? = nil
+  local attempt = function (operation: function (): ())
+    do operation() catch if not failure then failure = async.Error(error, traceback) end end
+  end
+  if self.listener then attempt(self.listener:close) end
+  local operations: {async.Task<|nil, value|>} = {}
+  for _, pending in iteration.pairs(self.operations) do operations[#operations + 1] = pending.task end
+  for index = 1, #operations do operations[index]:cancel() end
+  for index = 1, #operations do tasks.await_terminal(operations[index]) end
+  attempt(self.headless:close)
+  attempt(self.worlds:close)
+  for id, _ in iteration.pairs(self.unclaimed) do self.unclaimed[id] = nil end
+  -- Keep the coordinator draining while cancelled HTTP children send cleanup.
+  for index = 1, #self.api_workers do self.api_workers[index].worker:cancel() end
+  for index = 1, #self.api_workers do
+    local slot = self.api_workers[index]
+    attempt(function () slot.worker:join() end)
+    if slot.monitor then tasks.await_terminal(slot.monitor) end
+    attempt(function () discard_handoffs(slot.inbox) end)
+    slot.sender:close()
+    slot.inbox:close()
+  end
+  local worlds: {WorldWorker} = {}
+  for _, slot in iteration.pairs(self.world_workers) do worlds[#worlds + 1] = slot end
+  for index = 1, #worlds do worlds[index].worker:cancel() end
+  for index = 1, #worlds do
+    local slot = worlds[index]
+    attempt(function () slot.worker:join() end)
+    slot.health:close()
+    if slot.monitor then tasks.await_terminal(slot.monitor) end
+    attempt(function () discard_openings(slot.inbox) end)
+    slot.sender:close()
+    slot.inbox:close()
+  end
+  local pending_keys: {string} = {}
+  for key, _ in iteration.pairs(self.provisional) do pending_keys[#pending_keys + 1] = key end
+  for index = 1, #pending_keys do
+    local pending? = self.provisional[pending_keys[index]]
+    if pending then attempt(function () self:discard_provisional(pending_keys[index], pending.worker_id) end) end
+  end
+  self.controls:close()
+  if self.control_task then tasks.await_terminal(self.control_task) end
+  local remaining: {async.Task<|nil, value|>} = {}
+  for _, pending in iteration.pairs(self.operations) do remaining[#remaining + 1] = pending.task end
+  for index = 1, #remaining do tasks.await_terminal(remaining[index]) end
+  self.control_inbox:close()
+  self.returned:close()
+  if self.return_task then tasks.await_terminal(self.return_task) end
+  attempt(function () discard_handoffs(self.return_inbox) end)
+  self.return_inbox:close()
+  self.log_lines:close()
+  if self.log_task then tasks.await_terminal(self.log_task) end
+  self.log_inbox:close()
+  self.database:close()
+  return failure
+end
+
+local function Server:begin_close()
+  if self.retirement then return end
+  self.closed = true
+  if self.listener then self.listener:close() end
+  self.retirement = async.run<|async.Error?, value|>(self:shutdown)
 end
 
 function Server:close()
-  if self.closed then return end
-  self.closed = true
-  if self.listener then self.listener:close() end
-  -- Stop controllers before their Hub/Store dependencies. Accepted HTTP
-  -- handlers may still be waiting; the manager closes admission first.
-  defer self.database:close()
-  defer self.worlds:close()
-  self.headless:close()
+  self:begin_close()
+  local retirement = self.retirement
+  tasks.await_terminal(retirement)
+  case retirement:status()
+  when succeeded(failure) then if failure then failure:raise() end
+  when failed(failure) then failure:raise()
+  else raise "relay shutdown cancelled"
+  end
 end

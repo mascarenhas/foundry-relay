@@ -70,7 +70,7 @@ local function fixture(): Fixture
       host = "127.0.0.1", port = port, api_key = api_key, pairing_code = "HTTP42",
       database = path, public_url = "ws://127.0.0.1:" .. port .. "/relay",
       origins = {origin}, request_timeout = 3000, heartbeat = 60000,
-      auth_timeout = 1000, max_pending = 16 }
+      auth_timeout = 1000, max_pending = 16, api_concurrency = 1 }
     local probe = Probe(0, 0, false, false)
     local launcher = function(options: foundry.Options, _executable: string, _parent: string,
         _worlds: hub.Hub, _timeout: integer): sessions.Client
