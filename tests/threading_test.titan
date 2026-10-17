@@ -14,6 +14,7 @@ local control = import "relay.control"
 local messages = import "relay.messages"
 local server = import "relay.server.titan"
 local sessions = import "relay.sessions"
+local store = import "relay.store.titan"
 local tasks = import "relay.tasks"
 local wire = import "relay.wire"
 
@@ -299,4 +300,60 @@ function test_cancel_after_queued_subscription_reply_retires_unclaimed_owner(con
   test.assert(barrier.status == 200 and fixture.instance.unclaimed[id] == nil)
   test.assert(#fixture.instance.worlds:subscription_snapshot(credential.id).targets == 0,
               "cancel after publication leaked an unclaimed subscription")
+end
+
+local function cancelled_security_transition(context: test.Context, operation: string)
+  local fixture = start(context)
+  local credential = pair(fixture, "world")
+  local connection = dial(fixture, credential)
+  defer connection:close()
+  local worker = world_worker(fixture, credential.id)
+  local database: store.Store = fixture.instance.database
+  -- Hold the real Store FIFO so cancellation deterministically reaches an
+  -- accepted coordinator transition while its persistent work is suspended.
+  database:acquire()
+  local held = true
+  defer if held then database:release() end
+  local tx, rx = thread.channel<|messages.ControlReply|>(1)
+  defer tx:close()
+  defer rx:close()
+  local id = "cancelled-security-" .. operation
+  fixture.instance.controls:send(messages.ControlRequest(id, 1, operation,
+    wire.encode({["clientId"] = credential.id, ["token"] = credential.token}), nil, nil, tx))
+  local admitted = async.run<|nil, value|>(function(): nil
+    while #database.waiters == 0 do timer.yield() end
+    return nil
+  end)
+  defer tasks.drain(admitted)
+  bounded(admitted, "security transition did not reach the Store FIFO")
+  local working = fixture.instance.operations[id].task
+  rx:close()
+  working:cancel(async.CancellationReason<|value|>.simple("API request abandoned after admission"))
+  database:release()
+  held = false
+  local completed = async.run<|nil, value|>(function(): nil
+    tasks.await_terminal(working)
+    return nil
+  end)
+  defer tasks.drain(completed)
+  bounded(completed, "cancelled security transition did not retire")
+  test.assert(database:authenticate(credential.id, credential.token) == nil,
+              "accepted credential mutation was lost to request cancellation")
+  if operation == "delete" then
+    test.assert(database:get(credential.id) == nil, "cancelled deletion retained the client")
+  end
+  test.assert(not fixture.instance.worlds:online(credential.id),
+              "credential mutation left its world admitting requests")
+  test.assert(worker:task():status():has_finished(),
+              "credential mutation returned before its captured world retired")
+  test.assert(request(fixture, "GET", "/world-info?clientId=" .. credential.id, nil).status == 503,
+              "API still dispatched requests to a revoked world")
+end
+
+function test_cancelled_revocation_finishes_credential_and_world_retirement(context: test.Context)
+  cancelled_security_transition(context, "revoke")
+end
+
+function test_cancelled_deletion_finishes_credential_and_world_retirement(context: test.Context)
+  cancelled_security_transition(context, "delete")
 end

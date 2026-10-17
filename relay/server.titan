@@ -176,22 +176,36 @@ local function Server:coordinate(request: messages.ControlRequest): messages.Con
     end)
   end
   if operation == "revoke" or operation == "delete" then
-    local retired: hub.Session? = nil
-    local response = self.worlds:transition<|messages.ControlReply|>(function (): messages.ControlReply
-      local id: string? = nil
-      if operation == "revoke" then
-        id = self.database:revoke(wire.text(data, "token"))
-        if not id then return error_reply(401, "invalid pairing token") end
-        log.emit(self.logger, "info", "pairing_revoked", {["client_id"] = id})
-      else
-        id = wire.text(data, "clientId")
-        if not self.database:remove(id) then return error_reply(404, "unknown client") end
-        log.emit(self.logger, "info", "client_removed", {["client_id"] = id})
-      end
-      retired = self.worlds:disconnect(id)
-      return reply(200, "{\"success\":true}", nil, nil, nil)
+    async.checkpoint()
+    local response: messages.ControlReply? = nil
+    local failure: async.Error? = nil
+    -- An accepted native COMMIT can finish even when its waiter is cancelled.
+    -- Once admitted, the complete credential/disconnect transition owns its
+    -- lifetime independently of the API request that must wait for retirement.
+    local changing = async.run<|nil, value|>(function (): nil
+      local retired: hub.Session? = nil
+      response = self.worlds:transition<|messages.ControlReply|>(function (): messages.ControlReply
+        local id: string? = nil
+        if operation == "revoke" then
+          id = self.database:revoke(wire.text(data, "token"))
+          if not id then return error_reply(401, "invalid pairing token") end
+          log.emit(self.logger, "info", "pairing_revoked", {["client_id"] = id})
+        else
+          id = wire.text(data, "clientId")
+          if not self.database:remove(id) then return error_reply(404, "unknown client") end
+          log.emit(self.logger, "info", "client_removed", {["client_id"] = id})
+        end
+        retired = self.worlds:disconnect(id)
+        return reply(200, "{\"success\":true}", nil, nil, nil)
+      end)
+      if retired then retired:close() end
+      return nil
+    catch
+      failure = async.Error(error, traceback)
+      return nil
     end)
-    if retired then retired:close() end
+    tasks.await_terminal(changing)
+    if failure then failure:raise() end
     return response
   end
   if operation == "session-handshake" then

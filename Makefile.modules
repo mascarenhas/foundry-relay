@@ -40,4 +40,4 @@ MODULE_IMPORTS_tests/session_http_test := relay/config relay/foundry_session rel
 MODULE_IMPORTS_tests/sessions_test := relay/foundry_session relay/hub relay/log relay/sessions relay/store relay/wire tests/session_crypto_test
 MODULE_IMPORTS_tests/store_concurrency_test := relay/store
 MODULE_IMPORTS_tests/store_test := relay/store
-MODULE_IMPORTS_tests/threading_test := relay/config relay/control relay/messages relay/server relay/sessions relay/tasks relay/wire
+MODULE_IMPORTS_tests/threading_test := relay/config relay/control relay/messages relay/server relay/sessions relay/store relay/tasks relay/wire
