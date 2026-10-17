@@ -208,8 +208,9 @@ local function Server:coordinate(request: messages.ControlRequest): messages.Con
     self.headless:ready(entry)
     if request.reply and request.reply:is_closed() then return error_reply(503, "session request cancelled") end
     delivered = true
-    return reply(200, wire.encode({["success"] = true, ["sessionId"] = entry.session_id,
-      ["clientId"] = entry.client_id}), nil, nil, nil)
+    local result: {string: value} = {["success"] = true, ["sessionId"] = entry.session_id,
+      ["clientId"] = entry.client_id}
+    return reply(200, wire.encode(result), nil, nil, nil)
   end
   if operation == "session-publish" then
     local key = wire.text(data, "requestKey")
@@ -531,6 +532,7 @@ local function Server:begin_close()
 end
 
 function Server:close()
+  if self.retirement and self.retirement:status():has_finished() then return end
   self:begin_close()
   local retirement = self.retirement
   tasks.await_terminal(retirement)
