@@ -1,5 +1,9 @@
 # Validation record
 
+The current threaded implementation is covered by the
+[2026-10-17 validation record](thread-validation.md). The remainder of this
+document records the earlier implementation and its live Foundry checks.
+
 Validated on 2026-10-04 against Titan's WebSocket implementation plus the HTTP
 response-abort change, represented by `codex/foundry-relay-build-docs` at
 `4987078d`. The isolated SDK rebuilds used the same compiler/runtime inputs as

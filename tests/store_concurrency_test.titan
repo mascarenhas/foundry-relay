@@ -1,0 +1,202 @@
+local async = import "async"
+local fs = import "fs"
+local os = import "os"
+local sqlite3 = import "sqlite3"
+local test = import "test"
+local thread = import "thread"
+local timer = import "timer"
+local uv = import "uv"
+local store = import "relay.store.titan"
+
+record Bootstrap
+  path: string
+  ready: thread.Sender<|integer|>
+  go: thread.Receiver<|integer|>
+end
+
+local function fixture(context: test.Context): (store.Store, string)
+  local path = fs.tmpname()
+  context:cleanup(function()
+    if fs.stat(path) then fs.unlink(path) end
+  end)
+  local database = store.open(path)
+  context:cleanup(function() database:close() end)
+  return database, path
+end
+
+local function drain<|T|>(task: async.Task<|T, value|>)
+  if not task:status():has_finished() then task:cancel() end
+  async.join(task)
+end
+
+local function contender(input: Bootstrap): store.Client
+  local database = store.attach(input.path)
+  defer database:close()
+  input.ready:send(1)
+  input.go:receive()
+  return database:pair("world", "World", "fingerprint", "http://localhost")
+end
+
+function test_four_thread_pairings_converge_with_default_native_pool(context: test.Context)
+  local pool? = os.getenv("UV_THREADPOOL_SIZE")
+  if pool and pool ~= "4" then
+    test.skip("contention regression requires the default four native worker slots")
+  end
+  local database, path = fixture(context)
+  local owner = sqlite3.connect(path)
+  defer owner:close()
+  local ready_tx, ready_rx = thread.channel<|integer|>(4)
+  defer ready_tx:close()
+  defer ready_rx:close()
+  local go_tx, go_rx = thread.channel<|integer|>(4)
+  defer go_tx:close()
+  defer go_rx:close()
+  local workers: {thread.Thread<|store.Client|>} = {}
+  for index = 1, 4 do
+    local worker = thread.spawn_one(contender, Bootstrap(path, ready_tx, go_rx))
+    workers[index] = worker
+    context:cleanup(function()
+      worker:cancel()
+      worker:join()
+    end)
+  end
+  for _ = 1, 4 do ready_rx:receive() end
+  store.execute(owner, "BEGIN IMMEDIATE")
+  defer owner:rollback()
+  for _ = 1, 4 do go_tx:send(1) end
+  -- Four independent writers contend while the coordinator still needs one
+  -- native worker to release its reservation. Sleeping inside SQLite would
+  -- occupy the whole process-wide pool and exhaust every contender's budget.
+  timer.sleep(100)
+  test.assert(not owner:get_autocommit(), "writer reservation ended before release")
+  owner:commit()
+  local first: store.Client?
+  for index = 1, 4 do
+    case workers[index]:join()
+    when succeeded(client) then
+      if first then
+        test.assert(client.client_id == first.client_id and client.token == first.token,
+                    "independent worker stores minted different credentials")
+      else first = client end
+    when failed(failure) then failure:raise()
+    else raise "contention worker was cancelled"
+    end
+  end
+  local clients = database:list()
+  test.assert(first ~= nil and #clients == 1 and clients[1].client_id == first.client_id,
+              "concurrent worker pairings persisted duplicate identities")
+end
+
+function test_attach_uses_initialized_database_without_schema_work(context: test.Context)
+  local database, path = fixture(context)
+  local client = database:pair("world", "World")
+  local owner = sqlite3.connect(path)
+  defer owner:close()
+  store.execute(owner, "BEGIN EXCLUSIVE")
+  defer owner:rollback()
+  -- Repeating initialization here would need the held schema/write lock.
+  local attached = store.attach(path)
+  defer attached:close()
+  owner:rollback()
+  test.assert(attached:authenticate(client.client_id, client.token) ~= nil,
+              "attached worker store cannot see initialized credentials")
+end
+
+function test_cancelled_mutation_rolls_back_before_fifo_handoff(context: test.Context)
+  local database = fixture(context)
+  local client = database:pair("world", "Before")
+  local dirty = false
+  local writer = async.run<|nil, value|>(function(): nil
+    return database:operation<|nil|>(true, function(db: sqlite3.Connection): nil
+      store.execute(db, "UPDATE clients SET world_title = ? WHERE client_id = ?",
+                    "Uncommitted", client.client_id)
+      dirty = true
+      timer.sleep(1000)
+      return nil
+    end)
+  end)
+  defer drain(writer)
+  while not dirty do
+    test.assert(not writer:status():has_finished(), "writer ended before its native mutation")
+    timer.yield()
+  end
+  local reader = async.run<|string, value|>(function(): string
+    return database:get(client.client_id).world_title
+  end)
+  defer drain(reader)
+  local next_writer = async.run<|nil, value|>(function(): nil
+    database:update(client.client_id, "", "After", "", "")
+    return nil
+  end)
+  defer drain(next_writer)
+  while #database.waiters < 2 do timer.yield() end
+  local reason = async.CancellationReason<|value|>.simple("cancel after native SQL mutation")
+  writer:cancel(reason)
+  case async.join(writer)
+  when cancelled(actual) then test.assert(actual == reason, "cleanup changed cancellation reason")
+  else raise "cancelled mutation did not remain cancelled"
+  end
+  case async.join(reader)
+  when succeeded(title) then test.assert(title == "Before", "FIFO reader observed uncommitted data")
+  when failed(failure) then failure:raise()
+  else raise "FIFO reader did not complete"
+  end
+  test.assert(async.join(next_writer):has_succeeded(), "next writer did not inherit ownership")
+  test.assert(database:get(client.client_id).world_title == "After",
+              "next writer failed to commit after rollback")
+end
+
+function test_busy_retries_roll_back_the_complete_write(context: test.Context)
+  local database = fixture(context)
+  local client = database:pair("world", "Before")
+  local attempts = 0
+  database:operation<|nil|>(true, function(db: sqlite3.Connection): nil
+    attempts = attempts + 1
+    store.execute(db, "UPDATE clients SET world_title = world_title || '!' WHERE client_id = ?",
+                  client.client_id)
+    if attempts == 1 then
+      raise sqlite3.Error("BUSY after an uncommitted mutation", 5, 5, "test.retry")
+    end
+    return nil
+  end)
+  test.assert(attempts == 2 and database:get(client.client_id).world_title == "Before!",
+              "BUSY retry retained a partial mutation or failed to retry")
+end
+
+function test_sqlite_locked_is_not_retried(context: test.Context)
+  local database = fixture(context)
+  local attempts = 0
+  local caught = false
+  do
+    database:operation<|nil|>(true, function(_db: sqlite3.Connection): nil
+      attempts = attempts + 1
+      raise sqlite3.Error("LOCKED is not BUSY", 6, 6, "test.locked")
+    end)
+  catch
+    if error is sqlite3.Error then caught = (error as sqlite3.Error).code == 6
+    else raise end
+  end
+  test.assert(caught and attempts == 1, "SQLITE_LOCKED was retried or changed")
+  test.assert(#database:list() == 0, "non-retry failure retained the Store owner")
+end
+
+function test_read_busy_budget_releases_connection_and_fifo_owner(context: test.Context)
+  local database, path = fixture(context)
+  database:pair("world", "World")
+  local owner = sqlite3.connect(path)
+  defer owner:close()
+  store.execute(owner, "BEGIN EXCLUSIVE")
+  defer owner:rollback()
+  local started = uv.hrtime()
+  local caught = false
+  do database:list()
+  catch
+    if error is sqlite3.Error then caught = (error as sqlite3.Error).code == 5
+    else raise end
+  end
+  local elapsed_ms = (uv.hrtime() - started) / 1000000.0
+  test.assert(caught and elapsed_ms >= 4500.0 and elapsed_ms < 10000.0,
+              "read contention did not exhaust the bounded BUSY retry budget")
+  owner:rollback()
+  test.assert(#database:list() == 1, "expired retry retained a connection or FIFO owner")
+end

@@ -7,6 +7,11 @@ local browser = import "relay.browser.titan"
 local store = import "relay.store"
 local foundry = import "relay.foundry_session.titan"
 local hub = import "relay.hub.titan"
+local world = import "relay.world.titan"
+local protocol = import "relay.world_protocol"
+local messages = import "relay.messages"
+local config = import "relay.config"
+local thread = import "thread"
 local wire = import "relay.wire"
 local browser_fixture = import "tests.browser_test.titan"
 local cdp_fixture = import "tests.cdp_test.titan"
@@ -14,6 +19,7 @@ local cdp_fixture = import "tests.cdp_test.titan"
 local record RelayFixture
   const peer: cdp_fixture.Fixture
   const session: hub.Session
+  const engine: world.Engine
   local const release: function(boolean): ()
   local const close_release: function(): ()
   local closed: boolean
@@ -21,23 +27,48 @@ end
 
 -- Keep the relay transport independent of browser cleanup. Only this channel
 -- releases its peer, so browser exit cannot accidentally satisfy the assertion.
-local function relay_fixture(worlds: hub.Hub): RelayFixture
+local function relay_fixture(worlds: hub.Hub, id: string?): RelayFixture
   local admit, admitted, close_admitted = async.channel<|hub.Session|>(1)
   defer close_admitted()
   local release, released, close_release = async.channel<|boolean|>(1)
   local transferred = false
+  local engine: world.Engine? = nil
   defer if not transferred then close_release() end
   local peer = cdp_fixture.fixture(function(stream)
-    local session = hub.Session.new("retirement-world", stream, 8)
-    defer do session:close(); session.outbox:close() end
-    worlds.sessions[session.id] = session
+    local requests_tx, requests_rx = thread.channel<|protocol.WorldRequest|>(8)
+    local commands_tx, commands_rx = thread.channel<|protocol.WorldCommand|>(8)
+    local health_tx, health_rx = thread.channel<|nil|>(1)
+    local inbox_tx, inbox_rx = thread.channel<|world.Opening|>(1)
+    local ready_tx, ready_rx = thread.channel<|boolean|>(1)
+    local control_tx, control_rx = thread.channel<|messages.ControlRequest|>(1)
+    defer do
+      requests_rx:close(); commands_rx:close(); inbox_rx:close(); ready_rx:close(); control_rx:close()
+      requests_tx:close(); commands_tx:close(); inbox_tx:close(); ready_tx:close(); control_tx:close()
+    end
+    local key = store.secure_token(16)
+    local handle = protocol.WorldHandle(key, id or "retirement-world", requests_tx, commands_tx, health_rx)
+    local settings = config.Config("127.0.0.1", 0, "key", "CODE12", "/unused", "ws://127.0.0.1/relay", {}, 60000, 60000, 1000, 8, 1)
+    local bootstrap = world.Bootstrap(1, settings, handle, requests_rx, commands_rx, inbox_rx, ready_tx, control_tx, "error", nil)
+    engine = world.Engine(bootstrap, stream, nil)
+    defer do engine:close(); engine.outbox:close() end
+    local requests = async.run<|nil, value|>(engine:request_loop)
+    defer hub.drain(requests)
+    local owner = async.run<|nil, value|>(function (): nil
+      -- This terminal signal follows actual native transport close and children.
+      defer health_tx:close()
+      defer hub.drain(requests)
+      defer engine:close()
+      return engine:command_loop()
+    end)
+    defer hub.drain(owner)
+    local session, _activation = worlds:publish_authenticated(handle)
     admit(session)
     released()
   end)
   defer if not transferred then peer:close() end
   local session = admitted()
   transferred = true
-  return RelayFixture(peer, session, release, close_release, false)
+  return RelayFixture(peer, session, engine, release, close_release, false)
 end
 
 local function RelayFixture:close()
@@ -58,15 +89,15 @@ local function empty_browser(): browser.Browser
   return browser.Browser(directory, nil, nil, nil, "", nil, nil, nil, false)
 end
 
-local function pending_request(session: hub.Session): async.Task<|hub.Reply, value|>
+local function pending_request(fixture: RelayFixture): async.Task<|hub.Reply, value|>
   local requesting = async.run<|hub.Reply, value|>(function(): hub.Reply
-    return session:request("world-info", {}, 60000)
+    return fixture.session:request("world-info", {}, 60000)
   end)
   local transferred = false
   defer if not transferred then hub.drain(requesting) end
   -- Dequeuing the request synchronizes with its registered waiter, without a
   -- timer or scheduler polling. No writer sends it to the held relay peer.
-  case session.outbox:next()
+  case fixture.engine.outbox:next()
   when item(_) then
   else raise "Retirement fixture did not enqueue its pending request"
   end
@@ -90,13 +121,15 @@ local function assert_owned_relay_retirement(instance: browser.Browser)
   defer fixture:close()
   local session_owner = foundry.Session(instance, fixture.session, fixture.session.id, {})
   defer session_owner:close()
-  local requesting = pending_request(fixture.session)
+  local requesting = pending_request(fixture)
   defer hub.drain(requesting)
   test.assert(worlds:online(fixture.session.id) and not fixture.peer.peer:status():has_finished())
   session_owner:close()
   test.assert(not worlds:online(fixture.session.id),
     "Browser retirement left its independent relay session online")
   test.assert(not fixture.peer.peer:status():has_finished(), "Relay peer was released by browser cleanup")
+  test.assert(fixture.engine.closed and fixture.session.world.health:is_closed(),
+    "Retirement reported offline before its independent transport owner finished")
   test.assert(not instance:running() and fs.lstat(instance:profile()) == nil,
     "Relay retirement skipped browser cleanup")
   assert_disconnected(requesting)
@@ -160,7 +193,7 @@ function test_session_close_runs_both_owners_after_browser_cleanup_failure(_cont
   instance.retirement = retirement
   defer hub.drain(retirement)
   local session_owner = foundry.Session(instance, fixture.session, fixture.session.id, {})
-  local requesting = pending_request(fixture.session)
+  local requesting = pending_request(fixture)
   defer hub.drain(requesting)
   local closing = async.run<|value, value|>(function(): value
     entered(true)
@@ -289,34 +322,17 @@ end
 function test_readiness_uses_exact_hub_connection(_context: test.Context)
   local worlds = hub.Hub(8, 60000)
   defer worlds:close()
-  local admitted: hub.Session? = nil
-  local replacement: hub.Session? = nil
-  local release, wait_release, close_release = async.channel<|boolean|>(1)
-  defer close_release()
-  local send_ready, wait_ready, close_ready = async.channel<|boolean|>(1)
-  defer close_ready()
-  local fixture = cdp_fixture.fixture(function (stream)
-    admitted = hub.Session("paired", stream, 8)
-    replacement = hub.Session("paired", stream, 8)
-    defer do
-      admitted:close(); admitted.outbox:close()
-      replacement:close(); replacement.outbox:close()
-    end
-    worlds.sessions["paired"] = admitted
-    send_ready(true)
-    wait_release()
-  end)
-  defer fixture:close()
-  wait_ready()
-  test.assert(foundry.owns_connection(worlds, "paired", admitted))
-  worlds.sessions["paired"] = replacement
-  test.assert(worlds:online("paired") and not foundry.owns_connection(worlds, "paired", admitted),
+  local admitted = relay_fixture(worlds, "paired")
+  defer admitted:close()
+  test.assert(foundry.owns_connection(worlds, "paired", admitted.session))
+  local replacement = relay_fixture(worlds, "paired")
+  defer replacement:close()
+  test.assert(worlds:online("paired") and not foundry.owns_connection(worlds, "paired", admitted.session),
     "A replacement connection kept its predecessor's owned session ready")
-  test.assert(foundry.owns_connection(worlds, "paired", replacement))
-  worlds:disconnect("paired")
-  test.assert(not foundry.owns_connection(worlds, "paired", replacement))
-  release(true)
-  fixture:finish_peer()
+  test.assert(foundry.owns_connection(worlds, "paired", replacement.session))
+  local retired? = worlds:disconnect("paired")
+  if retired then retired:close() end
+  test.assert(not foundry.owns_connection(worlds, "paired", replacement.session))
 end
 
 function test_startup_budget_includes_browser_initialization(_context: test.Context)

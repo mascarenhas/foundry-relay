@@ -15,6 +15,7 @@ record Config
   const heartbeat: integer
   const auth_timeout: integer
   const max_pending: integer
+  const api_concurrency: integer
 end
 
 local function number(name: string, fallback: integer, maximum: integer): integer
@@ -59,7 +60,8 @@ function load(): Config
     origins = origins, request_timeout = number("RELAY_REQUEST_TIMEOUT_MS", 0, 3600000),
     heartbeat = number("RELAY_HEARTBEAT_MS", 30000, 3600000),
     auth_timeout = number("RELAY_AUTH_TIMEOUT_MS", 10000, 60000),
-    max_pending = number("RELAY_MAX_PENDING", 128, 10000) }
+    max_pending = number("RELAY_MAX_PENDING", 128, 10000),
+    api_concurrency = number("RELAY_API_CONCURRENCY", 1, math.maxinteger) }
 end
 
 -- Scan all bytes, including when lengths differ; secrets never appear in logs.

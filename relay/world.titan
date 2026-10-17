@@ -1,0 +1,470 @@
+-- One isolated state owns one authenticated Foundry WebSocket and all its Tasks.
+local async = import "async"
+local timer = import "timer"
+local thread = import "thread"
+local uv = import "uv"
+local http = import "http"
+local websocket = import "websocket"
+local iteration = import "iteration"
+local protocol = import "relay.world_protocol"
+local messages = import "relay.messages"
+local control = import "relay.control"
+local config = import "relay.config"
+local store = import "relay.store"
+local wire = import "relay.wire"
+local router = import "relay.router"
+local log = import "relay.log"
+local api = import "relay.api"
+local tasks = import "relay.tasks"
+
+record Opening
+  const delivery_id: string
+  const payload: string
+  const world_title: string
+  const module_version: string
+  const metadata_json: string
+end
+
+record Bootstrap
+  const worker_id: integer
+  const settings: config.Config
+  const handle: protocol.WorldHandle
+  const requests: thread.Receiver<|protocol.WorldRequest|>
+  const commands: thread.Receiver<|protocol.WorldCommand|>
+  const inbox: thread.Receiver<|Opening|>
+  const ready: thread.Sender<|boolean|>
+  const coordinator: thread.Sender<|messages.ControlRequest|>
+  const log_level: string
+  const log_lines: thread.Sender<|string|>?
+end
+
+local const message_types: {string: boolean}?
+local function message_type(kind: string): string return message_types[kind] and kind or "unknown" end
+
+local record Pending
+  const job: protocol.WorldRequest
+  local completed: boolean
+  local deadline: async.Task<|nil, value|>?
+end
+
+local function Pending:complete(status: integer, body: string)
+  if self.completed then return end
+  self.completed = true
+  if not self.job.reply:is_closed() then
+    do self.job.reply:try_send(protocol.WorldReply(self.job.request_id, status, body)) catch end
+  end
+end
+
+local record Outgoing
+  const text: string
+  const request_id: string?
+  const kind: string?
+end
+
+local function Outgoing:should_send(pending_requests: {string: Pending}): boolean
+  if not self.request_id then return true end
+  local pending? = pending_requests[self.request_id]
+  return pending ~= nil and not pending.completed and not pending.job.reply:is_closed() and uv.hrtime() < pending.job.deadline_ns
+end
+
+local record Engine
+  const bootstrap: Bootstrap
+  const connection: websocket.Connection
+  const pending: {string: Pending}
+  const targets: {string: protocol.SubscriptionTarget}
+  const counts: {string: integer}
+  const outbox: async.BufferedSubscription<|Outgoing, string|>
+  const publish: function (Outgoing): boolean
+  const finish: function (): boolean
+  const logger: log.Logger?
+  local writer: async.Task<|nil, value|>?
+  local count: integer
+  local queued: integer
+  local admitting: boolean
+  local activated: boolean
+  local closed: boolean
+end
+
+local function Engine.new(bootstrap: Bootstrap, connection: websocket.Connection, logger: log.Logger?): Engine
+  local publish: (function (Outgoing): boolean)? = nil
+  local finish: (function (): boolean)? = nil
+  local outbox = async.BufferedSubscription<|Outgoing, string|>(function (p, _fail, f)
+    publish = p; finish = f
+    return async.SubscriptionActions<|Outgoing|>(function () end, function (_drain) end)
+  end)
+  return {bootstrap = bootstrap, connection = connection, pending = {}, targets = {}, counts = {},
+    outbox = outbox, publish = publish, finish = finish, logger = logger, writer = nil,
+    count = 0, queued = 0, admitting = true, activated = false, closed = false}
+end
+
+local function Engine:enqueue(text: string, id: string?, kind: string?)
+  if not self.admitting then raise "Foundry world is disconnected" end
+  if self.queued >= self.bootstrap.settings.max_pending + 16 then raise "Foundry output queue is full" end
+  if not self.publish(Outgoing(text, id, message_type(kind or "unknown"))) then raise "Foundry output queue is closed" end
+  self.queued = self.queued + 1
+end
+
+local function Engine:remove(id: string)
+  local pending? = self.pending[id]
+  if not pending then return end
+  self.pending[id] = nil
+  self.count = self.count - 1
+  if pending.deadline then tasks.drain(pending.deadline) end
+end
+
+local function Engine:quiesce()
+  local retired: {Pending} = {}
+  if self.admitting then
+    self.admitting = false
+    local code? = self.connection:close_status()
+    log.emit(self.logger, "info", "websocket_disconnected", {["client_id"] = self.bootstrap.handle.client_id, ["close_code"] = code})
+    self.finish()
+    for _, pending in iteration.pairs(self.pending) do
+      pending:complete(503, wire.error_body("Foundry world disconnected"))
+    end
+    -- Detach all queued mutations before any retirement can yield.
+    for id, pending in iteration.pairs(self.pending) do
+      self.pending[id] = nil
+      retired[#retired + 1] = pending
+    end
+    self.count = 0
+  end
+  -- Connection:write schedules a child before native output admission and can
+  -- wait behind a control frame. Cancelling before any drain yields closes
+  -- that window; the ACK must wait until the writer and its child have retired.
+  -- A writer-origin failure already retired its child and must not join itself.
+  local writer? = self.writer
+  if writer and writer ~= async.running() then writer:cancel() end
+  for index = 1, #retired do if retired[index].deadline then tasks.drain(retired[index].deadline) end end
+  if writer and writer ~= async.running() then tasks.await_terminal(writer) end
+end
+
+local function Engine:close()
+  if self.closed then return end
+  self.closed = true
+  self:quiesce()
+  self.connection:close()
+end
+
+local function Engine:log_failure(reason: string, cause: value)
+  if self.closed or not self.admitting or cause is async.CancellationReason then return end
+  if cause is websocket.Error then
+    local failure: websocket.Error = cause
+    if failure.kind == "state" then
+      log.emit(self.logger, "debug", "websocket_closing", {["client_id"] = self.bootstrap.handle.client_id})
+      return
+    end
+  end
+  log.emit(self.logger, "error", "websocket_failed", {["client_id"] = self.bootstrap.handle.client_id, ["reason"] = reason})
+end
+
+local function Engine:write_loop(): nil
+  while self.admitting do
+    case self.outbox:next()
+    when item(item) then
+      self.queued = self.queued - 1
+      if not self.admitting then return nil end
+      if item:should_send(self.pending) then
+        self.connection:write(websocket.TEXT, item.text)
+        log.emit(self.logger, "debug", "websocket_message_sent", {["client_id"] = self.bootstrap.handle.client_id,
+          ["type"] = item.kind or "unknown", ["bytes"] = #item.text})
+      else
+        if item.request_id then self:remove(item.request_id) end
+        log.emit(self.logger, "debug", "websocket_message_discarded", {["client_id"] = self.bootstrap.handle.client_id,
+          ["type"] = item.kind or "unknown", ["reason"] = "request_retired"})
+      end
+    else return nil
+    end
+  end
+  return nil
+catch
+  self:log_failure("write_failed", error)
+  -- Quiescence intentionally cancels an idle/pre-admission writer. Keep that
+  -- open transport for the command owner's graceful Close; an admitted write
+  -- already aborts its transport inside websocket.Connection cancellation.
+  if self.admitting or not (error is async.CancellationReason) then self:close() end
+  return nil
+end
+
+local function Engine:heartbeat_loop(): nil
+  while self.admitting do
+    timer.sleep(self.bootstrap.settings.heartbeat)
+    if self.admitting then
+      log.emit(self.logger, "debug", "websocket_ping", {["client_id"] = self.bootstrap.handle.client_id})
+      self.connection:ping(5000)
+      log.emit(self.logger, "debug", "websocket_pong", {["client_id"] = self.bootstrap.handle.client_id})
+    end
+  end
+  return nil
+catch
+  self:log_failure("heartbeat_failed", error)
+  self:close()
+  return nil
+end
+
+local function Engine:prune()
+  local retired: {Pending} = {}
+  local now = uv.hrtime()
+  for id, pending in iteration.pairs(self.pending) do
+    if pending.job.reply:is_closed() or now >= pending.job.deadline_ns then
+      self.pending[id] = nil
+      self.count = self.count - 1
+      if not pending.job.reply:is_closed() then pending:complete(408, wire.error_body("Foundry request timed out")) end
+      retired[#retired + 1] = pending
+    end
+  end
+  for index = 1, #retired do if retired[index].deadline then tasks.drain(retired[index].deadline) end end
+end
+
+local function Engine:request_loop(): nil
+  for _, job in self.bootstrap.requests:incoming() do
+    self:prune()
+    local pending = Pending(job, false, nil)
+    if not self.admitting then pending:complete(503, wire.error_body("Foundry world disconnected"))
+    elseif uv.hrtime() >= job.deadline_ns then pending:complete(408, wire.error_body("Foundry request timed out"))
+    elseif self.count >= self.bootstrap.settings.max_pending then pending:complete(429, wire.error_body("too many pending requests"))
+    elseif job.reply:is_closed() then
+      -- A timed out caller has already retired this request's reply lease.
+    else
+      self.pending[job.request_id] = pending
+      self.count = self.count + 1
+      pending.deadline = async.run<|nil, value|>(function (): nil
+        local remaining = job.deadline_ns - uv.hrtime()
+        if remaining > 0 then timer.sleep((remaining + 999999) // 1000000) end
+        if self.pending[job.request_id] == pending then
+          self.pending[job.request_id] = nil; self.count = self.count - 1
+          pending:complete(408, wire.error_body("Foundry request timed out"))
+          log.emit(self.logger, "error", "request_timeout", {["client_id"] = self.bootstrap.handle.client_id, ["type"] = message_type(job.action)})
+        end
+        return nil
+      end)
+      do self:enqueue(job.payload_json, job.request_id, job.action)
+      catch
+        pending:complete(503, wire.error_body("Foundry output queue is full"))
+        self:remove(job.request_id)
+      end
+      log.emit(self.logger, "debug", "request_forwarded", {["client_id"] = self.bootstrap.handle.client_id,
+        ["type"] = message_type(job.action), ["pending"] = self.count})
+    end
+  end
+  return nil
+catch
+  self:log_failure("request_failed", error)
+  self:close()
+  return nil
+end
+
+local function Engine:notify(channel: string, count: integer, force: boolean?)
+  local previous? = self.counts[channel]
+  self.counts[channel] = count
+  if self.admitting and self.activated and (force or previous ~= count) then
+    local payload: {string: value} = {["type"] = "event-subscription-update", ["channel"] = channel, ["count"] = count}
+    self:enqueue(wire.encode(payload), nil, "event-subscription-update")
+    log.emit(self.logger, "debug", "subscription_changed", {["client_id"] = self.bootstrap.handle.client_id,
+      ["channel"] = channel, ["count"] = count})
+  end
+end
+
+local function Engine:command_loop(): nil
+  for _, command in self.bootstrap.commands:incoming() do
+    case command
+    when quiesce(_reason, ack) then
+      self:quiesce()
+      do ack:try_send(true) catch end
+    when stop(graceful) then
+      self:quiesce()
+      if graceful then
+        log.emit(self.logger, "debug", "websocket_replaced", {["client_id"] = self.bootstrap.handle.client_id})
+        do self.connection:shutdown(1000, "Replaced by reconnect", 1000) catch end
+      end
+      self:close()
+      return nil
+    when cancel(id) then self:remove(id)
+    when subscribe(target, count) then
+      self.targets[target.key] = target
+      self:notify(target.channel, count)
+    when unsubscribe(key, channel, count) then
+      self.targets[key] = nil
+      self:notify(channel, count)
+    end
+  end
+  self:close()
+  return nil
+catch
+  self:log_failure("command_failed", error)
+  self:close()
+  return nil
+end
+
+local function event_channel(kind: string): string?
+  if kind == "chat-event" then return "chat-events" end
+  if kind == "roll-data" then return "roll-events" end
+  if kind == "hook-event" then return "hooks" end
+  if kind == "combat-event" then return "combat-events" end
+  if kind == "actor-event" then return "actor-events" end
+  if kind == "scene-event" then return "scene-events" end
+  return nil
+end
+
+local function Engine:receive(text: string)
+  if not self.admitting then return end
+  local message = wire.object(text)
+  local kind = wire.text(message, "type")
+  local id = self.bootstrap.handle.client_id
+  log.emit(self.logger, "debug", "websocket_message_received", {["client_id"] = id, ["type"] = message_type(kind), ["bytes"] = #text})
+  if kind == "ping" then self:enqueue("{\"type\":\"pong\"}", nil, "pong"); return end
+  local channel? = event_channel(kind)
+  if channel then
+    local dropped: {protocol.SubscriptionTarget} = {}
+    for key, target in iteration.pairs(self.targets) do
+      if target.channel == channel then
+        local sent = false
+        do if not target.events:is_closed() then sent = target.events:try_send(text) end catch end
+        if not sent then
+          target.events:close()
+          self.targets[key] = nil
+          dropped[#dropped + 1] = target
+        end
+      end
+    end
+    if #dropped > 0 then self:notify(channel, (self.counts[channel] or #dropped) - #dropped) end
+    for index = 1, #dropped do
+      local target = dropped[index]
+      control.notify(self.bootstrap.coordinator, self.bootstrap.worker_id, "drop-subscription",
+        wire.encode({["key"] = target.key}), nil, nil)
+    end
+    return
+  end
+  local request_id = wire.text(message, "requestId")
+  local pending? = self.pending[request_id]
+  if pending and kind == pending.job.action .. "-result" then
+    local status = message["error"] ~= nil and 400 or 200
+    pending:complete(status, text)
+    self:remove(request_id)
+    log.emit(self.logger, "debug", "request_result", {["client_id"] = id, ["type"] = message_type(kind), ["status"] = status})
+  else
+    log.emit(self.logger, "debug", "websocket_message_ignored", {["client_id"] = id, ["type"] = message_type(kind)})
+  end
+end
+
+local function Engine:read_loop()
+  while not self.closed do
+    local kind?, data? = self.connection:read()
+    if not kind then return end
+    if kind ~= websocket.TEXT then
+      log.emit(self.logger, "error", "websocket_failed", {["client_id"] = self.bootstrap.handle.client_id, ["reason"] = "text_messages_required"})
+      return
+    end
+    self:receive(data)
+  end
+catch self:log_failure("message_or_transport_failed", error)
+end
+
+local function origin_allowed(request: http.Request, settings: config.Config): boolean
+  local origins = request.headers:values("Origin")
+  if #origins == 0 then return true end
+  if #origins ~= 1 then return false end
+  local origin = origins[1]
+  if origin == request.url.scheme .. "://" .. request.url.authority then return true end
+  for index = 1, #settings.origins do if origin == settings.origins[index] then return true end end
+  return false
+end
+
+local function execute(bootstrap: Bootstrap, logger: log.Logger?): nil
+  defer do
+    -- Only bytes still queued here are known not to have been adopted.
+    while true do
+      local found, opening? = bootstrap.inbox:try_receive()
+      if not found then break end
+      http.Exchange.discard_transfer_payload(opening.payload)
+    end
+    -- Supervisor closes the producer before its final post-join drain.
+    -- Closing this Receiver here could discard a concurrently enqueued raw resource.
+    bootstrap.requests:close(); bootstrap.commands:close()
+  end
+  local database = store.attach(bootstrap.settings.database)
+  defer database:close()
+  bootstrap.ready:send(true)
+  local opening = bootstrap.inbox:receive()
+  local exchange = http.Exchange.from_transfer_payload(opening.payload)
+  defer exchange:close()
+  local request = exchange.request
+  local response = exchange.response
+  if not origin_allowed(request, bootstrap.settings) then router.error_response(response, 403, "origin is not allowed"); return nil end
+  local connection = websocket.accept(request, response, websocket.AcceptOptions {
+    allowed_origins = bootstrap.settings.origins, read_limit = 16777216, handshake_timeout = bootstrap.settings.auth_timeout})
+  defer connection:close()
+  local engine = Engine(bootstrap, connection, logger)
+  defer do engine:close(); engine.outbox:close() end
+  local commands = async.run<|nil, value|>(engine:command_loop)
+  defer tasks.drain(commands)
+  local deadline = async.run<|nil, value|>(function (): nil
+    timer.sleep(bootstrap.settings.auth_timeout); connection:close(); return nil
+  end)
+  defer tasks.drain(deadline)
+  local kind?, text? = connection:read()
+  if not kind then return nil end
+  if kind ~= websocket.TEXT then
+    log.emit(logger, "error", "websocket_failed", {["reason"] = "authentication_requires_text"}); return nil
+  end
+  log.emit(logger, "debug", "websocket_message_received", {["type"] = "authentication", ["bytes"] = #text})
+  local auth = wire.object(text)
+  local token = wire.text(auth, "token")
+  local client? = database:authenticate(bootstrap.handle.client_id, token)
+  if wire.text(auth, "type") ~= "auth" or not client then
+    log.emit(logger, "info", "websocket_authentication_rejected")
+    connection:write(websocket.TEXT, "{\"type\":\"auth-failed\",\"error\":\"invalid pairing token\"}")
+    connection:shutdown(1008, "authentication failed", 1000); return nil
+  end
+  tasks.drain(deadline)
+  database:update(client.client_id, client.world_id, opening.world_title ~= "" and opening.world_title or client.world_title,
+    opening.module_version, opening.metadata_json)
+  local published = control.call(bootstrap.coordinator, bootstrap.worker_id, "auth-publish",
+    wire.encode({["id"] = client.client_id, ["token"] = token}), bootstrap.handle, nil)
+  if published.status ~= 200 or not engine.admitting then
+    if engine.admitting then
+      log.emit(logger, "info", "websocket_authentication_rejected")
+      connection:write(websocket.TEXT, "{\"type\":\"auth-failed\",\"error\":\"invalid pairing token\"}")
+      connection:shutdown(1008, "authentication failed", 1000)
+    end
+    return nil
+  end
+  local activation = published.activation
+  if not activation then raise "World activation is missing" end
+  for index = 1, #activation.targets do
+    local target = activation.targets[index]
+    if not target.events:is_closed() then engine.targets[target.key] = target end
+  end
+  connection:write(websocket.TEXT, "{\"type\":\"auth-success\"}")
+  log.emit(logger, "debug", "websocket_message_sent", {["client_id"] = client.client_id, ["type"] = "auth-success", ["bytes"] = 23})
+  if not engine.admitting then return nil end
+  engine.activated = true
+  local writer = async.run<|nil, value|>(engine:write_loop)
+  engine.writer = writer
+  local heartbeat = async.run<|nil, value|>(engine:heartbeat_loop)
+  local requests = async.run<|nil, value|>(engine:request_loop)
+  defer do engine:close(); tasks.drain(requests); tasks.drain(heartbeat); tasks.drain(writer) end
+  for index = 1, #activation.counts do
+    local count = activation.counts[index]
+    engine:notify(count.channel, engine.counts[count.channel] or count.count, true)
+  end
+  engine:read_loop()
+  return nil
+catch
+  if not (error is async.CancellationReason) then log.emit(logger, "error", "websocket_failed", {["reason"] = "handshake_or_authentication_failed"}) end
+  return nil
+end
+
+function run(bootstrap: Bootstrap): nil
+  local logger? = log.forward(bootstrap.log_level, bootstrap.log_lines)
+  defer if logger then logger:close() end
+  return execute(bootstrap, logger)
+end
+
+do
+  message_types = {["ping"] = true, ["pong"] = true, ["auth-success"] = true,
+    ["event-subscription-update"] = true, ["chat-event"] = true, ["roll-data"] = true,
+    ["hook-event"] = true, ["combat-event"] = true, ["actor-event"] = true, ["scene-event"] = true}
+  local endpoints = api.definitions()
+  for index = 1, #endpoints do message_types[endpoints[index].action] = true; message_types[endpoints[index].action .. "-result"] = true end
+end
