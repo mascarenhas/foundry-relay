@@ -67,9 +67,11 @@ main logging sink.
 
 ## Channel cost measurements
 
-The initial production Linux x86_64 benchmark used five rounds of 3,000 round
-trips with exactly one outstanding request, worker startup excluded, and GC
-enabled. Socket I/O, JSON encoding, and Foundry execution were excluded.
+The initial production Linux x86_64 benchmark used Titan `a5a6bb2` on an AMD
+Ryzen AI 9 HX 370. Five rounds each completed 3,000 round trips with exactly one
+outstanding request, worker startup excluded, and GC enabled. The table gives
+the median of the five per-round average costs. Socket I/O, JSON encoding, and
+Foundry execution were excluded.
 
 | Reply strategy | Median round trip |
 | --- | ---: |

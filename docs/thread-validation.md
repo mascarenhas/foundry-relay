@@ -1,8 +1,8 @@
 # Threaded relay validation
 
 Validated on 2026-10-17. Native application and test inputs are commit
-`578d90ff2d3866dfb63c2b40edb19189cd71e15c`; subsequent delivery changes update
-documentation only. All 58 authored files were checked against that commit in
+`ce01300e68ed89e2dc73ee29b7f709ead37dcbc3`; subsequent delivery changes update
+documentation only. All 59 authored files were checked against that commit in
 each platform's isolated build source. The 39 Titan sources are identical
 across platforms.
 
@@ -18,10 +18,10 @@ only that pin relative to the compiled `f07fab4d` inputs.
 
 | Platform | Profile and toolchain | Selected | Passed | Skipped | Failed |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Linux x86_64 | Validation, GCC, system OpenSSL | 381 | 378 | 3 | 0 |
-| Linux x86_64 | Production, GCC/LTO, system OpenSSL 3.5.9 | 381 | 378 | 3 | 0 |
-| Local macOS 15.7.7 x86_64 VM | Validation, Apple Clang 17, system OpenSSL 3.6.5 | 381 | 378 | 3 | 0 |
-| Local Windows 11 Pro AMD64 VM, NTFS | CLANG64/UCRT, LLVM 22.1.8 | 382 | 364 | 18 | 0 |
+| Linux x86_64 | Validation, GCC, system OpenSSL | 385 | 382 | 3 | 0 |
+| Linux x86_64 | Production, GCC/LTO, system OpenSSL 3.5.9 | 385 | 382 | 3 | 0 |
+| Local macOS 15.7.7 x86_64 VM | Validation, Apple Clang 17, system OpenSSL 3.6.5 | 385 | 382 | 3 | 0 |
+| Local Windows 11 Pro AMD64 VM, NTFS | CLANG64/UCRT, LLVM 22.1.8 | 386 | 368 | 18 | 0 |
 
 The POSIX runs build the application and all 17 test roots. The Windows run
 builds the application and all 16 Windows core roots; the separate POSIX static
@@ -34,14 +34,23 @@ file sharing. The Windows skips are 17 POSIX fake-child fixtures and one POSIX
 permission-bit assertion. Windows installed-Edge cases ran. There are no
 threading, reply-pool, or concurrent-Store skips.
 
-The new coverage includes seven real network/threading cases, fourteen reply
+The new coverage includes nine real network/threading cases, fourteen reply
 pool cases, and six concurrent-Store cases. It verifies persistent workers,
 per-request round robin including keep-alive requests, separate world threads,
 worker failure, pending-call settlement, accepted-connection retirement, and
-subscription cancellation before and after reply publication. Seventeen world
+subscription cancellation before and after reply publication. Nineteen world
 protocol cases cover request correlation, admission, reconnect quiescence,
 subscription counts, and captured connection ownership. Four session HTTP cases
 also verify that session identifiers remain strings and shutdown is idempotent.
+
+Two cancellation regressions hold the real Store FIFO after a security
+transition is admitted, then cancel its coordinator request. Both credential
+mutation and captured-world retirement still complete. The tests fail against
+the old Server. Ordinary Store operations retain their cancellation/rollback
+behavior. Two writer regressions verify retirement before a quiescence ACK and
+avoid self-join on writer-origin failure. Restoring the old quiescence body
+fails the retirement assertion; all other protocol cases still pass. Graceful
+reconnect Close 1000 and a usable replacement are covered by integration tests.
 
 ## Executable delivery and configuration
 
@@ -59,9 +68,9 @@ The VM policy disallows script-file execution, so the authored check script's
 body and parameters ran through ordinary PowerShell commands without changing
 the policy.
 
-Installed SDK inputs remained immutable. Full before/after manifests on macOS
-(2,372 files and links) and Windows (2,771 files) matched. Linux validation also
-retained matching compiler and standard-provider hashes. Separate sources,
+Installed SDK inputs remained immutable. Full before/after manifests matched
+for Linux validation (2,335 files and links), Linux production (1,510), macOS
+(2,372), and Windows (2,771). Separate sources,
 output roots, prefixes, and writable compiler caches prevented build overlap.
 
 A Linux CLI smoke checked the actual `RELAY_API_CONCURRENCY` environment path.
@@ -85,6 +94,8 @@ The handoff prerequisite passed complete native suites on Linux
 Windows (1,519 passed, 30 classified skips), plus metadata, build-inventory,
 and source-free consumer checks. Windows demand-read tests exercise established
 TLS and post-read connection movement on IOCP.
+Hosted Linux CI also passed for the exact handoff head:
+[run 39050671093](https://github.com/mascarenhas/titan/actions/runs/39050671093).
 
 The nil-message iterator review finding was reproduced and fixed with native
 regressions. Abandoned thread-result endpoint cleanup was already corrected in
