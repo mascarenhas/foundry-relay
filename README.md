@@ -6,7 +6,7 @@ The server and tests are Titan. On POSIX, application modules and the Titan stan
 
 ## Build and test
 
-Use a prepared Titan installation containing `http`, `websocket`, `sqlite3`, `json`, and `peg`, including HTTP `Response:abort()`, the compiled `titan.test.Case`/`run` API, and `--output` support from [Titan PR #236](https://github.com/mascarenhas/titan/pull/236). GNU Make 4.3 or newer is required for grouped module outputs. [TITAN_REVISION](TITAN_REVISION) pins that producer commit for the production line-coverage workflow. Earlier Linux x86_64 and local Windows x64 validation used commit `4987078d`; those historical checks are recorded in [validation](docs/validation.md).
+Use a prepared Titan installation containing `thread`, `http`, `websocket`, `sqlite3`, `json`, and `peg`, including the channel endpoint-transfer API from [Titan PR #248](https://github.com/mascarenhas/titan/pull/248) and portable demand reads, HTTP exchange transfer/disposal, and `Exchange:serve` header deadlines from [Titan PR #249](https://github.com/mascarenhas/titan/pull/249). The compiled `titan.test.Case`/`run` API, HTTP `Response:abort()`, and `--output` support are also required. GNU Make 4.3 or newer is required for grouped module outputs. [TITAN_REVISION](TITAN_REVISION) pins the tested producer commit for builds and native coverage. See [thread validation](docs/thread-validation.md) for current Linux, macOS, and Windows results; [earlier validation](docs/validation.md) retains checks against older producer revisions.
 
 ```sh
 export PATH=/path/to/titan-prefix/bin:$PATH
@@ -35,7 +35,7 @@ Both phases use `--static --incremental --output build`. Make compiles changed m
 
 `Makefile.modules` records each module's project imports so an edited producer rebuilds its consumers before relinking. Keep it current when adding or renaming modules or changing imports. The build configuration stamp tracks source inventory and caller settings; compiler, SDK, selected provider, native tool, and OpenSSL files are ordinary Make prerequisites. SDK replacement and flag changes rebuild the shared objects. `make clean` removes `build`; legacy source-adjacent artifacts are left untouched.
 
-`TITANC=/absolute/path/bin/titanc` selects a compiler and its SDK prefix. `TITAN_STDLIB=/absolute/path/lib/titan/0.6` overrides the standard-provider directory; the test command also supplies it to child fixtures through `TITAN_PATH_0_6`. Both ordinary POSIX executables embed the selected standard archive. On a restricted development host, set `CCACHE_DIR` to a writable location; `TITAN_PROBE_CACHE_DISABLE=1` is useful after a failed sandboxed native-header probe.
+`TITANC=/absolute/path/bin/titanc` selects a compiler and its SDK prefix. `TITAN_STDLIB=/absolute/path/lib/titan/0.6` overrides the standard-provider directory; the test command also supplies it to child fixtures through `TITAN_PATH_0_6`. Both ordinary POSIX executables embed the selected standard archive. On a restricted development host, set `CCACHE_DIR` to a writable location; `TITAN_PROBE_CACHE_DISABLE=1` keeps persistent native-header probes from writing to an immutable SDK and is also useful after a failed sandboxed probe.
 
 `make coverage` runs the full Titan suite with native executable-line coverage,
 including the covered relay child launched by the process test. Titan produces
