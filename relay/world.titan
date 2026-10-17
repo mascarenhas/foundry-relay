@@ -77,6 +77,7 @@ local record Engine
   const publish: function (Outgoing): boolean
   const finish: function (): boolean
   const logger: log.Logger?
+  local writer: async.Task<|nil, value|>?
   local count: integer
   local queued: integer
   local admitting: boolean
@@ -92,7 +93,7 @@ local function Engine.new(bootstrap: Bootstrap, connection: websocket.Connection
     return async.SubscriptionActions<|Outgoing|>(function () end, function (_drain) end)
   end)
   return {bootstrap = bootstrap, connection = connection, pending = {}, targets = {}, counts = {},
-    outbox = outbox, publish = publish, finish = finish, logger = logger,
+    outbox = outbox, publish = publish, finish = finish, logger = logger, writer = nil,
     count = 0, queued = 0, admitting = true, activated = false, closed = false}
 end
 
@@ -112,22 +113,30 @@ local function Engine:remove(id: string)
 end
 
 local function Engine:quiesce()
-  if not self.admitting then return end
-  self.admitting = false
-  local code? = self.connection:close_status()
-  log.emit(self.logger, "info", "websocket_disconnected", {["client_id"] = self.bootstrap.handle.client_id, ["close_code"] = code})
-  self.finish()
-  for _, pending in iteration.pairs(self.pending) do
-    pending:complete(503, wire.error_body("Foundry world disconnected"))
-  end
-  -- Detach all queued mutations before any timer retirement can yield.
   local retired: {Pending} = {}
-  for id, pending in iteration.pairs(self.pending) do
-    self.pending[id] = nil
-    retired[#retired + 1] = pending
+  if self.admitting then
+    self.admitting = false
+    local code? = self.connection:close_status()
+    log.emit(self.logger, "info", "websocket_disconnected", {["client_id"] = self.bootstrap.handle.client_id, ["close_code"] = code})
+    self.finish()
+    for _, pending in iteration.pairs(self.pending) do
+      pending:complete(503, wire.error_body("Foundry world disconnected"))
+    end
+    -- Detach all queued mutations before any retirement can yield.
+    for id, pending in iteration.pairs(self.pending) do
+      self.pending[id] = nil
+      retired[#retired + 1] = pending
+    end
+    self.count = 0
   end
-  self.count = 0
+  -- Connection:write schedules a child before native output admission and can
+  -- wait behind a control frame. Cancelling before any drain yields closes
+  -- that window; the ACK must wait until the writer and its child have retired.
+  -- A writer-origin failure already retired its child and must not join itself.
+  local writer? = self.writer
+  if writer and writer ~= async.running() then writer:cancel() end
   for index = 1, #retired do if retired[index].deadline then tasks.drain(retired[index].deadline) end end
+  if writer and writer ~= async.running() then tasks.await_terminal(writer) end
 end
 
 local function Engine:close()
@@ -170,7 +179,10 @@ local function Engine:write_loop(): nil
   return nil
 catch
   self:log_failure("write_failed", error)
-  self:close()
+  -- Quiescence intentionally cancels an idle/pre-admission writer. Keep that
+  -- open transport for the command owner's graceful Close; an admitted write
+  -- already aborts its transport inside websocket.Connection cancellation.
+  if self.admitting or not (error is async.CancellationReason) then self:close() end
   return nil
 end
 
@@ -428,6 +440,7 @@ local function execute(bootstrap: Bootstrap, logger: log.Logger?): nil
   if not engine.admitting then return nil end
   engine.activated = true
   local writer = async.run<|nil, value|>(engine:write_loop)
+  engine.writer = writer
   local heartbeat = async.run<|nil, value|>(engine:heartbeat_loop)
   local requests = async.run<|nil, value|>(engine:request_loop)
   defer do engine:close(); tasks.drain(requests); tasks.drain(heartbeat); tasks.drain(writer) end

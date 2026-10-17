@@ -52,8 +52,11 @@ repeating initialization.
 The main thread owns the live world directory, persistent SSE subscriptions,
 and headless browsers, credentials, and reservations. Channels coordinate final
 authentication and publication, revocation or deletion with disconnect, and
-headless admission. A reconnect quiesces the incumbent world and receives an
-acknowledgment before replacing it. Graceful WebSocket retirement then runs in
+headless admission. Once a revoke/delete transition is admitted, an independent
+coordinator Task completes both the credential mutation and the captured
+connection's retirement even if its API caller is cancelled. A reconnect
+quiesces the incumbent world and waits for acknowledgment that its data writer
+has retired before replacing it. Graceful WebSocket retirement then runs in
 the background. Headless cleanup retains the exact captured connection identity.
 
 SSE streams stay in API workers. Worlds send events directly through bounded

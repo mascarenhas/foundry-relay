@@ -9,6 +9,10 @@ local uv = import "uv"
 local async = import "async"
 local timer = import "timer"
 local string = import "string"
+local http = import "http"
+local websocket = import "websocket"
+local os = import "os"
+local messages = import "relay.messages"
 
 function test_nulls_and_nested_arrays_round_trip(_context: test.Context)
   local source = [[{"a":[1,null,null],"b":null,"c":{"d":null}}]]
@@ -324,4 +328,120 @@ function test_captured_close_holds_admission_until_quiescence_then_awaits_join(_
   when failed(failure) then failure:raise()
   else raise "captured close did not finish after owner join"
   end
+end
+
+local record WriterFixture
+  const engine: world.Engine
+  const peer: websocket.Connection
+  const endpoint: Address
+  const listener: http.Server
+  const serving: async.Task<|async.Error?, value|>
+  const close_channels: function (): ()
+end
+
+local function WriterFixture:close()
+  self.engine:close()
+  self.engine.outbox:close()
+  self.peer:close()
+  self.listener:close()
+  hub.drain(self.serving)
+  self.endpoint:close()
+  self.close_channels()
+end
+
+local function writer_fixture(): WriterFixture
+  local accepted, receive, close_accepted = async.channel<|websocket.Connection|>(1)
+  defer close_accepted()
+  local listener: http.Server? = nil
+  local port = 0
+  local first = 44000 + (os.pid() % 100) * 20
+  for candidate = first, first + 19 do
+    local failure: async.Error? = nil
+    do
+      listener = http.listen("127.0.0.1", function (request, response)
+        accepted(websocket.accept(request, response))
+      end, candidate, 8, 1000)
+    catch failure = async.Error(error, traceback) end
+    if not failure then port = candidate; break end
+    if failure.error is async.OperationError then
+      if (failure.error as async.OperationError).name ~= "EADDRINUSE" then failure:raise() end
+    else failure:raise() end
+  end
+  if not listener then raise "No loopback port available for world writer tests" end
+  local serving = async.run<|async.Error?, value|>(function (): async.Error?
+    listener:serve()
+    return nil
+  catch return async.Error(error, traceback) end)
+  local transferred = false
+  defer if not transferred then listener:close(); hub.drain(serving) end
+  local peer = websocket.connect("ws://127.0.0.1:" .. port .. "/writer")
+  defer if not transferred then peer:close() end
+  local connection = receive()
+  defer if not transferred then connection:close() end
+  local endpoint = address("writer")
+  defer if not transferred then endpoint:close() end
+  local inbox_tx, inbox_rx = thread.channel<|world.Opening|>(1)
+  local ready_tx, ready_rx = thread.channel<|boolean|>(1)
+  local control_tx, control_rx = thread.channel<|messages.ControlRequest|>(1)
+  local close_channels = function ()
+    inbox_rx:close(); inbox_tx:close(); ready_rx:close(); ready_tx:close()
+    control_rx:close(); control_tx:close()
+  end
+  defer if not transferred then close_channels() end
+  local settings = config.Config("127.0.0.1", 0, "key", "CODE12", "/unused",
+    "ws://127.0.0.1/relay", {}, 60000, 60000, 1000, 8, 1)
+  local bootstrap = world.Bootstrap(1, settings, endpoint.handle, endpoint.requests,
+    endpoint.commands, inbox_rx, ready_tx, control_tx, "error", nil)
+  local engine = world.Engine(bootstrap, connection, nil)
+  transferred = true
+  return WriterFixture(engine, peer, endpoint, listener, serving, close_channels)
+end
+
+local function bounded_writer(task: async.Task<|nil, value|>, message: string)
+  local deadline = async.run<|nil, value|>(function (): nil timer.sleep(3000); return nil end)
+  defer hub.drain(deadline)
+  case async.race_two(task, deadline)
+  when first(status) then
+    case status
+    when succeeded() then
+    when failed(failure) then failure:raise()
+    else raise "World writer test Task was cancelled"
+    end
+  when second() then raise message
+  end
+end
+
+function test_quiescence_retires_writer_before_acknowledging(_context: test.Context)
+  local fixture = writer_fixture()
+  defer fixture:close()
+  local engine = fixture.engine
+  engine:enqueue("queued mutation", nil, "entity")
+  local writer = async.run<|nil, value|>(engine:write_loop)
+  engine.writer = writer
+  defer hub.drain(writer)
+  -- FIFO runs the writer first: Connection:write schedules its native-work
+  -- child behind this quiescer, so no native write has yet been accepted.
+  local quiescing = async.run<|nil, value|>(function (): nil
+    test.assert(engine.queued == 0 and not writer:status():has_finished(),
+      "Fixture did not enter the data writer before native admission")
+    engine:quiesce()
+    test.assert(writer:status():has_finished(),
+      "quiescence acknowledged while an uncommitted writer could still send")
+    return nil
+  end)
+  defer hub.drain(quiescing)
+  bounded_writer(quiescing, "Quiescence did not retire its data writer")
+end
+
+function test_writer_origin_close_does_not_drain_itself(_context: test.Context)
+  local fixture = writer_fixture()
+  defer fixture:close()
+  local engine = fixture.engine
+  engine:enqueue("\255", nil, "entity")
+  local writer = async.run<|nil, value|>(engine:write_loop)
+  engine.writer = writer
+  defer hub.drain(writer)
+  bounded_writer(writer, "Writer-origin close tried to drain itself")
+  test.assert(engine.closed and not engine.admitting,
+    "Invalid outgoing text did not retire the world engine")
 end
