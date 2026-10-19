@@ -1,0 +1,30 @@
+local thread = import "thread"
+local world = import "relay.world_protocol"
+
+-- Coordinator requests contain data and channel endpoints, never a transport.
+record ControlRequest
+  const request_id: string
+  const worker_id: integer
+  const operation: string
+  const body: string
+  const world: world.WorldHandle?
+  const subscription: world.Subscription?
+  const reply: thread.Sender<|ControlReply|>?
+end
+
+record ControlReply
+  const status: integer
+  const body: string
+  const world: world.WorldHandle?
+  const subscription: world.Subscription?
+  const activation: world.Activation?
+end
+
+-- The sender owns payload until enqueue succeeds. The queue then owns it until
+-- immediate adoption, or explicit disposal after its sole consumer has joined.
+record Handoff
+  const delivery_id: string
+  const payload: string
+  const method: string
+  const target: string
+end

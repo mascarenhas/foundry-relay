@@ -10,6 +10,10 @@ local string = import "string"
 local server = import "relay.server"
 local config = import "relay.config"
 local hub = import "relay.hub.titan"
+local world_engine = import "relay.world.titan"
+local protocol = import "relay.world_protocol"
+local thread = import "thread"
+local uv = import "uv"
 local wire = import "relay.wire"
 local sessions = import "relay.sessions"
 
@@ -47,7 +51,7 @@ local function start(database: string, timeout: integer): Fixture
       host = "127.0.0.1", port = port, api_key = api_key, pairing_code = pairing_code,
       database = database, public_url = "ws://127.0.0.1:" .. port .. "/relay",
       origins = {"http://127.0.0.1:30000"}, request_timeout = timeout,
-      heartbeat = 60000, auth_timeout = 1000, max_pending = 16 }
+      heartbeat = 60000, auth_timeout = 1000, max_pending = 16, api_concurrency = 1 }
     local instance = server.Server(settings, sessions.Options("", "/unused", 4, 120000))
     local failure: async.Error? = nil
     do
@@ -243,14 +247,14 @@ function test_reconnect_snapshot_includes_zero_counts_and_surviving_readers(_con
     local incumbent = dial(fixture, credentials)
     defer incumbent:close()
     local retained = fixture.instance.worlds:subscribe(credentials.id, "chat-events")
-    defer fixture.instance.worlds:unsubscribe(retained)
+    defer fixture.instance.worlds:unsubscribe(retained.key)
     local removed = fixture.instance.worlds:subscribe(credentials.id, "hooks")
     local chat = message(incumbent)
     local hooks = message(incumbent)
     test.assert(chat["count"] == 1 and hooks["count"] == 1)
     incumbent:close()
     while fixture.instance.worlds:online(credentials.id) do timer.yield() end
-    fixture.instance.worlds:unsubscribe(removed)
+    fixture.instance.worlds:unsubscribe(removed.key)
     local snapshot: {string: integer} = {}
     local replacement = dial(fixture, credentials, snapshot)
     defer replacement:close()
@@ -268,7 +272,7 @@ function test_sse_overflow_immediately_disables_the_world_event_channel(_context
     local world = dial(fixture, credentials)
     defer world:close()
     local stalled = fixture.instance.worlds:subscribe(credentials.id, "chat-events")
-    defer fixture.instance.worlds:unsubscribe(stalled)
+    defer fixture.instance.worlds:unsubscribe(stalled.key)
     test.assert(message(world)["count"] == 1)
     -- Keep the reader registered but consume no data, just like a stalled HTTP
     -- stream whose cleanup has not run. The overflow must notify Foundry itself.
@@ -285,36 +289,22 @@ function test_sse_overflow_immediately_disables_the_world_event_channel(_context
 end
 
 function test_cancelled_queued_mutation_detaches_before_deadline_cleanup(_context: test.Context)
-  with_relay(function(fixture)
-    local connection = dial(fixture, pair(fixture, "world"))
-    defer connection:close()
-    -- Hold output in an isolated Session with no writer, so cancellation can be
-    -- observed before network admission while its real timer handle retires.
-    local session = hub.Session.new("isolated", connection, 10)
-    defer do session:close(); session.outbox:close() end
-    local payload: {string: value} = {}
-    local requesting = async.run<|hub.Reply, value|>(function (): hub.Reply
-      return session:request("create", payload, 60000)
-    end)
-    defer hub.drain(requesting)
-    while requesting:status():as_string() == "ready" do timer.yield() end
-    timer.yield()
-    local output = hub.Outgoing("queued mutation", wire.text(payload, "requestId"))
-    test.assert(output:should_send(session.pending))
-    requesting:cancel()
-    local observing = async.run<|boolean, value|>(function (): boolean
-      return output:should_send(session.pending)
-    end)
-    defer hub.drain(observing)
-    case async.join(observing)
-    when succeeded(eligible) then
-      test.assert(not eligible, "cancelled mutation remained eligible while its deadline retired")
-    when failed(failure) then failure:raise()
-    else raise "queued request observer did not finish"
-    end
-    test.assert((async.join(requesting):has_cancelled()))
-    test.assert(session.count == 0 and not output:should_send(session.pending))
-  end)
+  local tx, rx = thread.channel<|protocol.WorldReply|>(1)
+  defer tx:close()
+  local pending = world_engine.Pending(protocol.WorldRequest("cancelled", "create", "{}", uv.hrtime() + 60000000000, tx), false, nil)
+  local requests: {string: world_engine.Pending} = {["cancelled"] = pending}
+  local output = world_engine.Outgoing("queued mutation", "cancelled")
+  test.assert(output:should_send(requests))
+  -- Poisoning a cancelled caller's lease is synchronous. The writer must stop
+  -- admitting its queued mutation before advisory cancel/timer cleanup arrives.
+  rx:close()
+  local observing = async.run<|boolean, value|>(function (): boolean return output:should_send(requests) end)
+  defer hub.drain(observing)
+  case async.join(observing)
+  when succeeded(eligible) then test.assert(not eligible, "cancelled mutation remained eligible while its deadline retired")
+  when failed(failure) then failure:raise()
+  else raise "queued request observer did not finish"
+  end
 end
 
 local function answer(connection: websocket.Connection, request: {string: value},

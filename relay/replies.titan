@@ -1,0 +1,209 @@
+local async = import "async"
+local iteration = import "iteration"
+local math = import "math"
+local thread = import "thread"
+local timer = import "timer"
+local uv = import "uv"
+local protocol = import "relay.world_protocol"
+local store = import "relay.store"
+local wire = import "relay.wire"
+local tasks = import "relay.tasks"
+
+local record Lease
+  sender: thread.Sender<|protocol.WorldReply|>
+  receiver: thread.Receiver<|protocol.WorldReply|>
+  busy: boolean
+end
+
+local function Lease.new(): Lease
+  local sender, receiver = thread.channel<|protocol.WorldReply|>(1)
+  return { sender = sender, receiver = receiver, busy = false }
+end
+
+local record Waiter
+  const task: async.Task
+  const token: async.ResumeToken
+  lease: Lease?
+end
+
+record Pool
+  local const leases: {Lease}
+  local const waiters: {Waiter}
+  local closed: boolean
+end
+
+function Pool.new(size: integer?): Pool
+  local count = size or 4
+  if count < 1 then raise "reply pool size must be positive" end
+  local leases: {Lease} = {}
+  for _ = 1, count do leases[#leases + 1] = Lease.new() end
+  return { leases = leases, waiters = {}, closed = false }
+end
+
+local function Pool:remove_waiter(waiter: Waiter)
+  for index = 1, #self.waiters do
+    if self.waiters[index] == waiter then
+      for following = index + 1, #self.waiters do
+        self.waiters[following - 1] = self.waiters[following]
+      end
+      self.waiters[#self.waiters] = nil
+      return
+    end
+  end
+end
+
+local function Pool:release(lease: Lease, reusable: boolean)
+  if not reusable or self.closed then
+    -- Closing the receiving endpoint destroys queued packets and rejects old
+    -- transferred sending endpoints before a replacement can serve a request.
+    lease.receiver:close()
+    lease.sender:close()
+    if not self.closed then
+      lease.sender, lease.receiver = thread.channel<|protocol.WorldReply|>(1)
+    end
+  end
+  lease.busy = false
+  if self.closed or #self.waiters == 0 then return end
+  local waiter = self.waiters[1]
+  self:remove_waiter(waiter)
+  -- Reserve this lease before waking its FIFO successor; newcomers cannot
+  -- acquire it while the resumed Task is still in the Runtime's ready queue.
+  lease.busy = true
+  waiter.lease = lease
+  waiter.task:resume(waiter.token)
+end
+
+local function Pool:acquire(): Lease?
+  async.checkpoint()
+  if self.closed then return nil end
+  if #self.waiters == 0 then
+    for _, lease in iteration.ipairs(self.leases) do
+      if not lease.busy then lease.busy = true; return lease end
+    end
+  end
+  local waiter = Waiter(async.running(), async.ResumeToken("reply pool lease"), nil)
+  self.waiters[#self.waiters + 1] = waiter
+  local claimed = false
+  defer do
+    self:remove_waiter(waiter)
+    -- Cancellation may win after release reserved a slot but before this
+    -- waiter resumed. Return that reservation rather than stranding a slot.
+    if not claimed and waiter.lease then self:release(waiter.lease, true) end
+  end
+  async.suspend(waiter.token, function () self:remove_waiter(waiter) end)
+  if self.closed then return nil end
+  claimed = true
+  return waiter.lease
+end
+
+local function reply(id: string, status: integer, message: string): protocol.WorldReply
+  return protocol.WorldReply(id, status, wire.error_body(message))
+end
+
+function Pool:request(handle: protocol.WorldHandle, action: string,
+                      payload: {string: value}, timeout_ms: integer): protocol.WorldReply
+  async.checkpoint()
+  if timeout_ms < 0 then raise "request timeout must not be negative" end
+  local started = uv.hrtime()
+  if timeout_ms > (math.maxinteger - started) // 1000000 then
+    raise "request timeout is too large"
+  end
+  local deadline_ns = started + timeout_ms * 1000000
+  local id = store.secure_token(16)
+  if self.closed then return reply(id, 503, "relay is closed") end
+  if timeout_ms == 0 then return reply(id, 408, "Foundry request timed out") end
+  if handle.health:is_closed() then return reply(id, 503, "Foundry world is offline") end
+  local envelope: {string: value} = {}
+  for key, item in iteration.pairs(payload) do
+    if key ~= "clientId" then envelope[key] = item end
+  end
+  envelope["type"] = action
+  envelope["requestId"] = id
+  local encoded = wire.encode(envelope)
+  local operation = async.run<|protocol.WorldReply, value|>(function (): protocol.WorldReply
+    local lease? = self:acquire()
+    if not lease then return reply(id, 503, "relay is closed") end
+    local reusable = false
+    local attempted = false
+    defer do
+      if attempted and not reusable then
+        lease.receiver:close()
+        -- Cancellation is advisory after delivery; never repeat a mutation.
+        do handle.commands:try_send(protocol.WorldCommand.cancel(id)) catch end
+      end
+      self:release(lease, reusable)
+    end
+    if uv.hrtime() >= deadline_ns then
+      return reply(id, 408, "Foundry request timed out")
+    end
+    attempted = true
+    handle.requests:send(protocol.WorldRequest(id, action, encoded, deadline_ns, lease.sender))
+    while true do
+      if uv.hrtime() >= deadline_ns then
+        return reply(id, 408, "Foundry request timed out")
+      end
+      case lease.receiver:receive_result()
+      when message(received) then
+        -- A sender retained after an earlier success may send a duplicate.
+        -- Only this lease's current request ID can complete its next request.
+        if received.request_id == id then
+          if uv.hrtime() >= deadline_ns then
+            return reply(id, 408, "Foundry request timed out")
+          end
+          reusable = true
+          return received
+        end
+        async.yield()
+      when closed() then return reply(id, 503, "Foundry world is offline")
+      end
+    end
+  catch
+    if error == "channel is closed" then
+      return reply(id, 503, "Foundry world is offline")
+    end
+    raise
+  end)
+  local deadline = async.run<|nil, value|>(function (): nil
+    local remaining = deadline_ns - uv.hrtime()
+    if remaining > 0 then timer.sleep((remaining + 999999) // 1000000) end
+    return nil
+  end)
+  local health = async.run<|nil, value|>(function (): nil
+    while true do
+      case handle.health:receive_result()
+      when closed() then return nil
+      when message() then
+      end
+    end
+  end)
+  defer do
+    tasks.drain(operation)
+    tasks.drain(deadline)
+    tasks.drain(health)
+  end
+  case async.race_three(operation, deadline, health)
+  when first(status) then
+    case status
+    when succeeded(received) then return received
+    when failed(failure) then raise failure
+    when cancelled(reason) then raise reason
+    else raise "reply operation did not finish"
+    end
+  when second() then return reply(id, 408, "Foundry request timed out")
+  when third() then return reply(id, 503, "Foundry world is offline")
+  end
+end
+
+function Pool:close()
+  if self.closed then return end
+  self.closed = true
+  for _, lease in iteration.ipairs(self.leases) do
+    lease.receiver:close()
+    lease.sender:close()
+  end
+  while #self.waiters > 0 do
+    local waiter = self.waiters[1]
+    self:remove_waiter(waiter)
+    waiter.task:resume(waiter.token)
+  end
+end

@@ -37,7 +37,7 @@ local function start(logger: log.Logger, database: string,
       pairing_code = integration.pairing_code, database = database,
       public_url = "ws://127.0.0.1:" .. port .. "/relay",
       origins = {"http://127.0.0.1:30000"}, request_timeout = timeout or 3000,
-      heartbeat = heartbeat or 60000, auth_timeout = 1000, max_pending = 16 }
+      heartbeat = heartbeat or 60000, auth_timeout = 1000, max_pending = 16, api_concurrency = 1 }
     local instance = server.Server(settings, sessions.Options("", "/unused", 4, 120000),
                                    nil, logger)
     local failure: async.Error? = nil
@@ -239,11 +239,11 @@ function test_debug_logs_forwarding_and_websocket_metadata_without_payloads(_con
   integration.answer(world, requested, {["result"] = "LEAK_RESULT_BODY"})
   test.assert(integration.await_reply(pending).status == 200)
   local subscriber = fixture.instance.worlds:subscribe(credentials.id, "chat-events")
-  defer fixture.instance.worlds:unsubscribe(subscriber)
+  defer fixture.instance.worlds:unsubscribe(subscriber.key)
   test.assert(integration.message(world)["count"] == 1)
   world:write(websocket.TEXT, [[{"type":"chat-event","data":{"secret":"LEAK_EVENT_BODY"}}]])
   test.assert(subscriber:next() ~= nil)
-  fixture.instance.worlds:unsubscribe(subscriber)
+  fixture.instance.worlds:unsubscribe(subscriber.key)
   test.assert(integration.message(world)["count"] == 0)
   world:write(websocket.TEXT, [[{"type":"LEAK_DEBUG_KIND","body":"LEAK_DEBUG_BODY"}]])
   world:write(websocket.TEXT, [[{"type":42,"body":"LEAK_NUMERIC_KIND_BODY"}]])

@@ -5,11 +5,12 @@ Each executable prints a Titan executable-line summary and writes its annotated
 report directly. The workflow requires a matching C coverage toolchain; it has
 no Python, gcovr, or relay-specific report-processing dependency.
 
-## Tools and pin
+## Tools
 
-[TITAN_REVISION](../TITAN_REVISION) selects the Titan source revision. Prepare an
-SDK from that checkout following its build instructions. The relay consumes the
-installed SDK without modifying it.
+Use the prepared Titan SDK selected by `titanc` on `PATH`, with native
+`--coverage` support. Prepend another SDK's `bin` directory to `PATH` to select
+it. The relay consumes the installed SDK without modifying it or pinning its
+source revision.
 
 On Linux, use GCC 14 or newer and the matching `gcov`. Use the same OpenSSL mode
 as the installed SDK. System OpenSSL needs its development files and

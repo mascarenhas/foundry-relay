@@ -40,9 +40,9 @@ passed all applicable cases in that environment. Browser security settings were 
 weakened. An operator must run a desktop-dependent launcher in its supported
 environment; a native Chromium executable need not use that launcher.
 
-The prepared SDK at `/home/mascarenhas/.local/titan` predates the coverage compiler
-pin in `TITAN_REVISION`. These session checks used that installed SDK; they did
-not validate the newer coverage workflow or update the pin. Identifying SHA256s:
+The prepared SDK at `/home/mascarenhas/.local/titan` predates the native coverage
+workflow. These session checks used that installed SDK; they did not validate
+the newer coverage workflow. Identifying SHA256s:
 
 | Input | SHA256 |
 | --- | --- |
@@ -102,7 +102,7 @@ provider was verified before the fixed build at SHA256
 `f56df0c4e5a4734c7c4e459a8481e2a3fab2dedb3ea36e47a9d4dd97920bcbb1`.
 The independent crypto client was MSYS2 OpenSSL **3.6.5**; the application used
 the SDK's OpenSSL DLLs. Installed Edge was **154.0.4258.53**. These are
-prepared-SDK checks, not a fresh build of `TITAN_REVISION`.
+prepared-SDK checks, not a fresh compiler/standard-library build.
 
 The pre-fix archive
 `c05af68fc5d24dd9e9bd290b47a75f4ae18f4e60ac9d969581c4a2277302f4ba`

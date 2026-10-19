@@ -3,6 +3,7 @@ local async = import "async"
 local uv = import "uv"
 local os = import "os"
 local string = import "string"
+local timer = import "timer"
 
 -- Pairing credentials live in this private database, never in client-list JSON.
 record Client
@@ -86,9 +87,9 @@ end
 local function connection(path: string): sqlite3.Connection
   local db = sqlite3.connect(path)
   -- Each operation closes its own connection before handing the Store onward.
-  -- The timeout also bounds contention from an external database connection.
+  -- SQLite reports BUSY promptly; cooperative retry owns the wait budget.
   do
-    local statement = db:prepare("PRAGMA busy_timeout = 5000")
+    local statement = db:prepare("PRAGMA busy_timeout = 0")
     defer statement:close()
     local cursor = statement:query()
     defer cursor:close()
@@ -97,11 +98,6 @@ local function connection(path: string): sqlite3.Connection
     raise
   end
   return db
-end
-
-local function Store:connect(): sqlite3.Connection
-  if self.closed then raise "relay store is closed" end
-  return connection(self.path)
 end
 
 local function Store:remove_waiter(waiter: Waiter)
@@ -147,30 +143,99 @@ local function Store:acquire()
   end
 end
 
-function open(path: string): Store
+-- Every attempt materializes its result, releases statements/cursors, and
+-- retires its connection before retry. The callback publishes no external result.
+local function retry_operation<|T|>(path: string, write: boolean,
+    operation: function (sqlite3.Connection): T): T
+  -- Bound retry admission and backoff; accepted native work still retires.
+  local deadline = uv.hrtime() + 5000000000
+  local delay = 1
+  local previous: sqlite3.Error? = nil
+  while true do
+    if previous ~= nil and uv.hrtime() >= deadline then raise previous end
+    local committed = false
+    do
+      return (function (): T
+        local db = connection(path)
+        defer db:close()
+        defer do
+          if write and not committed then db:rollback() end
+        end
+        if write then execute(db, "BEGIN IMMEDIATE") end
+        local result = operation(db)
+        if write then
+          db:commit()
+          -- Guard publication/cleanup failures after an acknowledged commit.
+          committed = true
+        end
+        return result
+      end)()
+    catch
+      if committed or not (error is sqlite3.Error) then raise end
+      local failure: sqlite3.Error = error
+      if failure.code ~= 5 then raise end
+      previous = failure
+      local remaining = deadline - uv.hrtime()
+      if remaining < 1000000 then raise end
+      local pause = delay
+      local remaining_ms = remaining // 1000000
+      if pause > remaining_ms then pause = remaining_ms end
+      timer.sleep(pause)
+      delay = delay * 2
+      if delay > 25 then delay = 25 end
+    end
+  end
+end
+
+-- Hold the existing FIFO ownership across the complete retry loop.
+local function Store:operation<|T|>(write: boolean,
+    callback: function (sqlite3.Connection): T): T
+  self:acquire()
+  defer self:release()
+  if self.closed then raise "relay store is closed" end
+  return retry_operation<|T|>(self.path, write, callback)
+end
+
+local function validate_path(path: string)
   if path == "" or path == ":memory:" then
     raise "relay store requires a persistent database filename"
   end
-  local db = connection(path)
-  defer db:close()
-  -- Restrict the file before any token is written; SQLite journals inherit its
-  -- permissions. The single-user store intentionally retains stable tokens.
-  local request = uv.fs_t()
-  defer uv.fs_req_cleanup(request)
-  local status = uv.fs_chmod(nil, request, path, 384, nil) -- 0600
-  if status ~= 0 then raise "cannot protect relay database: " .. uv.strerror(status) end
-  execute(db, [[CREATE TABLE IF NOT EXISTS clients (
-    client_id TEXT PRIMARY KEY NOT NULL,
-    token TEXT UNIQUE NOT NULL,
-    world_id TEXT NOT NULL,
-    world_title TEXT NOT NULL,
-    server_fingerprint TEXT NOT NULL,
-    server_origin TEXT NOT NULL,
-    module_version TEXT NOT NULL,
-    metadata_json TEXT NOT NULL,
-    last_seen INTEGER NOT NULL
-  )]])
+end
+
+-- The main thread initializes and protects the database before starting workers.
+-- Attaching creates only this thread's FIFO owner; it performs no schema work.
+function attach(path: string): Store
+  validate_path(path)
   return {path = path, closed = false, owner = nil, waiters = {}}
+end
+
+function open(path: string): Store
+  validate_path(path)
+  do
+    local db = connection(path)
+    defer db:close()
+    -- Protect the database before schema initialization creates any journal.
+    -- No worker or credential-writing operation is admitted until open returns.
+    local request = uv.fs_t()
+    defer uv.fs_req_cleanup(request)
+    local status = uv.fs_chmod(nil, request, path, 384, nil) -- 0600
+    if status ~= 0 then raise "cannot protect relay database: " .. uv.strerror(status) end
+  end
+  retry_operation<|nil|>(path, true, function (db: sqlite3.Connection): nil
+    execute(db, [[CREATE TABLE IF NOT EXISTS clients (
+      client_id TEXT PRIMARY KEY NOT NULL,
+      token TEXT UNIQUE NOT NULL,
+      world_id TEXT NOT NULL,
+      world_title TEXT NOT NULL,
+      server_fingerprint TEXT NOT NULL,
+      server_origin TEXT NOT NULL,
+      module_version TEXT NOT NULL,
+      metadata_json TEXT NOT NULL,
+      last_seen INTEGER NOT NULL
+    )]])
+    return nil
+  end)
+  return attach(path)
 end
 
 function Store:pair(world_id: string, world_title: string,
@@ -180,66 +245,57 @@ function Store:pair(world_id: string, world_title: string,
   local fingerprint = server_fingerprint or ""
   local origin = server_origin or ""
   local existing_id = existing_client_id or ""
-  self:acquire()
-  defer self:release()
-  local db = self:connect()
-  defer db:close()
-  -- A writer reservation covers both identity lookup and credential creation,
-  -- so concurrent valid pairings for one world return the same credential.
-  execute(db, "BEGIN IMMEDIATE")
-  local existing: Client?
-  if existing_id ~= "" then
-    existing = find_client(db,
-      "client_id = ? AND world_id = ? AND " ..
-      "(server_origin = '' OR ? = '' OR server_origin = ?)",
-      existing_id, world_id, origin, origin)
-  end
-  if not existing and fingerprint ~= "" then
-    existing = find_client(db,
-      "world_id = ? AND server_fingerprint = ? AND " ..
-      "(server_origin = '' OR ? = '' OR server_origin = ?)",
-      world_id, fingerprint, origin, origin)
-  end
-  if not existing then
-    existing = find_client(db, "world_id = ? AND server_origin = ?", world_id, origin)
-  end
-  local client: Client?
-  if existing then
-    client = Client {
-      client_id = existing.client_id, token = existing.token, world_id = world_id,
-      world_title = world_title ~= "" and world_title or existing.world_title,
-      server_fingerprint = fingerprint ~= "" and fingerprint or existing.server_fingerprint,
-      server_origin = origin ~= "" and origin or existing.server_origin,
-      module_version = existing.module_version, metadata_json = existing.metadata_json,
-      last_seen = os.time()
-    }
-    execute(db, "UPDATE clients SET world_title = ?, server_fingerprint = ?, " ..
-      "server_origin = ?, last_seen = ? WHERE client_id = ?",
-      client.world_title, client.server_fingerprint, client.server_origin,
-      client.last_seen, client.client_id)
-  else
-    client = Client {
-      client_id = secure_token(16), token = secure_token(), world_id = world_id,
-      world_title = world_title, server_fingerprint = fingerprint, server_origin = origin,
-      module_version = "", metadata_json = "{}", last_seen = os.time()
-    }
-    execute(db, "INSERT INTO clients (" .. client_columns .. ") " ..
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      client.client_id, client.token, client.world_id, client.world_title,
-      client.server_fingerprint, client.server_origin, client.module_version,
-      client.metadata_json, client.last_seen)
-  end
-  db:commit()
-  -- Closing an uncommitted connection on error/cancellation rolls back.
-  return client
+  return self:operation<|Client|>(true, function (db: sqlite3.Connection): Client
+    local existing: Client?
+    if existing_id ~= "" then
+      existing = find_client(db,
+        "client_id = ? AND world_id = ? AND " ..
+        "(server_origin = '' OR ? = '' OR server_origin = ?)",
+        existing_id, world_id, origin, origin)
+    end
+    if not existing and fingerprint ~= "" then
+      existing = find_client(db,
+        "world_id = ? AND server_fingerprint = ? AND " ..
+        "(server_origin = '' OR ? = '' OR server_origin = ?)",
+        world_id, fingerprint, origin, origin)
+    end
+    if not existing then
+      existing = find_client(db, "world_id = ? AND server_origin = ?", world_id, origin)
+    end
+    local client: Client?
+    if existing then
+      client = Client {
+        client_id = existing.client_id, token = existing.token, world_id = world_id,
+        world_title = world_title ~= "" and world_title or existing.world_title,
+        server_fingerprint = fingerprint ~= "" and fingerprint or existing.server_fingerprint,
+        server_origin = origin ~= "" and origin or existing.server_origin,
+        module_version = existing.module_version, metadata_json = existing.metadata_json,
+        last_seen = os.time()
+      }
+      execute(db, "UPDATE clients SET world_title = ?, server_fingerprint = ?, " ..
+        "server_origin = ?, last_seen = ? WHERE client_id = ?",
+        client.world_title, client.server_fingerprint, client.server_origin,
+        client.last_seen, client.client_id)
+    else
+      client = Client {
+        client_id = secure_token(16), token = secure_token(), world_id = world_id,
+        world_title = world_title, server_fingerprint = fingerprint, server_origin = origin,
+        module_version = "", metadata_json = "{}", last_seen = os.time()
+      }
+      execute(db, "INSERT INTO clients (" .. client_columns .. ") " ..
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        client.client_id, client.token, client.world_id, client.world_title,
+        client.server_fingerprint, client.server_origin, client.module_version,
+        client.metadata_json, client.last_seen)
+    end
+    return client
+  end)
 end
 
 function Store:get(client_id: string): Client?
-  self:acquire()
-  defer self:release()
-  local db = self:connect()
-  defer db:close()
-  return find_client(db, "client_id = ?", client_id)
+  return self:operation<|Client?|>(false, function (db: sqlite3.Connection): Client?
+    return find_client(db, "client_id = ?", client_id)
+  end)
 end
 
 function Store:authenticate(client_id: string, token: string): Client?
@@ -250,53 +306,46 @@ end
 
 function Store:update(client_id: string, world_id: string, world_title: string,
                        module_version: string, metadata_json: string)
-  self:acquire()
-  defer self:release()
-  local db = self:connect()
-  defer db:close()
-  execute(db, "UPDATE clients SET " ..
-    "world_id = CASE WHEN ? = '' THEN world_id ELSE ? END, " ..
-    "world_title = CASE WHEN ? = '' THEN world_title ELSE ? END, " ..
-    "module_version = CASE WHEN ? = '' THEN module_version ELSE ? END, " ..
-    "metadata_json = CASE WHEN ? = '' THEN metadata_json ELSE ? END, " ..
-    "last_seen = ? WHERE client_id = ?",
-    world_id, world_id, world_title, world_title, module_version, module_version,
-    metadata_json, metadata_json, os.time(), client_id)
+  self:operation<|nil|>(true, function (db: sqlite3.Connection): nil
+    execute(db, "UPDATE clients SET " ..
+      "world_id = CASE WHEN ? = '' THEN world_id ELSE ? END, " ..
+      "world_title = CASE WHEN ? = '' THEN world_title ELSE ? END, " ..
+      "module_version = CASE WHEN ? = '' THEN module_version ELSE ? END, " ..
+      "metadata_json = CASE WHEN ? = '' THEN metadata_json ELSE ? END, " ..
+      "last_seen = ? WHERE client_id = ?",
+      world_id, world_id, world_title, world_title, module_version, module_version,
+      metadata_json, metadata_json, os.time(), client_id)
+    return nil
+  end)
 end
 
 function Store:list(): {Client}
-  self:acquire()
-  defer self:release()
-  local db = self:connect()
-  defer db:close()
-  local statement = db:prepare("SELECT " .. client_columns ..
-                               " FROM clients ORDER BY world_title, client_id")
-  defer statement:close()
-  local cursor = statement:query()
-  defer cursor:close()
-  local clients: {Client} = {}
-  for row in cursor:fetch do clients[#clients + 1] = row_client(row) end
-  return clients
+  return self:operation<|{Client}|>(false, function (db: sqlite3.Connection): {Client}
+    local statement = db:prepare("SELECT " .. client_columns ..
+                                 " FROM clients ORDER BY world_title, client_id")
+    defer statement:close()
+    local cursor = statement:query()
+    defer cursor:close()
+    local clients: {Client} = {}
+    for row in cursor:fetch do clients[#clients + 1] = row_client(row) end
+    return clients
+  end)
 end
 
 function Store:remove(client_id: string): boolean
-  self:acquire()
-  defer self:release()
-  local db = self:connect()
-  defer db:close()
-  return execute(db, "DELETE FROM clients WHERE client_id = ?", client_id) == 1
+  return self:operation<|boolean|>(true, function (db: sqlite3.Connection): boolean
+    return execute(db, "DELETE FROM clients WHERE client_id = ?", client_id) == 1
+  end)
 end
 
 function Store:revoke(token: string): string?
-  self:acquire()
-  defer self:release()
-  local db = self:connect()
-  defer db:close()
-  local client? = find_client(db, "token = ?", token)
-  if not client then return nil end
-  execute(db, "UPDATE clients SET token = ? WHERE client_id = ?",
-          secure_token(), client.client_id)
-  return client.client_id
+  return self:operation<|string?|>(true, function (db: sqlite3.Connection): string?
+    local client? = find_client(db, "token = ?", token)
+    if not client then return nil end
+    execute(db, "UPDATE clients SET token = ? WHERE client_id = ?",
+            secure_token(), client.client_id)
+    return client.client_id
+  end)
 end
 
 -- Callers join their request Tasks before closing the Store. Already admitted

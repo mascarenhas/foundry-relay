@@ -2,9 +2,17 @@ local test = import "test"
 local wire = import "relay.wire"
 local config = import "relay.config"
 local hub = import "relay.hub.titan"
+local world = import "relay.world.titan"
+local protocol = import "relay.world_protocol"
+local thread = import "thread"
+local uv = import "uv"
 local async = import "async"
 local timer = import "timer"
 local string = import "string"
+local http = import "http"
+local websocket = import "websocket"
+local os = import "os"
+local messages = import "relay.messages"
 
 function test_nulls_and_nested_arrays_round_trip(_context: test.Context)
   local source = [[{"a":[1,null,null],"b":null,"c":{"d":null}}]]
@@ -38,42 +46,37 @@ function test_wire_rejects_non_object_envelopes(_context: test.Context)
 end
 
 function test_reply_completion_wakes_exact_pending_request(_context: test.Context)
-  local pending = hub.Pending("test", "entity", async.ResumeToken("test pending"), nil, nil)
-  local waiting = async.run<|integer, value|>(function (): integer
-    pending.waiter = async.running()
-    async.suspend(pending.token, function () pending.waiter = nil end)
-    return pending.reply.status
-  end)
+  local tx, rx = thread.channel<|protocol.WorldReply|>(1)
+  defer do rx:close(); tx:close() end
+  local pending = world.Pending(protocol.WorldRequest("test", "entity", "{}", uv.hrtime() + 1000000000, tx), false, nil)
+  local waiting = async.run<|protocol.WorldReply, value|>(rx:receive)
   defer hub.drain(waiting)
-  while waiting:status():as_string() == "ready" do timer.yield() end
-  pending:complete(hub.Reply(200, "first"))
-  pending:complete(hub.Reply(400, "duplicate"))
+  pending:complete(200, "first")
+  pending:complete(400, "duplicate")
   case async.join(waiting)
-  when succeeded(status) then test.assert(status == 200 and pending.reply.body == "first")
+  when succeeded(reply) then test.assert(reply.status == 200 and reply.body == "first" and reply.request_id == "test")
   when failed(failure) then failure:raise()
   else raise "request waiter did not finish"
   end
+  local duplicate = rx:try_receive()
+  test.assert(not duplicate, "duplicate completion sent a second reply")
 end
 
 function test_cancelled_pending_request_cannot_be_resumed(_context: test.Context)
-  local pending = hub.Pending("test", "entity", async.ResumeToken("cancel pending"), nil, nil)
-  local waiting = async.run<|nil, value|>(function (): nil
-    pending.waiter = async.running()
-    async.suspend(pending.token, function () pending.waiter = nil end)
-    return nil
-  end)
-  defer hub.drain(waiting)
-  while waiting:status():as_string() == "ready" do timer.yield() end
-  waiting:cancel()
-  test.assert(pending.waiter == nil, "cancellation retained a protocol wake capability")
-  pending:complete(hub.Reply(200, "late"))
-  test.assert((async.join(waiting):has_cancelled()))
+  local tx, rx = thread.channel<|protocol.WorldReply|>(1)
+  defer tx:close()
+  local pending = world.Pending(protocol.WorldRequest("test", "entity", "{}", uv.hrtime() + 1000000000, tx), false, nil)
+  rx:close()
+  pending:complete(200, "late")
+  test.assert(pending.completed, "closed reply endpoint prevented terminal bookkeeping")
 end
 
 function test_late_reply_stores_result_before_wait_registration(_context: test.Context)
-  local pending = hub.Pending("test", "entity", async.ResumeToken("early reply"), nil, nil)
-  pending:complete(hub.Reply(200, "already delivered"))
-  test.assert(pending.reply.status == 200 and pending.waiter == nil)
+  local tx, rx = thread.channel<|protocol.WorldReply|>(1)
+  defer do rx:close(); tx:close() end
+  local pending = world.Pending(protocol.WorldRequest("test", "entity", "{}", uv.hrtime() + 1000000000, tx), false, nil)
+  pending:complete(200, "already delivered")
+  test.assert(rx:receive().body == "already delivered")
 end
 
 function test_large_json_response_preserves_multibyte_text(_context: test.Context)
@@ -83,30 +86,45 @@ function test_large_json_response_preserves_multibyte_text(_context: test.Contex
 end
 
 function test_queued_output_skips_expired_and_cancelled_requests(_context: test.Context)
-  local pending = hub.Pending("request", "entity", async.ResumeToken("output test"), nil, nil)
-  local requests: {string: hub.Pending} = { ["request"] = pending }
-  local message = hub.Outgoing("request payload", "request")
+  local tx, rx = thread.channel<|protocol.WorldReply|>(1)
+  defer do rx:close(); tx:close() end
+  local pending = world.Pending(protocol.WorldRequest("request", "entity", "{}", uv.hrtime() + 1000000000, tx), false, nil)
+  local requests: {string: world.Pending} = {["request"] = pending}
+  local message = world.Outgoing("request payload", "request")
   test.assert(message:should_send(requests), "live queued request was discarded")
-  pending:complete(hub.Reply(408, "expired"))
+  pending:complete(408, "expired")
   test.assert(not message:should_send(requests), "expired request remained eligible for output")
   requests["request"] = nil
   test.assert(not message:should_send(requests), "cancelled request remained eligible for output")
-  test.assert(hub.Outgoing("subscription update", nil):should_send(requests),
-              "request-independent control message was discarded")
+  test.assert(world.Outgoing("subscription update", nil):should_send(requests))
+end
+
+function test_queued_output_checks_deadline_and_poisoned_reply_endpoint(_context: test.Context)
+  local tx, rx = thread.channel<|protocol.WorldReply|>(1)
+  defer tx:close()
+  local pending = world.Pending(protocol.WorldRequest("request", "entity", "{}", uv.hrtime() + 1000000000, tx), false, nil)
+  local requests: {string: world.Pending} = {["request"] = pending}
+  local message = world.Outgoing("request payload", "request")
+  rx:close()
+  test.assert(not message:should_send(requests), "cancelled reply lease admitted a queued mutation")
+  local tx2, rx2 = thread.channel<|protocol.WorldReply|>(1)
+  defer do rx2:close(); tx2:close() end
+  requests["request"] = world.Pending(protocol.WorldRequest("request", "entity", "{}", uv.hrtime() - 1, tx2), false, nil)
+  test.assert(not message:should_send(requests), "expired absolute deadline admitted a queued mutation")
 end
 
 function test_unsubscribe_compacts_the_subscriber_registry(_context: test.Context)
   local worlds = hub.Hub(128, 30000)
   defer worlds:close()
   local first = worlds:subscribe("world", "chat-events")
-  defer worlds:unsubscribe(first)
+  defer worlds:unsubscribe(first.key)
   local second = worlds:subscribe("world", "chat-events")
   local third = worlds:subscribe("world", "hooks")
-  defer worlds:unsubscribe(third)
+  defer worlds:unsubscribe(third.key)
   local fourth = worlds:subscribe("world", "chat-events")
-  worlds:unsubscribe(second)
-  worlds:unsubscribe(fourth)
-  test.assert(#worlds.subscribers == 2 and worlds.subscribers[1] == first and worlds.subscribers[2] == third,
+  worlds:unsubscribe(second.key)
+  worlds:unsubscribe(fourth.key)
+  test.assert(#worlds.subscribers == 2 and worlds.subscribers[1].subscription.key == first.key and worlds.subscribers[2].subscription.key == third.key,
               "unsubscription retained holes or changed active subscriber order")
   test.assert(worlds:subscription_count("world", "chat-events") == 1 and
               worlds:subscription_count("world", "hooks") == 1,
@@ -117,8 +135,13 @@ function test_hub_shutdown_ends_waiters_and_stops_new_subscriptions(_context: te
   local worlds = hub.Hub(128, 30000)
   defer worlds:close()
   local subscriber = worlds:subscribe("world", "chat-events")
-  defer worlds:unsubscribe(subscriber)
-  local reading = async.run<|string?, value|>(subscriber:next)
+  defer worlds:unsubscribe(subscriber.key)
+  local reading = async.run<|string?, value|>(function (): string?
+    case subscriber.events:receive_result()
+    when message(text) then return text
+    when closed() then return nil
+    end
+  end)
   defer hub.drain(reading)
   while reading:status():as_string() == "ready" do timer.yield() end
   worlds:close()
@@ -139,4 +162,286 @@ function test_hub_shutdown_ends_waiters_and_stops_new_subscriptions(_context: te
   end
   test.assert(rejected and #worlds.subscribers == 1,
               "closed hub accepted a new subscriber")
+end
+
+local record Address
+  const handle: protocol.WorldHandle
+  const requests: thread.Receiver<|protocol.WorldRequest|>
+  const commands: thread.Receiver<|protocol.WorldCommand|>
+  const health: thread.Sender<|nil|>
+end
+
+local function address(key: string): Address
+  local requests, inbox = thread.channel<|protocol.WorldRequest|>(8)
+  local commands, controls = thread.channel<|protocol.WorldCommand|>(8)
+  local health, terminal = thread.channel<|nil|>(1)
+  return Address(protocol.WorldHandle(key, "world", requests, commands, terminal), inbox, controls, health)
+end
+
+local function Address:close()
+  self.health:close()
+  self.requests:close()
+  self.commands:close()
+end
+
+local function quiescence_ack(endpoint: Address): thread.Sender<|boolean|>
+  case endpoint.commands:receive()
+  when quiesce(_reason, ack) then return ack
+  else raise "replacement did not ask its incumbent to quiesce"
+  end
+end
+
+function test_replacement_selection_waits_for_local_quiescence(_context: test.Context)
+  local worlds = hub.Hub(8, 60000)
+  defer worlds:close()
+  local first = address("first")
+  defer first:close()
+  local second = address("second")
+  defer second:close()
+  local original, _snapshot = worlds:publish_authenticated(first.handle)
+  local replacing = async.run<|hub.Session, value|>(function (): hub.Session
+    local session, _activation = worlds:publish_authenticated(second.handle)
+    return session
+  end)
+  defer do first:close(); second:close(); hub.drain(replacing) end
+  local ack = quiescence_ack(first)
+  local selecting = async.run<|hub.Session?, value|>(function (): hub.Session?
+    local selected?, _problem? = worlds:select("world")
+    return selected
+  end)
+  defer hub.drain(selecting)
+  timer.yield()
+  test.assert(not selecting:status():has_finished() and not original.closed,
+    "selection observed an offline gap before the quiescence ACK")
+  ack:send(true)
+  local replacement: hub.Session? = nil
+  case async.join(replacing)
+  when succeeded(session) then replacement = session
+  when failed(failure) then failure:raise()
+  else raise "replacement admission did not finish"
+  end
+  case async.join(selecting)
+  when succeeded(session) then test.assert(session == replacement)
+  when failed(failure) then failure:raise()
+  else raise "selection did not resume after publication"
+  end
+  worlds:retire("world", "first")
+  test.assert(worlds:online("world"), "stale monitor removed its replacement")
+  first.health:close()
+  if original.retirement then
+    case async.join(original.retirement)
+    when succeeded() then
+    when failed(failure) then failure:raise()
+    else raise "incumbent retirement did not finish"
+    end
+  end
+end
+
+function test_cancelled_replacement_finishes_quiescence_without_publication(_context: test.Context)
+  local worlds = hub.Hub(8, 60000)
+  defer worlds:close()
+  local first = address("first")
+  defer first:close()
+  local second = address("second")
+  defer second:close()
+  local original, _snapshot = worlds:publish_authenticated(first.handle)
+  local replacing = async.run<|nil, value|>(function (): nil
+    worlds:publish_authenticated(second.handle)
+    return nil
+  end)
+  defer do first:close(); second:close(); hub.drain(replacing) end
+  local ack = quiescence_ack(first)
+  replacing:cancel()
+  ack:send(true)
+  test.assert((async.join(replacing):has_cancelled()))
+  test.assert(original.closed and not worlds:online("world"),
+    "cancelled admission retained a quiesced incumbent or published its replacement")
+  first.health:close()
+  if original.retirement then
+    case async.join(original.retirement)
+    when succeeded() then
+    when failed(failure) then failure:raise()
+    else raise "cancelled admission stranded incumbent retirement"
+    end
+  end
+end
+
+function test_failed_quiescence_delivery_waits_for_joined_health(_context: test.Context)
+  local worlds = hub.Hub(8, 60000)
+  defer worlds:close()
+  local first = address("first")
+  defer first:close()
+  local second = address("second")
+  defer second:close()
+  worlds:publish_authenticated(first.handle)
+  local replacing = async.run<|nil, value|>(function (): nil
+    worlds:publish_authenticated(second.handle)
+    return nil
+  end)
+  defer do first:close(); second:close(); hub.drain(replacing) end
+  local ack = quiescence_ack(first)
+  ack:close()
+  timer.yield()
+  timer.yield()
+  test.assert(not replacing:status():has_finished(), "failed ACK delivery was accepted as quiescence")
+  first.health:close()
+  case async.join(replacing)
+  when succeeded() then
+  when failed(failure) then failure:raise()
+  else raise "joined incumbent did not unblock admission"
+  end
+  local selected?, _problem? = worlds:select("world")
+  test.assert(selected ~= nil and selected.world.key == "second")
+end
+
+function test_captured_close_holds_admission_until_quiescence_then_awaits_join(_context: test.Context)
+  local worlds = hub.Hub(8, 60000)
+  defer worlds:close()
+  local endpoint = address("captured")
+  defer endpoint:close()
+  local session, _activation = worlds:publish_authenticated(endpoint.handle)
+  local closing = async.run<|nil, value|>(function (): nil session:close(); return nil end)
+  defer do endpoint:close(); hub.drain(closing) end
+  local ack = quiescence_ack(endpoint)
+  local selecting = async.run<|hub.Session?, value|>(function (): hub.Session?
+    local selected?, _problem? = worlds:select("world")
+    return selected
+  end)
+  defer hub.drain(selecting)
+  timer.yield()
+  test.assert(not session.closed and not selecting:status():has_finished(),
+    "captured close admitted a replacement before stopping world requests")
+  ack:send(true)
+  case endpoint.commands:receive()
+  when stop(graceful) then test.assert(not graceful)
+  else raise "captured close did not abort its quiesced transport"
+  end
+  case async.join(selecting)
+  when succeeded(selected) then test.assert(selected == nil)
+  when failed(failure) then failure:raise()
+  else raise "selection did not resume after captured quiescence"
+  end
+  test.assert(not closing:status():has_finished(), "captured close returned before transport owner joined")
+  endpoint.health:close()
+  case async.join(closing)
+  when succeeded() then
+  when failed(failure) then failure:raise()
+  else raise "captured close did not finish after owner join"
+  end
+end
+
+local record WriterFixture
+  const engine: world.Engine
+  const peer: websocket.Connection
+  const endpoint: Address
+  const listener: http.Server
+  const serving: async.Task<|async.Error?, value|>
+  const close_channels: function (): ()
+end
+
+local function WriterFixture:close()
+  self.engine:close()
+  self.engine.outbox:close()
+  self.peer:close()
+  self.listener:close()
+  hub.drain(self.serving)
+  self.endpoint:close()
+  self.close_channels()
+end
+
+local function writer_fixture(): WriterFixture
+  local accepted, receive, close_accepted = async.channel<|websocket.Connection|>(1)
+  defer close_accepted()
+  local listener: http.Server? = nil
+  local port = 0
+  local first = 44000 + (os.pid() % 100) * 20
+  for candidate = first, first + 19 do
+    local failure: async.Error? = nil
+    do
+      listener = http.listen("127.0.0.1", function (request, response)
+        accepted(websocket.accept(request, response))
+      end, candidate, 8, 1000)
+    catch failure = async.Error(error, traceback) end
+    if not failure then port = candidate; break end
+    if failure.error is async.OperationError then
+      if (failure.error as async.OperationError).name ~= "EADDRINUSE" then failure:raise() end
+    else failure:raise() end
+  end
+  if not listener then raise "No loopback port available for world writer tests" end
+  local serving = async.run<|async.Error?, value|>(function (): async.Error?
+    listener:serve()
+    return nil
+  catch return async.Error(error, traceback) end)
+  local transferred = false
+  defer if not transferred then listener:close(); hub.drain(serving) end
+  local peer = websocket.connect("ws://127.0.0.1:" .. port .. "/writer")
+  defer if not transferred then peer:close() end
+  local connection = receive()
+  defer if not transferred then connection:close() end
+  local endpoint = address("writer")
+  defer if not transferred then endpoint:close() end
+  local inbox_tx, inbox_rx = thread.channel<|world.Opening|>(1)
+  local ready_tx, ready_rx = thread.channel<|boolean|>(1)
+  local control_tx, control_rx = thread.channel<|messages.ControlRequest|>(1)
+  local close_channels = function ()
+    inbox_rx:close(); inbox_tx:close(); ready_rx:close(); ready_tx:close()
+    control_rx:close(); control_tx:close()
+  end
+  defer if not transferred then close_channels() end
+  local settings = config.Config("127.0.0.1", 0, "key", "CODE12", "/unused",
+    "ws://127.0.0.1/relay", {}, 60000, 60000, 1000, 8, 1)
+  local bootstrap = world.Bootstrap(1, settings, endpoint.handle, endpoint.requests,
+    endpoint.commands, inbox_rx, ready_tx, control_tx, "error", nil)
+  local engine = world.Engine(bootstrap, connection, nil)
+  transferred = true
+  return WriterFixture(engine, peer, endpoint, listener, serving, close_channels)
+end
+
+local function bounded_writer(task: async.Task<|nil, value|>, message: string)
+  local deadline = async.run<|nil, value|>(function (): nil timer.sleep(3000); return nil end)
+  defer hub.drain(deadline)
+  case async.race_two(task, deadline)
+  when first(status) then
+    case status
+    when succeeded() then
+    when failed(failure) then failure:raise()
+    else raise "World writer test Task was cancelled"
+    end
+  when second() then raise message
+  end
+end
+
+function test_quiescence_retires_writer_before_acknowledging(_context: test.Context)
+  local fixture = writer_fixture()
+  defer fixture:close()
+  local engine = fixture.engine
+  engine:enqueue("queued mutation", nil, "entity")
+  local writer = async.run<|nil, value|>(engine:write_loop)
+  engine.writer = writer
+  defer hub.drain(writer)
+  -- FIFO runs the writer first: Connection:write schedules its native-work
+  -- child behind this quiescer, so no native write has yet been accepted.
+  local quiescing = async.run<|nil, value|>(function (): nil
+    test.assert(engine.queued == 0 and not writer:status():has_finished(),
+      "Fixture did not enter the data writer before native admission")
+    engine:quiesce()
+    test.assert(writer:status():has_finished(),
+      "quiescence acknowledged while an uncommitted writer could still send")
+    return nil
+  end)
+  defer hub.drain(quiescing)
+  bounded_writer(quiescing, "Quiescence did not retire its data writer")
+end
+
+function test_writer_origin_close_does_not_drain_itself(_context: test.Context)
+  local fixture = writer_fixture()
+  defer fixture:close()
+  local engine = fixture.engine
+  engine:enqueue("\255", nil, "entity")
+  local writer = async.run<|nil, value|>(engine:write_loop)
+  engine.writer = writer
+  defer hub.drain(writer)
+  bounded_writer(writer, "Writer-origin close tried to drain itself")
+  test.assert(engine.closed and not engine.admitting,
+    "Invalid outgoing text did not retire the world engine")
 end
