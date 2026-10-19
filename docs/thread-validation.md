@@ -2,28 +2,63 @@
 
 ## PATH-selected Titan HEAD
 
-After removing the source revision pin, the relay was rebuilt from authored
-sources with the `titanc` already on `PATH` at `$HOME/.local/titan/bin/titanc`.
-That installation contains the compiler and standard library for Titan HEAD
-`cecdd46fe1b09f484a63d657b6b2c4c92404b669`. The installed `driver.lua` and
-`version.lua` hashes match that checkout. No `TITANC` or SDK-path override was
-supplied.
+After removing the source revision pin, the relay was rebuilt against the
+compiler and standard library for Titan HEAD
+`cecdd46fe1b09f484a63d657b6b2c4c92404b669`. Linux used the `titanc` already on
+`PATH` at `$HOME/.local/titan/bin/titanc`, without a `TITANC` or SDK-path
+override. Its installed `driver.lua` and `version.lua` hashes match that
+checkout. The new macOS and Windows runs used clean source trees from relay
+`11ffe549032ad2e9edfb7270402b726ed45e7503`; all 58 authored files matched the
+same source archive. Linux ran:
 
 ```sh
 env -u TITAN_FILTER TITAN_PROBE_CACHE_DISABLE=1 make -j4 test
 ```
 
-The complete Linux x86_64 production-SDK run, using GCC 16.2.1 and system
-OpenSSL 3.5.9, selected 385 tests: **382 passed, three expected skips, zero
-failures**. The skips are the two opt-in installed-Chromium capabilities and
-the Windows-exclusive file-sharing case.
+| Platform | Profile and toolchain | Selected | Passed | Skipped | Failed |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Linux x86_64 | Production, GCC 16.2.1, system OpenSSL 3.5.9 | 385 | 382 | 3 | 0 |
+| Local macOS 15.7.7 x86_64 VM | Validation, Apple Clang 17, system OpenSSL 3.6.5 | 385 | 382 | 3 | 0 |
+| Local Windows x64 VM, build 26300, NTFS | Validation, CLANG64/UCRT, LLVM 22.1.8 | 386 | 368 | 18 | 0 |
 
-A separate standalone CLI smoke configured three API workers, served health,
-rejected unauthenticated client listing with 401, paired a world through
-SQLite, listed it through the authenticated API, and exited with status zero
-and a `server_stopped` record after SIGTERM. An unchanged `make` performed no
-compilation or linking. macOS and Windows were not rerun for this unpinning
-change; their earlier results remain below.
+Linux and macOS ran all 17 test roots. Their skips are two opt-in
+installed-Chromium capabilities and the Windows-exclusive file-sharing case.
+Windows ran all 16 Windows roots, including the installed-Edge and independent
+OpenSSL-client cases; its skips are 17 POSIX fake-child fixtures and one POSIX
+permission-bit assertion. The separate POSIX process root is intentionally
+excluded by `Makefile.windows`. There are no threading, reply-pool, or
+concurrent-Store skips.
+
+macOS built with plain `titanc` on `PATH`, GNU Make 4.4.1, and
+`OPENSSL_MODE=system`, matching the current SDK. Windows built application and
+test payloads through the existing
+`make -f Makefile.windows -j3 PREFIX=<matched-sdk> all core-test-build`
+workflow. Its authored `check-windows.ps1` body ran as an ordinary PowerShell
+ScriptBlock without changing or bypassing execution policy.
+
+On both VMs, all 204 compiler/runtime/stdlib/build inputs and 83 installed
+compiler files matched Titan HEAD before the build. All authored relay files
+and producer inputs remained unchanged afterward. Complete SDK snapshots also
+matched: 2,786 files/links on macOS and 2,489 files on Windows.
+
+Separate Linux and macOS standalone CLI smokes configured three API workers,
+served health, rejected unauthenticated client listing with 401, paired a world
+through SQLite, listed it through the authenticated API, and exited with status
+zero and a `server_stopped` record after SIGTERM. An unchanged Linux `make`
+performed no compilation or linking.
+
+The macOS smoke used a relocated executable with only system directories on
+`PATH` and sandbox-denied reads of the entire SDK. A separate probe confirmed
+the denial, and the relocated process fixture also passed under that sandbox.
+Both macOS executables import only libSystem and the selected system OpenSSL
+libraries, not Titan or Lua providers.
+
+Windows passed all 18 x64 PE regular/delay-import audits without MSYS2/LLVM
+runtime dependencies. Its Unicode-relocated standalone application passed
+health, SQLite pairing, authenticated client listing, and credential-free JSON
+logging with SDK/toolchain paths removed. The authored Windows standalone
+harness terminates with `Process.Kill`; it does not establish graceful CLI
+shutdown. Native Windows shutdown tests passed separately.
 
 ## Earlier cross-platform validation
 
