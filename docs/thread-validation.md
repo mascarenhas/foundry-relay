@@ -1,12 +1,39 @@
 # Threaded relay validation
 
+## PATH-selected Titan HEAD
+
+After removing the source revision pin, the relay was rebuilt from authored
+sources with the `titanc` already on `PATH` at `$HOME/.local/titan/bin/titanc`.
+That installation contains the compiler and standard library for Titan HEAD
+`cecdd46fe1b09f484a63d657b6b2c4c92404b669`. The installed `driver.lua` and
+`version.lua` hashes match that checkout. No `TITANC` or SDK-path override was
+supplied.
+
+```sh
+env -u TITAN_FILTER TITAN_PROBE_CACHE_DISABLE=1 make -j4 test
+```
+
+The complete Linux x86_64 production-SDK run, using GCC 16.2.1 and system
+OpenSSL 3.5.9, selected 385 tests: **382 passed, three expected skips, zero
+failures**. The skips are the two opt-in installed-Chromium capabilities and
+the Windows-exclusive file-sharing case.
+
+A separate standalone CLI smoke configured three API workers, served health,
+rejected unauthenticated client listing with 401, paired a world through
+SQLite, listed it through the authenticated API, and exited with status zero
+and a `server_stopped` record after SIGTERM. An unchanged `make` performed no
+compilation or linking. macOS and Windows were not rerun for this unpinning
+change; their earlier results remain below.
+
+## Earlier cross-platform validation
+
 Validated on 2026-10-17. Native application and test inputs are commit
 `ce01300e68ed89e2dc73ee29b7f709ead37dcbc3`; subsequent delivery changes update
 documentation only. All 59 authored files were checked against that commit in
 each platform's isolated build source. The 39 Titan sources are identical
 across platforms.
 
-[TITAN_REVISION](../TITAN_REVISION) pins
+Those validation runs used Titan
 `92ff87a0b68415f6be7c68078c813bd4f838b10b`, the portable connection-handoff
 prerequisite in [Titan #249](https://github.com/mascarenhas/titan/pull/249),
 stacked on [Titan #248](https://github.com/mascarenhas/titan/pull/248).
