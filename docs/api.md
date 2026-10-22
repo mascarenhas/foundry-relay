@@ -1,33 +1,213 @@
-# REST relay API
+# HTTP and WebSocket API
 
-The relay implements 91 declarative forwarding routes from the reference Go relay. Authenticated requests use `x-api-key: $FOUNDRY_REST_API_KEY`. Normal endpoints live at the root URL, for example `/search` and `/get`.
+This is the contract for every route the relay serves. The route table is
+built by `relay/routes.titan` `create`: local handlers first, then the
+forwarding catalog from `relay/api.titan`. [Routing](routing.md) describes how
+targets are matched. API worker threads handle HTTP routes in
+`relay/api_worker.titan` `Worker:dispatch`; each module WebSocket runs in
+`relay/world.titan` `execute` on its own thread.
 
-Pass `clientId` in the query string when several Foundry worlds are connected. With exactly one connected world, the server selects it automatically. Use `userId` (a Foundry user ID or username) to request permission-scoped operations; omission uses the connected GM's authority.
+## Request rules
 
-Each route extracts only its declared parameters, validates their types, and forwards them as top-level WebSocket fields. The relay owns `type` and `requestId`. Unknown fields, client-supplied protocol fields, and `_scopes` are ignored. `data` is the entity data object. Explicit nested JSON nulls and trailing array nulls survive the round trip.
+These rules apply to every route, including the public ones:
 
-Query values accept case-insensitive `true`/`false`, finite JSON numbers, and JSON arrays/objects where declared. URL-encode structured query values. The parameter inventory lists source precedence: `body/query` checks the body first, while `query/body` checks the query first. False and zero body values remain present; empty query values are omitted. Object body parameters require actual JSON objects, rather than JSON strings containing object text. Most behavioral defaults are applied by the Foundry module.
+- **Origin.** A request may omit `Origin`, send its own scheme and authority, or
+  send one of the exact `RELAY_ALLOWED_ORIGINS` entries. Anything else,
+  including more than one `Origin` header, returns 403 before routing. An
+  accepted `Origin` is echoed in `Access-Control-Allow-Origin` with
+  `Vary: Origin`. `OPTIONS` returns 204 with `Access-Control-Allow-Methods`
+  and `Access-Control-Allow-Headers` (`Content-Type`, `X-API-Key`,
+  `X-Foundry-Url`, `X-Username`, `X-World-Name`).
+- **Authentication.** Every route except `/health`, `/auth/pair`,
+  `/api/self-unpair`, `/api/clients/:clientId/active`, and `/relay` requires
+  exactly one `x-api-key` header equal to `FOUNDRY_REST_API_KEY`. A missing,
+  wrong or repeated header returns 401.
+- **Bodies.** A route that reads a body requires `Content-Type:
+  application/json` and a JSON object, nested at most 64 levels, when the body
+  is nonempty; an empty body counts as `{}`. Bodies are capped at 16 MiB. The
+  one exception is a raw `POST /upload`, described under
+  [responses](#responses).
+- **World selection.** Forwarding routes and event streams take `clientId`
+  from the query; forwarding routes also accept a string `clientId` in the
+  body. When it is omitted and exactly one world is online, that world is
+  used. Several online worlds return 400 for forwarding routes and 503 for
+  event streams. An unknown or offline world, or no online world, returns 503.
+- **Errors.** Failures use a JSON body `{"error":"..."}`. A malformed target
+  returns 400; an unmatched path returns 404; a path declared only for other
+  methods returns 405 with an `Allow` header. Invalid parameters, an
+  oversized or non-JSON body, and other rejected input return 400 with the
+  generic message `invalid request`.
 
-Ordinary responses preserve the complete Foundry result object, including its `<action>-result` type and relay-generated request ID. A top-level `error` field produces HTTP 400. Timeouts are 10 seconds by default; filesystem listings allow 15 seconds, JavaScript and sheets 20 seconds, scene/canvas changes, uploads and scene screenshots 30 seconds, and downloads 45 seconds.
+## Local routes
 
-Canvas document types are `tokens`, `tiles`, `drawings`, `lights`, `sounds`, `notes`, `templates`, `walls`, and `regions`. The relay adds the corresponding Foundry `className`.
+| Method and path | Authentication | Result |
+| --- | --- | --- |
+| `GET /health` | public | `{"status":"ok"}` |
+| `POST /auth/pair` | pairing code in the body | `token`, `clientId`, `relayUrl`; see [pairing](#pairing-and-the-module-connection) |
+| `POST /api/self-unpair` | connection token in the body | Revokes that token |
+| `GET /api/clients/:clientId/active` | public | `{"active":true}` or `{"active":false}`; 404 for an unknown client |
+| `GET /relay?id=<clientId>` | first WebSocket message | Foundry module connection; 400 without `id` |
+| `GET /clients` | API key | Registered worlds; see [client list](#client-list) |
+| `DELETE /clients/:clientId` | API key | Forgets the world and revokes its pairing; 404 if unknown |
+| Six `GET /<channel>/subscribe` routes | API key | Server-sent events; see [event streams](#event-streams) |
+| `POST /session-handshake`, `POST /start-session`, `GET /session`, `DELETE /end-session` | API key | Headless sessions; see [sessions](sessions.md) |
 
-`GET /download` decodes base64 `fileData` to binary and supplies `Content-Type` and `Content-Disposition`; `?format=base64` preserves JSON. `/sheet` and `/scene/image` return decoded image bytes with `X-Image-Width` and `X-Image-Height`; `?format=base64` also preserves their JSON. `/scene/image/raw` returns the module's ordinary JSON result. Screenshots default to PNG and quality 0.9; sheets default to scale 1.
+### Pairing and the module connection
 
-`POST /upload` accepts JSON `path`, `filename`, and `fileData` formatted as `data:<mime>;base64,<bytes>`. `source` defaults to `data`. The server also adapts raw binary request bodies to a data URL. Files pass through Foundry's file API and are not persisted in the relay database.
+The Foundry module posts `/auth/pair` with `code`, `worldId`, `worldTitle`,
+`serverFingerprint`, `existingClientId`, and `serverOrigin`. A wrong code
+returns 401 and a missing `worldId` returns 400. Submitted codes are compared
+exactly with the uppercased `FOUNDRY_PAIRING_CODE`. The response contains
+`token`, `clientId`, and `relayUrl` (`RELAY_PUBLIC_URL`).
 
-Six separate SSE endpoints subscribe to module events: `/chat/subscribe`, `/rolls/subscribe`, `/hooks/subscribe`, `/encounters/subscribe`, `/actor/subscribe`, and `/scene/subscribe`. Subscriptions activate Foundry hooks only while consumers are present. The server handles these outside the ordinary request/response catalog.
+`relay/store.titan` `Store:pair` reuses an existing registration, with its
+client ID and token, when the request matches it by `existingClientId` and
+`worldId`, then by `worldId` and `serverFingerprint`, then by `worldId` and
+`serverOrigin`. A stored origin must agree with a supplied one. Otherwise it
+creates a new client ID (16 random bytes, hex) and token (32 random bytes,
+hex) from the operating system's CSPRNG.
 
-The local session API adds `POST /session-handshake`, `POST /start-session`,
-`GET /session`, and `DELETE /end-session`, authenticated with the same API key.
-See [sessions](sessions.md) for prerequisites, RSA-OAEP client examples, response
-shapes, and resource lifetime. These are local handlers rather than forwarding
-declarations. The [compatibility audit](api-audit.md) identifies remaining gaps
-against the official documentation and pinned Go relay.
+The module connects to `/relay?id=<clientId>` with nonsecret world and system
+query metadata. Its first text frame must be `{"type":"auth","token":"..."}`
+within `RELAY_AUTH_TIMEOUT_MS`. The relay answers `{"type":"auth-success"}`,
+or `{"type":"auth-failed","error":"invalid pairing token"}` followed by Close
+1008. A new authenticated connection for the same client replaces the old
+one, which is closed with code 1000. The relay pings every
+`RELAY_HEARTBEAT_MS` and answers module `ping` messages with `pong`. Module
+messages must be text and at most 16 MiB. The relay records the query
+metadata on each successful authentication.
+
+`POST /api/self-unpair` takes `{"token":"..."}`. It replaces that token with a
+fresh one, keeps the registration, disconnects the world, and returns
+`{"success":true}`; an unknown token returns 401. Re-pairing then returns the
+fresh token. `DELETE /clients/:clientId` also disconnects the world.
+
+### Client list
+
+`GET /clients` returns a JSON array of every registered world, online or not,
+ordered by world title. Each entry has `id` and `clientId` (both the client
+ID), `worldId`, `worldTitle`, `version` (module version), `lastSeen` (Unix
+seconds of the last pairing or authentication), and `connected`. The query
+metadata from the module's last authenticated connection is then copied into
+the entry, except keys named `id`, `token`, `clientId`, and `connected`.
+Tokens never appear.
+
+### Event streams
+
+| Route | Foundry channel | Module event type |
+| --- | --- | --- |
+| `/chat/subscribe` | `chat-events` | `chat-event` |
+| `/rolls/subscribe` | `roll-events` | `roll-data` |
+| `/hooks/subscribe` | `hooks` | `hook-event` |
+| `/encounters/subscribe` | `combat-events` | `combat-event` |
+| `/actor/subscribe` | `actor-events` | `actor-event` |
+| `/scene/subscribe` | `scene-events` | `scene-event` |
+
+A stream opens with `event: connected` and data `{"clientId":"..."}`. Each
+module event is written with its inner object-valued `data`, or the whole
+message when `data` is not an object. Event names are `roll` for rolls; the
+event's `hook` or `hookName` (default `hook`) for hooks; and
+`<chat|combat|actor|scene>-<eventType>` (default `eventType` `create`) for the
+others. A `: keepalive` comment follows every 15 seconds without an event.
+
+Each subscriber has a 128-event queue. A subscriber whose queue is full is
+retired, and its stream ends after the queued events. Subscriptions belong to
+the main registry, so they survive a world reconnect. Foundry receives
+`{"type":"event-subscription-update","channel":...,"count":...}` whenever a
+channel's subscriber count changes, and all six counts, including zero, after
+each authentication, so it can enable only the hooks in use. The streaming
+handler is `relay/api_worker.titan` `Worker:stream`.
+
+## Forwarding behavior
+
+The relay forwards 91 declarations from the reference Go relay to the
+selected world. Use `userId` (a Foundry user ID or username) to request
+permission-scoped operations; when it is omitted, the module uses the
+connected GM's authority. The D&D5e routes require a compatible D&D5e world.
+
+### Parameters
+
+`relay/api.titan` `build_payload` reads only the declared parameters, in their
+declared source order, and sends them as top-level fields of the WebSocket
+message. The relay sets `type` and `requestId` itself and never forwards
+`clientId`. Undeclared fields, including `_scopes`, are dropped. A false or
+zero body value counts as present; an empty query value counts as absent.
+When `data` is absent, an empty object is sent. Explicit JSON nulls, nested or
+trailing in arrays, survive the round trip.
+
+Values are checked against their declared kind (`Param:coerce`):
+
+- `boolean` accepts JSON booleans and the strings `true` and `false` in any
+  case.
+- `number` accepts JSON numbers and strings that parse as a finite JSON number.
+- `array` accepts JSON arrays and strings that parse as one.
+- `object` accepts JSON objects; JSON text is parsed only from the query.
+  URL-encode structured query values.
+- `value` (`speaker`) is forwarded unchanged, so a body may send a string or a
+  Foundry speaker object while a query value arrives as a string.
+
+Besides required parameters, some routes need at least one of a group
+(`relay/api.titan` `validate`): `/search` needs `query` or `filter`;
+`POST /select` needs `uuids`, `name`, `data`, or `all`; `GET`, `PUT`, and
+`DELETE /user` need `id` or `name`; `GET /scene` needs `sceneId`, `name`,
+`active`, `viewed`, or `all`; `PUT /scene` needs `sceneId`, `name`, or
+`active`; `DELETE /scene` and `/switch-scene` need `sceneId` or `name`; and
+`/sheet` needs `uuid` or `selected`. `/upload` needs `path`, `filename`, and a
+`fileData` data URL.
+
+Canvas `documentType` must be `tokens`, `tiles`, `drawings`, `lights`,
+`sounds`, `notes`, `templates`, `walls`, or `regions`; the relay adds the
+matching Foundry `className`. Most other defaults are applied by the module.
+
+### Responses
+
+A successful reply is the complete Foundry result object, including its
+`<action>-result` type and the relay's request ID. A result with a top-level
+`error` field is returned unchanged with status 400. `relay/api.titan`
+`response` converts three routes to binary unless `format=base64` is given:
+
+- `GET /download` decodes `fileData` and sets `Content-Type` from `mimeType`
+  (default `application/octet-stream`) and an attachment
+  `Content-Disposition` from the file name.
+- `GET /sheet` and `GET /scene/image` decode `imageData` (top-level or inside
+  `data`), set `Content-Type` from `mimeType` (default `image/png`), and add
+  `X-Image-Width` and `X-Image-Height` when the result has numeric
+  dimensions. Both default to `format` `png` and `quality` 0.9; `/sheet`
+  also defaults `scale` to 1.
+
+A result without file or image data is returned as JSON, and
+`GET /scene/image/raw` always returns the module's ordinary JSON result.
+
+`POST /upload` takes JSON `path`, `filename`, and `fileData` formatted as
+`data:<mime>;base64,<bytes>`; `source` defaults to `data`. A body with any
+other `Content-Type` is uploaded raw: the relay encodes it as a data URL with
+that content type and takes the other parameters from the query. Files pass
+through Foundry's file API and are not stored by the relay.
+
+### Deadlines and failures
+
+Each declaration has a deadline. It is 10 seconds unless listed here:
+
+| Deadline | Routes |
+| --- | --- |
+| 15 s | `GET /file-system` |
+| 20 s | `POST /execute-js`, `GET /sheet` |
+| 30 s | `POST /scene`, `PUT /scene`, `POST /switch-scene`, `POST` and `PUT /canvas/:documentType`, `GET /scene/image`, `GET /scene/image/raw`, `POST /upload` |
+| 45 s | `GET /download` |
+
+`RELAY_REQUEST_TIMEOUT_MS` replaces every deadline. The deadline covers
+waiting for a reply channel, admission, and the reply. When it expires the
+relay returns 408. The request may already have reached Foundry and
+performed a mutation; it is never retried. A world disconnect returns 503 to
+its pending requests. A world with `RELAY_MAX_PENDING` requests in flight
+returns 429, and a full output queue returns 503. [Threading](threading.md)
+describes how these requests are owned.
 
 ## Forwarding routes
 
-Required parameter names are listed below. Path parameters are decoded independently; an encoded slash cannot create another path segment.
+The catalog is `relay/api.titan` `catalog`. The last column lists the
+parameters that must be present; some routes add the one-of rules described
+under [parameters](#parameters).
 
 | Method | Path | WebSocket action | Required parameters |
 | --- | --- | --- | --- |
@@ -125,7 +305,8 @@ Required parameter names are listed below. Path parameters are decoded independe
 
 ## Accepted parameters
 
-Names marked `*` are required. `speaker` accepts both strings and Foundry speaker objects. Source order is significant.
+Names marked `*` are required. The source list gives the lookup order:
+`body/query` checks the body first and `query/body` checks the query first.
 
 - `GET /get`: `clientId:string (query)`, `uuid:string (query)`, `selected:boolean (query/body)`, `actor:boolean (query)`, `userId:string (query/body)`
 - `POST /create`: `entityType*:string (body)`, `data*:object (body)`, `clientId:string (query)`, `folder:string (body)`, `keepId:boolean (body/query)`, `override:boolean (body/query)`, `userId:string (query/body)`
@@ -168,11 +349,11 @@ Names marked `*` are required. `speaker` accepts both strings and Foundry speake
 - `PUT /scene`: `data*:object (body)`, `clientId:string (query)`, `sceneId:string (body/query)`, `name:string (body/query)`, `active:boolean (body/query)`, `userId:string (query/body)`
 - `DELETE /scene`: `clientId:string (query)`, `sceneId:string (query)`, `name:string (query)`, `userId:string (query/body)`
 - `POST /switch-scene`: `clientId:string (query)`, `sceneId:string (body/query)`, `name:string (body/query)`, `userId:string (query/body)`
-- `GET /canvas/:documentType`: `documentType*:string (params)`, `clientId:string (query)`, `sceneId:string (query)`, `documentId:string (query)`, `userId:string (query/body)`
+- `GET /canvas/:documentType`: `documentType*:string (path)`, `clientId:string (query)`, `sceneId:string (query)`, `documentId:string (query)`, `userId:string (query/body)`
 - `GET /measure-distance`: `clientId:string (query)`, `originX:number (body/query)`, `originY:number (body/query)`, `targetX:number (body/query)`, `targetY:number (body/query)`, `originUuid:string (body/query)`, `originName:string (body/query)`, `targetUuid:string (body/query)`, `targetName:string (body/query)`, `sceneId:string (body/query)`, `userId:string (query/body)`
-- `POST /canvas/:documentType`: `documentType*:string (params)`, `data*:object (body)`, `clientId:string (query)`, `sceneId:string (body/query)`, `userId:string (query/body)`
-- `PUT /canvas/:documentType`: `documentType*:string (params)`, `documentId*:string (body/query)`, `data*:object (body)`, `clientId:string (query)`, `sceneId:string (body/query)`, `userId:string (query/body)`
-- `DELETE /canvas/:documentType`: `documentType*:string (params)`, `documentId*:string (query)`, `clientId:string (query)`, `sceneId:string (query)`, `userId:string (query/body)`
+- `POST /canvas/:documentType`: `documentType*:string (path)`, `data*:object (body)`, `clientId:string (query)`, `sceneId:string (body/query)`, `userId:string (query/body)`
+- `PUT /canvas/:documentType`: `documentType*:string (path)`, `documentId*:string (body/query)`, `data*:object (body)`, `clientId:string (query)`, `sceneId:string (body/query)`, `userId:string (query/body)`
+- `DELETE /canvas/:documentType`: `documentType*:string (path)`, `documentId*:string (query)`, `clientId:string (query)`, `sceneId:string (query)`, `userId:string (query/body)`
 - `POST /move-token`: `x*:number (body/query)`, `y*:number (body/query)`, `clientId:string (query)`, `uuid:string (body/query)`, `name:string (body/query)`, `waypoints:array (body/query)`, `animate:boolean (body/query)`, `sceneId:string (body/query)`, `userId:string (query/body)`
 - `GET /chat`: `clientId:string (query)`, `limit:number (query)`, `offset:number (query)`, `userId:string (query/body)`, `chatType:number (query)`, `speaker:value (query)`
 - `POST /chat`: `content*:string (body)`, `clientId:string (query)`, `whisper:array (body)`, `speaker:value (body)`, `alias:string (body)`, `chatType:number (body)`, `flavor:string (body)`, `userId:string (query/body)`
@@ -219,12 +400,49 @@ Names marked `*` are required. `speaker` accepts both strings and Foundry speake
 - `POST /dnd5e/use-spell`: `actorUuid*:string (body/query)`, `clientId:string (query)`, `abilityUuid:string (body/query)`, `abilityName:string (body/query)`, `targetUuid:string (body/query)`, `targetName:string (body/query)`, `userId:string (query/body)`
 - `POST /dnd5e/use-item`: `actorUuid*:string (body/query)`, `clientId:string (query)`, `abilityUuid:string (body/query)`, `abilityName:string (body/query)`, `targetUuid:string (body/query)`, `targetName:string (body/query)`, `userId:string (query/body)`
 
-## Pairing compatibility
+## Upstream compatibility
 
-Use the Foundry module's manual pairing-code flow with six-character `FOUNDRY_PAIRING_CODE`. The environment code can pair multiple worlds. Each exchange creates a distinct connection token bound to its persistent world registration.
+The route and protocol reference is ThreeHats' Go relay at
+[`65ce83d6a534ea6d340c8a89d72251f4c6a0294e`](https://github.com/ThreeHats/foundryvtt-rest-api-relay/tree/65ce83d6a534ea6d340c8a89d72251f4c6a0294e/go-relay),
+together with the unversioned [official API documentation](https://foundryrestapi.com/docs/api).
+All 91 of its ordinary forwarding routes are present: 70 general and 21
+D&D5e. A matching method and path does not imply identical behavior:
 
-The module posts `/auth/pair` with `code`, `worldId`, `worldTitle`, `serverFingerprint`, `existingClientId`, and `serverOrigin`. It receives `token`, `clientId`, and `relayUrl`. It connects to `/relay?id=<clientId>` with nonsecret world/system query metadata, sends `{"type":"auth","token":"..."}` as its first text frame, then waits for `{"type":"auth-success"}`. Tokens never appear in URLs. SQLite preserves registrations and tokens across relay restarts; the database is created with mode `0600` on POSIX. Windows deployments require a private user directory protected by its ACL.
+- **Client list.** `GET /clients` returns a bare array with `connected`. The
+  reference returns `{"total":n,"clients":[...]}` with `isOnline` and other
+  per-client fields.
+- **Event filters.** Stream filters are ignored: `speaker`, `type`,
+  `whisperOnly`, and `userId` on chat; `userId` on rolls; `hooks`;
+  `encounterId`; `actorUuid`; and `sceneId`. Every subscriber receives all of
+  its channel's events, so a stream is not permission-scoped. The reference
+  ends streams when a world disconnects, limits the subscription count, and
+  requires `clientId`; this relay keeps streams across reconnects with a
+  bounded queue and selects a single online world automatically.
+- **Capacity.** Request bodies and module messages are limited to 16 MiB,
+  including base64 and JSON overhead. The reference accepts uploads of up to
+  250 MiB. Large downloads and screenshots can exceed the module message limit.
+- **Script screening.** `POST /execute-js` and Macro `POST /create` are
+  forwarded without the reference's forbidden-pattern screen or scope checks.
+  The single API key has full authority over every paired world.
+- **Input and errors.** This relay requires typed JSON input and a data URL
+  for JSON uploads. It returns 503 for an offline world, 400 for an ambiguous
+  forwarding selection, and 429 at the pending limit, where the reference
+  returns 404 or starts the world. Error bodies differ.
+- **Canvas.** `POST /canvas/:documentType` requires an object `data`, as the
+  reference does, although the official documentation also describes arrays.
+- **Sessions.** The [session API](sessions.md) reuses an existing pairing
+  instead of minting a connection token, keeps all session state in memory,
+  and does not capture the browser console.
 
-Public `GET /api/clients/:clientId/active` returns `{"active":true|false}` for registered clients and 404 for unknown IDs. `POST /api/self-unpair` uses its body connection token to revoke that browser's token while preserving the world registration.
+These reference surfaces are absent: the consumer WebSocket `GET /ws/api`,
+including its subscriptions and interactive sheet control; the cross-world
+module tunnel (`remote-request`); the deprecated `GET /contents/*`, which
+returns 404 here; `GET /api/status` and `GET /api/health` (the local
+`/health` is not schema-compatible); and `/openapi.json`, `/asyncapi.json`,
+and `/api/docs`.
 
-The reference frontend, accounts, scoped-key tenancy, billing, external notifications, Redis clustering, and interactive screenshot-control transport are outside this single-user application's scope. The D&D5e forwarding routes are included and require a compatible D&D5e world.
+The service features of the reference are out of scope for this single-user
+relay: delegated key requests, accounts and scoped API keys, dashboard pairing
+and the credential vault, notifications and activity logs, administration,
+billing, metrics, Redis clustering, and the web frontend.
+`DELETE /clients/:clientId` is a local extension.
