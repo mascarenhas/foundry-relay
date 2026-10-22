@@ -63,12 +63,12 @@ transmission.
 
 Each API worker owns a `relay/replies.titan` `Pool` of four reply-channel
 leases. A request exclusively acquires a lease, sends its endpoint, receives
-its matching reply, and returns the lease. Waiters are served FIFO. The wait,
-queue admission, and reply all consume the same request deadline. Timeout,
-cancellation, or uncertain completion closes and replaces the lease, so a late
-reply cannot reach a later borrower, and request IDs reject duplicate or stale
-messages. The leases limit each worker to four simultaneous world calls,
-independently of the thread count. Leases exist because reusing a reply
+its matching reply, and returns the lease. Waiters are served FIFO, and the
+wait counts against the request's [deadline](api.md#deadlines-and-failures).
+Timeout, cancellation, or uncertain completion closes and replaces the lease,
+so a late reply cannot reach a later borrower, and request IDs reject duplicate
+or stale messages. The leases limit each worker to four simultaneous world
+calls, independently of the thread count. Leases exist because reusing a reply
 channel is cheaper than creating one and transferring its endpoint for every
 request. Headless readiness checks on the main thread use a one-lease pool
 (`hub.Session:request`).
@@ -113,9 +113,6 @@ graceful Close 1000 runs in the background. Revocation, deletion, and
 shutdown retire connections without a graceful Close. Headless cleanup
 retires only the exact connection it captured.
 
-Event streams run in API workers. Worlds write events directly into bounded
-subscriber channels, while the main registry keeps subscriptions across
-reconnects. Every newly authenticated world receives all six subscription
-counts, including zero, and an overflow retires only the affected subscriber.
-Workers forward encoded log records to the main logging sink without blocking
-and report records they drop as `log_dropped`.
+Event streams run in API workers. Worlds write events directly into the
+bounded subscriber channels that the main registry owns; the
+[event streams](api.md#event-streams) section gives their contract.

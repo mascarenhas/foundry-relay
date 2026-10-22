@@ -13,10 +13,11 @@ These rules apply to every route, including the public ones:
 
 - **Origin.** A request may omit `Origin`, send its own scheme and authority, or
   send one of the exact `RELAY_ALLOWED_ORIGINS` entries. Anything else,
-  including more than one `Origin` header, returns 403 before routing. An
-  accepted `Origin` is echoed in `Access-Control-Allow-Origin` with
-  `Vary: Origin`. `OPTIONS` returns 204 with `Access-Control-Allow-Methods`
-  and `Access-Control-Allow-Headers` (`Content-Type`, `X-API-Key`,
+  including more than one `Origin` header, returns 403 ahead of every other
+  response, including 404 and 405. An accepted `Origin` is echoed in
+  `Access-Control-Allow-Origin` with `Vary: Origin`. `OPTIONS` to any target,
+  matched or not, then returns 204 with `Access-Control-Allow-Methods` and
+  `Access-Control-Allow-Headers` (`Content-Type`, `X-API-Key`,
   `X-Foundry-Url`, `X-Username`, `X-World-Name`).
 - **Authentication.** Every route except `/health`, `/auth/pair`,
   `/api/self-unpair`, `/api/clients/:clientId/active`, and `/relay` requires
@@ -195,8 +196,8 @@ Each declaration has a deadline. It is 10 seconds unless listed here:
 | 30 s | `POST /scene`, `PUT /scene`, `POST /switch-scene`, `POST` and `PUT /canvas/:documentType`, `GET /scene/image`, `GET /scene/image/raw`, `POST /upload` |
 | 45 s | `GET /download` |
 
-`RELAY_REQUEST_TIMEOUT_MS` replaces every deadline. The deadline covers
-waiting for a reply channel, admission, and the reply. When it expires the
+`RELAY_REQUEST_TIMEOUT_MS` replaces every deadline. The deadline covers the
+whole request, including time spent queued in the relay. When it expires the
 relay returns 408. The request may already have reached Foundry and
 performed a mutation; it is never retried. A world disconnect returns 503 to
 its pending requests. A world with `RELAY_MAX_PENDING` requests in flight
@@ -411,13 +412,16 @@ D&D5e. A matching method and path does not imply identical behavior:
 - **Client list.** `GET /clients` returns a bare array with `connected`. The
   reference returns `{"total":n,"clients":[...]}` with `isOnline` and other
   per-client fields.
-- **Event filters.** Stream filters are ignored: `speaker`, `type`,
+- **Event streams.** Stream filters are ignored: `speaker`, `type`,
   `whisperOnly`, and `userId` on chat; `userId` on rolls; `hooks`;
   `encounterId`; `actorUuid`; and `sceneId`. Every subscriber receives all of
   its channel's events, so a stream is not permission-scoped. The reference
   ends streams when a world disconnects, limits the subscription count, and
   requires `clientId`; this relay keeps streams across reconnects with a
-  bounded queue and selects a single online world automatically.
+  bounded queue and selects a single online world automatically. This relay
+  also unwraps object-valued event `data` on every channel, where the
+  reference unwraps it only for combat events and otherwise sends the whole
+  event object.
 - **Capacity.** Request bodies and module messages are limited to 16 MiB,
   including base64 and JSON overhead. The reference accepts uploads of up to
   250 MiB. Large downloads and screenshots can exceed the module message limit.
@@ -432,7 +436,9 @@ D&D5e. A matching method and path does not imply identical behavior:
   reference does, although the official documentation also describes arrays.
 - **Sessions.** The [session API](sessions.md) reuses an existing pairing
   instead of minting a connection token, keeps all session state in memory,
-  and does not capture the browser console.
+  and does not capture the browser console. It encrypts credentials with one
+  ephemeral RSA key shared by all pending handshakes, where the reference
+  creates a new key for each handshake.
 
 These reference surfaces are absent: the consumer WebSocket `GET /ws/api`,
 including its subscriptions and interactive sheet control; the cross-world

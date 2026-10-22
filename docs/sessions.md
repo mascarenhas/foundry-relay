@@ -19,7 +19,8 @@ Configure the ordinary relay executable. Leave `RELAY_CHROME` unset or empty to
 disable session creation. The browser remains a separate installed dependency,
 controlled by native Titan CDP; the relay does not invoke Node, Python, or the
 Titan compiler. The numeric settings are validated at startup even when
-sessions are disabled.
+sessions are disabled; `Server.new` checks them after opening the database, so
+an invalid value stops the relay with status 1 before the listener opens.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |

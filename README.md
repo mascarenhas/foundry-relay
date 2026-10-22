@@ -35,7 +35,7 @@ Both images use `--static --incremental --output build`. Make compiles each chan
 
 `TITANC=/absolute/path/bin/titanc` selects a compiler and its SDK prefix. `TITAN_STDLIB=/absolute/path/lib/titan/0.6` overrides the standard-provider directory; the test command also supplies it to child fixtures through `TITAN_PATH_0_6`. `TITAN_JOBS` (default 2) bounds parallel C compilation inside each `titanc` call. On a restricted development host, set `CCACHE_DIR` to a writable location; `TITAN_PROBE_CACHE_DISABLE=1` keeps persistent native-header probes from writing to an immutable SDK and is also useful after a failed sandboxed probe.
 
-`make test` runs the suite under a 120-second timeout and passes `TEST_ARGS` to the runner. It sets `RELAY_TEST_EXECUTABLE`, so `tests/process_test.titan` can run a relocated copy of the server without the compiler or Titan provider on its search paths and stop it with SIGTERM. Optional capabilities enable more cases:
+`make test` runs the suite under `timeout 120s` and passes `TEST_ARGS` to the runner, so it needs a `timeout` command on `PATH`, such as GNU coreutils'; macOS does not ship one. It sets `RELAY_TEST_EXECUTABLE`, so `tests/process_test.titan` can run a relocated copy of the server without the compiler or Titan provider on its search paths and stop it with SIGTERM. Optional capabilities enable more cases:
 
 | Variable | Effect |
 | --- | --- |
@@ -74,9 +74,9 @@ The default listener is `127.0.0.1:3010`. SQLite credentials and metadata live i
 | `RELAY_API_CONCURRENCY` | `1` | Number of API worker OS threads; requests use round-robin dispatch |
 | `RELAY_LOG_LEVEL` | `info` | JSON logging threshold: `error`, `info`, or `debug` |
 
-Numeric settings must be positive integers. An invalid value for any of these settings stops startup with exit status 1 before the database or listener opens. The headless session variables are listed in [sessions](docs/sessions.md#enable-sessions).
+Numeric settings must be positive integers. An invalid value for any of these settings stops startup with exit status 1 before the database or listener opens. The headless session variables, listed in [sessions](docs/sessions.md#enable-sessions), are checked after the database opens and before the listener does.
 
-Each world WebSocket connection has its own OS thread. API workers own their HTTP connections, query SQLite independently, and use four exclusive reply-channel leases each. See [thread ownership and request flow](docs/threading.md).
+[Threading](docs/threading.md) describes the API worker and world threads and how they own requests.
 
 Headless sessions are available in the same executable when `RELAY_CHROME` is
 configured. Pair the already running world first, then use the authenticated
@@ -143,7 +143,7 @@ regular file is unsupported and disables the log sink.
 3. Choose **Enter Code** in the module connection dialog and enter your `FOUNDRY_PAIRING_CODE`. The default **Pair** button uses the upstream browser-approval flow, which this relay does not implement.
 4. Repeat in additional worlds with the same code.
 
-The module posts to `/auth/pair`; the relay returns a distinct `clientId` and cryptographically random token for each world/server identity. The module stores that token and sends it in its first WebSocket message, never in the URL. Credentials survive relay restarts. Re-pairing an existing world retains its identity and credential. Module self-unpair revokes its token while retaining the registered world; re-pairing then returns a fresh token. The [API](docs/api.md#pairing-and-the-module-connection) specifies the protocol.
+Each world receives its own client ID and token, and credentials survive relay restarts. The [API](docs/api.md#pairing-and-the-module-connection) specifies pairing, the module connection, re-pairing, and revocation.
 
 ```sh
 curl -H "x-api-key: $FOUNDRY_REST_API_KEY" http://127.0.0.1:3010/clients
@@ -151,7 +151,7 @@ curl -H "x-api-key: $FOUNDRY_REST_API_KEY" \
   'http://127.0.0.1:3010/world-info?clientId=YOUR_CLIENT_ID'
 ```
 
-Exactly one online world is selected automatically when `clientId` is omitted. Multiple online worlds require an explicit `clientId`. Offline worlds remain listed with `connected: false`; tokens are never included in the list. `DELETE /clients/:clientId`, authenticated with the API key, forgets a world and revokes its pairing.
+Pass `clientId` when more than one world is online; the [request rules](docs/api.md#request-rules) describe world selection, and the [client list](docs/api.md#client-list) includes offline worlds.
 
 [The API](docs/api.md) documents all 91 forwarding routes, the local routes, the six event streams, deadlines and failure statuses, and the differences from the upstream relay. [Routing](docs/routing.md) describes the project-local declarative router.
 
