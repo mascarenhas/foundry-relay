@@ -263,7 +263,7 @@ end
 function Session:request(action: string, payload: {string: value}, timeout: integer): Reply
   if self.closed then return Reply(503, wire.error_body("Foundry world is offline")) end
   -- Main-state headless readiness is low rate; API workers retain their pool4.
-  local pool = replies.Pool(1)
+  local pool = replies.Pool(1, self.owner.logger)
   defer pool:close()
   local response = pool:request(self.world, action, payload, timeout)
   return Reply(response.status, response.body)

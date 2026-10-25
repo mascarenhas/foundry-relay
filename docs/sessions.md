@@ -59,6 +59,9 @@ Omitting it succeeds only when exactly one existing pairing matches the Foundry
 origin. The relay resolves a title to its concrete world ID and validates the
 loaded world against that ID. It does not create or repair a pairing, change
 world settings, enter an administrator password, or select a world from setup.
+The username is the account's exact displayed name. On the join form, the relay
+selects that name and submits the corresponding internal user ID; an account
+that is already active cannot be selected.
 
 ## Authenticate and start
 
@@ -233,6 +236,10 @@ For example, a missing profile parent reports `browser_profile` and
 working directory. Create the configured parent before starting a session.
 Browser output, raw errors, profile paths, credentials, and handshake data are
 excluded from these diagnostics. API errors retain their generic message.
+If Foundry displays its administrator login page, startup fails with stage
+`foundry_readiness` and cause `administrator_login_required`. Log in to Foundry's
+administration interface and launch the intended world before retrying with a
+fresh handshake.
 
 Sessions, handshakes, and RSA keys exist only in memory. Restart does not resume
 sessions, replay handshakes, load `.world`, or retrieve stored Foundry passwords.
@@ -240,10 +247,13 @@ SQLite retains ordinary world pairings independently of this lifecycle.
 
 ## Validation boundaries
 
-The Linux session implementation passed all four endpoints against a live HTTPS
+Historical checks on 2026-10-11 passed all four endpoints against a live HTTPS
 Foundry world, including read-only world requests, a fresh session after ending
 the first, and SIGTERM retirement. After the Windows endpoint-file fix, the Linux
 native suite passed 327 cases with one Windows-only fixture skipped, including
 independent crypto interoperability, lifecycle races, loopback HTTP/CDP fixtures,
 and real Chrome retirement. See the [session validation record](session-validation.md)
 for the tested SDK, browser, platform boundaries, and Windows results.
+The [current Titan master validation](master-validation.md) records the newer
+Linux and M1 macOS suites, current login-form regressions, and the unavailable
+live-world prerequisite during that investigation.

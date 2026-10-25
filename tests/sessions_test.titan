@@ -294,6 +294,7 @@ function test_startup_failure_logs_finite_causes_and_keeps_secrets_private(conte
     StartupCase("Browser startup timed out", 408, "browser_startup", "deadline_expired"),
     StartupCase("Foundry readiness timed out", 408, "foundry_readiness", "deadline_expired"),
     StartupCase("CDP command timed out", 408, "browser_protocol", "deadline_expired"),
+    StartupCase("Foundry administrator login is required", 500, "foundry_readiness", "administrator_login_required"),
     StartupCase("private-raw-secret https://private.example/ private-profile-path", 500, "startup", "startup_failed") }
   for index = 1, #cases do
     local selected = cases[index]

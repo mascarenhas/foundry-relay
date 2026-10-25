@@ -6,7 +6,7 @@ The server and tests are Titan. On POSIX, application modules and the Titan stan
 
 ## Build and test
 
-Use a prepared Titan installation containing `thread`, `http`, `websocket`, `sqlite3`, `json`, and `peg`, including channel endpoint transfer, portable demand reads, HTTP exchange transfer/disposal, and `Exchange:serve` header deadlines. The compiled `titan.test.Case`/`run` API, HTTP `Response:abort()`, and `--output` support are also required. GNU Make 4.3 or newer is required for grouped module outputs. Builds and native coverage use `titanc` from `PATH`, without pinning a Titan source revision. Prepend another installation's `bin` directory to `PATH` to select its compiler and matching standard library. See [thread validation](docs/thread-validation.md) for recorded Linux, macOS, and Windows results; [earlier validation](docs/validation.md) retains checks against older producer revisions.
+Use a prepared Titan installation containing `thread`, `http`, `websocket`, `sqlite3`, `json`, and `peg`, including channel endpoint transfer, portable demand reads, HTTP exchange transfer/disposal, and `Exchange:serve` header deadlines. The compiled `titan.test.Case`/`run` API, HTTP `Response:abort()`, and `--output` support are also required. GNU Make 4.3 or newer is required for grouped module outputs. Builds and native coverage use `titanc` from `PATH`, without pinning a Titan source revision. Prepend another installation's `bin` directory to `PATH` to select its compiler and matching standard library. See [current master validation](docs/master-validation.md) for the latest Linux and M1 macOS checks and session-login regression; [thread validation](docs/thread-validation.md) and [earlier validation](docs/validation.md) retain results against older producer revisions.
 
 ```sh
 export PATH=/path/to/titan-prefix/bin:$PATH
@@ -30,6 +30,9 @@ the OpenSSL objects already carried by the SDK and does not invoke `pkg-config`.
 that SDK.
 
 `build/foundry-relay` is the server. `build/relay-tests` is one native `titan.test` runner containing routing, storage, API, protocol, integration, and executable tests. All compiler-generated files live under `build`, preserving the source hierarchy. The application and tests share production module objects and the same compiled Titan standard provider. Builds compile authored sources directly without copying them.
+
+The POSIX test and coverage runners have a 300-second execution budget, including
+optional installed-Chromium checks. Override it with `TEST_TIMEOUT=<seconds>`.
 
 Both phases use `--static --incremental --output build`. Make compiles changed modules separately with `-c`, then links the executable from current objects in that output tree. An unchanged `make` performs no compilation or linking. `make test` builds only missing or stale application/test outputs before running the suite. Only test-owner objects receive Titan's test traceback flag; production modules use the same flags in both images.
 
@@ -111,6 +114,9 @@ reasons. Message categories come from the known protocol catalog; unrecognized
 types are recorded as `unknown`. Client IDs in lifecycle logs come from stored
 pairings. Normal disconnect, reconnect replacement, unpair and shutdown are
 lifecycle events.
+
+A forwarded request returning HTTP 408 emits one `request_timeout` event,
+regardless of whether the caller's deadline or the world worker's deadline wins.
 
 Logging admission does not suspend request or connection owners. A writer drains
 up to 1,024 queued records plus one in-flight record, with each JSON object

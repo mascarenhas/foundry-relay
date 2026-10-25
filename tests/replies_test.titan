@@ -3,9 +3,11 @@ local async = import "async"
 local iteration = import "iteration"
 local thread = import "thread"
 local timer = import "timer"
+local string = import "string"
 local uv = import "uv"
 local protocol = import "relay.world_protocol"
 local replies = import "relay.replies.titan"
+local log = import "relay.log"
 local wire = import "relay.wire"
 
 local record Fixture
@@ -16,11 +18,11 @@ local record Fixture
   const commands: thread.Receiver<|protocol.WorldCommand|>
 end
 
-local function fixture(size: integer?, capacity: integer?): Fixture
+local function fixture(size: integer?, capacity: integer?, logger: log.Logger?): Fixture
   local requests, incoming = thread.channel<|protocol.WorldRequest|>(capacity or 16)
   local commands, command_input = thread.channel<|protocol.WorldCommand|>(128)
   local health, health_input = thread.channel<|nil|>(1)
-  return Fixture(replies.Pool(size),
+  return Fixture(replies.Pool(size, logger),
     protocol.WorldHandle("world-key", "client", requests, commands, health_input),
     incoming, health, command_input)
 end
@@ -371,4 +373,82 @@ function test_zero_deadline_does_not_enqueue_and_negative_deadline_is_rejected(_
   local rejected = false
   do f.pool:request(f.handle, "negative", {}, -1) catch rejected = true end
   test.assert(rejected)
+end
+
+local record TimeoutCapture
+  const logger: log.Logger
+  const lines: {string}
+end
+
+local function timeout_capture(): TimeoutCapture
+  local lines: {string} = {}
+  local logger = log.Logger("error", function(text: string) lines[#lines + 1] = text end)
+  return TimeoutCapture(logger, lines)
+end
+
+local function TimeoutCapture:assert_timeout(kind: string, secrets: {string})
+  self.logger:close()
+  test.assert(#self.lines == 1, "A final timeout did not emit exactly one log record")
+  local line = self.lines[1]
+  local fields = wire.object(line)
+  test.assert(fields["event"] == "request_timeout" and fields["level"] == "error" and
+    fields["client_id"] == "client" and fields["type"] == kind,
+    "Timeout log omitted its finite event, client, or request category")
+  for _, secret in iteration.ipairs(secrets) do
+    test.assert(string.find(line, secret, 1, true) == nil, "Timeout log leaked private request data")
+  end
+end
+
+function test_caller_deadline_logs_once_without_a_world_timer(_context: test.Context)
+  local capture = timeout_capture()
+  defer capture.logger:close()
+  local f = fixture(1, nil, capture.logger)
+  defer f:close()
+  local expired = async.run<|protocol.WorldReply, value|>(function (): protocol.WorldReply
+    return f.pool:request(f.handle, "world-info", {["secret"] = "LEAK_TIMEOUT_PAYLOAD"}, 20)
+  end)
+  defer stop(expired)
+  -- This fixture has no world deadline owner. Only the caller can expire it.
+  local held = f.incoming:receive()
+  test.assert(result(expired).status == 408 and held.reply:is_closed())
+  capture:assert_timeout("world-info", {held.request_id, "LEAK_TIMEOUT_PAYLOAD"})
+end
+
+function test_world_timeout_reply_logs_once_before_the_caller_deadline(_context: test.Context)
+  local capture = timeout_capture()
+  defer capture.logger:close()
+  local f = fixture(1, nil, capture.logger)
+  defer f:close()
+  local pending = request(f, "world-info", 5000)
+  defer stop(pending)
+  local held = f.incoming:receive()
+  held.reply:send(protocol.WorldReply(held.request_id, 408, "LEAK_WORLD_TIMEOUT_BODY"))
+  local response = result(pending)
+  test.assert(response.status == 408 and response.body == "LEAK_WORLD_TIMEOUT_BODY")
+  capture:assert_timeout("world-info", {held.request_id, "LEAK_WORLD_TIMEOUT_BODY"})
+end
+
+function test_zero_deadline_logs_once_without_world_delivery(_context: test.Context)
+  local capture = timeout_capture()
+  defer capture.logger:close()
+  local f = fixture(1, nil, capture.logger)
+  defer f:close()
+  local response = f.pool:request(f.handle, "world-info", {["secret"] = "LEAK_ZERO_TIMEOUT_PAYLOAD"}, 0)
+  local delivered = f.incoming:try_receive()
+  test.assert(response.status == 408 and not delivered and not f.pool.leases[1].busy)
+  capture:assert_timeout("world-info", {response.request_id, "LEAK_ZERO_TIMEOUT_PAYLOAD"})
+end
+
+function test_timeout_log_uses_unknown_for_an_unrecognized_action(_context: test.Context)
+  local capture = timeout_capture()
+  defer capture.logger:close()
+  local f = fixture(1, nil, capture.logger)
+  defer f:close()
+  local expired = async.run<|protocol.WorldReply, value|>(function (): protocol.WorldReply
+    return f.pool:request(f.handle, "LEAK_TIMEOUT_ACTION", {["secret"] = "LEAK_UNKNOWN_PAYLOAD"}, 20)
+  end)
+  defer stop(expired)
+  local held = f.incoming:receive()
+  test.assert(result(expired).status == 408)
+  capture:assert_timeout("unknown", {held.request_id, "LEAK_TIMEOUT_ACTION", "LEAK_UNKNOWN_PAYLOAD"})
 end

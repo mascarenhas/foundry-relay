@@ -283,6 +283,123 @@ function test_world_title_resolves_to_concrete_paired_world(_context: test.Conte
   test.assert(selected.world_id == "sandbox", "Display title did not resolve to the paired world id")
 end
 
+local function installed_browser(): browser.Browser
+  local executable = os.getenv("RELAY_TEST_CHROME") or ""
+  local parent = os.getenv("RELAY_TEST_BROWSER_PROFILES") or ""
+  if executable == "" or parent == "" then
+    test.skip("capability: set RELAY_TEST_CHROME and RELAY_TEST_BROWSER_PROFILES for installed Chromium")
+  end
+  return browser.start(executable, parent, true, 15000)
+end
+
+local function login_options(user: string, origin: string?): foundry.Options
+  return foundry.Options("about:blank", origin or "null", "sandbox", user,
+    "synthetic-password", paired("paired", "sandbox", "null"), "ws://127.0.0.1/relay")
+end
+
+local function login_document(instance: browser.Browser, html: string)
+  instance:cdp():evaluate("document.body.innerHTML=" .. wire.encode(html) .. [=[;
+    delete globalThis.__titanFoundrySession;
+    globalThis.__loginSubmitted=null;
+    globalThis.__loginChanges=0;
+    document.querySelector('select')?.addEventListener('change', () => ++globalThis.__loginChanges);
+    document.querySelector('form')?.addEventListener('submit', event => {
+      event.preventDefault();
+      const data=new FormData(event.target);
+      globalThis.__loginSubmitted={user:data.get('userId') ?? data.get('username'),
+        password:data.get('password'),submitter:event.submitter?.name};
+    }); true]=], instance:session(), 5000)
+end
+
+local function join_document(field: string, options: string): string
+  return "<form name=\"join\"><select name=\"" .. field .. "\">" .. options ..
+    "</select><input name=\"password\" type=\"password\"><button name=\"join\" type=\"submit\">Join</button></form>"
+end
+
+function test_installed_chromium_login_submits_selected_user_id(context: test.Context)
+  local instance = installed_browser()
+  context:cleanup(instance:close)
+  local fields = {"userId", "username"}
+  for index = 1, #fields do
+    local field = fields[index]
+    context:run(field, function (_child: test.Context)
+      login_document(instance, join_document(field, [[<option value=""></option>
+        <option value="opaque-other">Other GM</option><option value="opaque-target">Synthetic GM</option>]]))
+      test.assert(foundry.page_state(instance, 5000) == "join")
+      foundry.login(instance, login_options("Synthetic GM"), 5000)
+      local submitted: {string: value} = instance:cdp():evaluate("globalThis.__loginSubmitted", instance:session(), 5000)
+      test.assert(submitted["user"] == "opaque-target", "Login submitted the display name instead of the selected user ID")
+      test.assert(submitted["password"] == "synthetic-password" and submitted["submitter"] == "join",
+        "Login changed the password or join-form submission")
+      test.assert(instance:cdp():evaluate("globalThis.__loginChanges", instance:session(), 5000) == 1,
+        "Login did not notify the user selection change")
+    end)
+  end
+end
+
+local function rejected_login(instance: browser.Browser, options: foundry.Options)
+  local failure: value = nil
+  do foundry.login(instance, options, 5000)
+  catch failure = error
+  end
+  test.assert(failure == "Foundry login form is unavailable", "Unavailable account or form was submitted")
+  test.assert(instance:cdp():evaluate([=[globalThis.__loginSubmitted === null &&
+    (document.querySelector('[name="password"]')?.value ?? '') === '']=], instance:session(), 5000) == true,
+    "Rejected login submitted the form or populated its password")
+end
+
+function test_installed_chromium_login_requires_available_exact_user(context: test.Context)
+  local instance = installed_browser()
+  context:cleanup(instance:close)
+  context:run("missing_name", function (_child: test.Context)
+    login_document(instance, join_document("userId", [[<option value=""></option>
+      <option value="Synthetic GM">Different GM</option>]]))
+    rejected_login(instance, login_options("Synthetic GM"))
+  end)
+  context:run("blank_placeholder", function (_child: test.Context)
+    login_document(instance, join_document("userId", [[<option value=""></option>]]))
+    rejected_login(instance, login_options(""))
+  end)
+  context:run("active_user", function (_child: test.Context)
+    login_document(instance, join_document("userId", [[<option value="opaque-target" disabled>Synthetic GM</option>]]))
+    rejected_login(instance, login_options("Synthetic GM"))
+  end)
+  context:run("duplicate_name", function (_child: test.Context)
+    login_document(instance, join_document("userId", [[<option value="one">Synthetic GM</option>
+      <option value="two">Synthetic GM</option>]]))
+    rejected_login(instance, login_options("Synthetic GM"))
+  end)
+  context:run("wrong_origin", function (_child: test.Context)
+    login_document(instance, join_document("userId", [[<option value="opaque-target">Synthetic GM</option>]]))
+    rejected_login(instance, login_options("Synthetic GM", "https://other.example"))
+  end)
+  context:run("missing_password", function (_child: test.Context)
+    login_document(instance, [[<form name="join"><select name="userId"><option value="opaque-target">Synthetic GM</option></select>
+      <button name="join" type="submit">Join</button></form>]])
+    rejected_login(instance, login_options("Synthetic GM"))
+  end)
+  context:run("missing_join_button", function (_child: test.Context)
+    login_document(instance, [[<form name="join"><select name="userId"><option value="opaque-target">Synthetic GM</option></select>
+      <input name="password" type="password"></form>]])
+    rejected_login(instance, login_options("Synthetic GM"))
+  end)
+end
+
+function test_installed_chromium_readiness_identifies_administrator_login(context: test.Context)
+  local instance = installed_browser()
+  context:cleanup(instance:close)
+  context:run("current_form", function (_child: test.Context)
+    login_document(instance, [[<form method="post"><input name="adminUsername">
+      <input name="adminPassword" type="password"><button name="action" value="adminAuth">Log In</button></form>]])
+    test.assert(foundry.page_state(instance, 5000) == "admin-login",
+      "Administrator page remained pending until the startup deadline")
+  end)
+  context:run("named_form", function (_child: test.Context)
+    login_document(instance, [[<form name="auth"><input name="password" type="password"></form>]])
+    test.assert(foundry.page_state(instance, 5000) == "admin-login")
+  end)
+end
+
 function test_world_information_publishes_only_documented_metadata(_context: test.Context)
   local response = hub.Reply(200, [[{"type":"world-info-result","requestId":"private",
     "data":{"world":{"id":"sandbox","title":"Test World"},
