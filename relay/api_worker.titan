@@ -324,7 +324,7 @@ function run(bootstrap: Bootstrap): nil
   defer database:close()
   local logger? = log.forward(bootstrap.log_level, bootstrap.log_lines)
   defer if logger then logger:close() end
-  local pool = replies.Pool(4)
+  local pool = replies.Pool(4, logger)
   defer pool:close()
   local worker = Worker(bootstrap.worker_id, bootstrap.settings, database, routes.create(),
     bootstrap.coordinator, bootstrap.returned, pool, logger)

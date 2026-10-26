@@ -204,6 +204,9 @@ local function startup_failure(problem: value): (integer, string, string)
   if problem == "Foundry user is not the configured full GM" then
     return 500, "foundry_readiness", "wrong_user"
   end
+  if problem == "Foundry administrator login is required" then
+    return 500, "foundry_readiness", "administrator_login_required"
+  end
   if problem == "Foundry requires setup or an active REST API module" then
     return 500, "foundry_readiness", "setup_or_module_required"
   end

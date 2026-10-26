@@ -69,6 +69,9 @@ Omitting it succeeds only when exactly one existing pairing matches the Foundry
 origin. The relay resolves a title to its concrete world ID and validates the
 loaded world against that ID. It does not create or repair a pairing, change
 world settings, enter an administrator password, or select a world from setup.
+The username is the account's exact displayed name. On the join form, the relay
+selects that name and submits the corresponding internal user ID; an account
+that is already active cannot be selected.
 
 ## Authenticate and start
 
@@ -255,6 +258,10 @@ For example, a missing profile parent reports `browser_profile` and
 working directory. Create the configured parent before starting a session.
 Browser output, raw errors, profile paths, credentials, and handshake data are
 excluded from these diagnostics. API errors retain their generic message.
+If Foundry displays its administrator login page, startup fails with stage
+`foundry_readiness` and cause `administrator_login_required`. Log in to Foundry's
+administration interface and launch the intended world before retrying with a
+fresh handshake.
 
 Sessions, handshakes, and RSA keys exist only in memory. Restart does not resume
 sessions, replay handshakes, load `.world`, or retrieve stored Foundry passwords.

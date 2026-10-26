@@ -132,7 +132,8 @@ local function page_state(instance: browser.Browser, timeout_ms: integer): strin
       return 'disconnected';
     if (phase && phase !== 'waiting') return phase;
     if (document.querySelector('form[name="join"]')) return 'join';
-    if (document.querySelector('form[name="auth"]')) return 'admin-login';
+    if (document.querySelector('form[name="auth"], form input[name="adminPassword"]'))
+      return 'admin-login';
     return 'waiting';
   })()]=], instance:session(), timeout_ms)
   if not (value is string) then raise "Invalid Foundry readiness response" end
@@ -145,12 +146,14 @@ local function login(instance: browser.Browser, options: Options, timeout_ms: in
   local accepted = instance:cdp():evaluate("(() => { const cfg=" .. wire.encode(credentials) .. [=[;
     if (location.origin !== cfg.origin) return false;
     const form=document.querySelector('form[name="join"]');
-    const user=form?.querySelector('[name="username"]');
+    const user=form?.querySelector('select[name="userId"], select[name="username"]');
     const password=form?.querySelector('[name="password"]');
     const button=form?.querySelector('[name="join"]');
     if (!form || !user || !password || !button) return false;
-    user.value=cfg.user; password.value=cfg.password;
-    user.dispatchEvent(new Event('input',{bubbles:true}));
+    const matches=[...user.options].filter(option => option.textContent === cfg.user);
+    if (matches.length !== 1 || !matches[0].value || matches[0].disabled) return false;
+    user.value=matches[0].value; password.value=cfg.password;
+    user.dispatchEvent(new Event('change',{bubbles:true}));
     password.dispatchEvent(new Event('input',{bubbles:true}));
     form.requestSubmit(button); return true;
   })()]=], instance:session(), timeout_ms)
@@ -202,6 +205,7 @@ function start(options: Options, executable: string, profile_parent: string,
       if phase == "pairing-mismatch" then raise "Foundry pairing settings do not match" end
       if phase == "wrong-world" then raise "Foundry loaded a different world" end
       if phase == "wrong-user" then raise "Foundry user is not the configured full GM" end
+      if phase == "admin-login" then raise "Foundry administrator login is required" end
       raise "Foundry requires setup or an active REST API module"
     end
     timer.sleep(remaining(deadline, 100))

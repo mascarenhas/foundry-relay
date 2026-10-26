@@ -35,11 +35,11 @@ Both images use `--static --incremental --output build`. Make compiles each chan
 
 `TITANC=/absolute/path/bin/titanc` selects a compiler and its SDK prefix. `TITAN_STDLIB=/absolute/path/lib/titan/0.6` overrides the standard-provider directory; the test command also supplies it to child fixtures through `TITAN_PATH_0_6`. `TITAN_JOBS` (default 2) bounds parallel C compilation inside each `titanc` call. On a restricted development host, set `CCACHE_DIR` to a writable location; `TITAN_PROBE_CACHE_DISABLE=1` keeps persistent native-header probes from writing to an immutable SDK and is also useful after a failed sandboxed probe.
 
-`make test` runs the suite under `timeout 120s` and passes `TEST_ARGS` to the runner, so it needs a `timeout` command on `PATH`, such as GNU coreutils'; macOS does not ship one. It sets `RELAY_TEST_EXECUTABLE`, so `tests/process_test.titan` can run a relocated copy of the server without the compiler or Titan provider on its search paths and stop it with SIGTERM. Optional capabilities enable more cases:
+`make test` runs the suite under `timeout 300s` by default and passes `TEST_ARGS` to the runner. `TEST_TIMEOUT=<seconds>` overrides the POSIX test and coverage execution budget, including optional installed-Chromium checks. Both need a `timeout` command on `PATH`, such as GNU coreutils'; macOS does not ship one. It sets `RELAY_TEST_EXECUTABLE`, so `tests/process_test.titan` can run a relocated copy of the server without the compiler or Titan provider on its search paths and stop it with SIGTERM. Optional capabilities enable more cases:
 
 | Variable | Effect |
 | --- | --- |
-| `RELAY_TEST_CHROME` and `RELAY_TEST_BROWSER_PROFILES` | Run the installed-browser lifecycle cases; both must be set |
+| `RELAY_TEST_CHROME` and `RELAY_TEST_BROWSER_PROFILES` | Run the installed-browser lifecycle and Foundry login/readiness DOM cases; both must be set |
 | `RELAY_TEST_OPENSSL` | OpenSSL CLI for the independent-client crypto cases; default `openssl`, skipped when it is missing |
 
 POSIX runs skip the Windows exclusive-file-sharing case. Windows runs skip the POSIX permission-bit and fake-child browser cases. The SQLite contention case skips when `UV_THREADPOOL_SIZE` is set to anything other than 4.
@@ -119,6 +119,9 @@ types are recorded as `unknown`. Client IDs in lifecycle logs come from stored
 pairings. Normal disconnect, reconnect replacement, unpair and shutdown are
 lifecycle events.
 
+A forwarded request returning HTTP 408 emits one `request_timeout` event,
+regardless of whether the caller's deadline or the world worker's deadline wins.
+
 Logging admission does not suspend request or connection owners. A writer drains
 up to 1,024 queued records plus one in-flight record, with each JSON object
 capped at 16 KiB. Worker threads forward their records to this writer.
@@ -176,6 +179,7 @@ Route and wire-protocol compatibility was researched from the upstream Go relay 
 
 Validation logs, audits, and measurement records describe past runs rather than current behavior. Their lasting conclusions live in the documents above; their last versions remain available:
 
+- [`docs/master-validation.md`](https://github.com/mascarenhas/foundry-relay/blob/25271a4d5581b1a65a0184a9518318d15d85e85f/docs/master-validation.md): 2026-10-25 Titan-master validation on Linux and M1 macOS, including the headless login and timeout-logging regressions.
 - [`docs/validation.md`](https://github.com/mascarenhas/foundry-relay/blob/2903378391888e0737819920abe8d15c7bda9875/docs/validation.md): Linux, Windows, and live Foundry validation of the relay before it used worker threads.
 - [`docs/logging-validation.md`](https://github.com/mascarenhas/foundry-relay/blob/2903378391888e0737819920abe8d15c7bda9875/docs/logging-validation.md): validation of structured logging.
 - [`docs/session-validation.md`](https://github.com/mascarenhas/foundry-relay/blob/2903378391888e0737819920abe8d15c7bda9875/docs/session-validation.md): validation of the headless session API, including the live HTTPS Foundry run.

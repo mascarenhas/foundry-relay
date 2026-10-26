@@ -4,6 +4,8 @@ local math = import "math"
 local thread = import "thread"
 local timer = import "timer"
 local uv = import "uv"
+local api = import "relay.api"
+local log = import "relay.log"
 local protocol = import "relay.world_protocol"
 local store = import "relay.store"
 local wire = import "relay.wire"
@@ -29,15 +31,16 @@ end
 record Pool
   local const leases: {Lease}
   local const waiters: {Waiter}
+  local const logger: log.Logger?
   local closed: boolean
 end
 
-function Pool.new(size: integer?): Pool
+function Pool.new(size: integer?, logger: log.Logger?): Pool
   local count = size or 4
   if count < 1 then raise "reply pool size must be positive" end
   local leases: {Lease} = {}
   for _ = 1, count do leases[#leases + 1] = Lease.new() end
-  return { leases = leases, waiters = {}, closed = false }
+  return { leases = leases, waiters = {}, logger = logger, closed = false }
 end
 
 local function Pool:remove_waiter(waiter: Waiter)
@@ -100,8 +103,8 @@ local function reply(id: string, status: integer, message: string): protocol.Wor
   return protocol.WorldReply(id, status, wire.error_body(message))
 end
 
-function Pool:request(handle: protocol.WorldHandle, action: string,
-                      payload: {string: value}, timeout_ms: integer): protocol.WorldReply
+local function Pool:wait_reply(handle: protocol.WorldHandle, action: string,
+                              payload: {string: value}, timeout_ms: integer): protocol.WorldReply
   async.checkpoint()
   if timeout_ms < 0 then raise "request timeout must not be negative" end
   local started = uv.hrtime()
@@ -192,6 +195,23 @@ function Pool:request(handle: protocol.WorldHandle, action: string,
   when second() then return reply(id, 408, "Foundry request timed out")
   when third() then return reply(id, 503, "Foundry world is offline")
   end
+end
+
+function Pool:request(handle: protocol.WorldHandle, action: string,
+                      payload: {string: value}, timeout_ms: integer): protocol.WorldReply
+  local received = self:wait_reply(handle, action, payload, timeout_ms)
+  if received.status == 408 then
+    local kind = "unknown"
+    local endpoints = api.definitions()
+    for index = 1, #endpoints do
+      if endpoints[index].action == action then kind = action; break end
+    end
+    -- Both the world deadline and this caller's deadline can expire first.
+    -- The final returned result owns the event after transport cleanup ends.
+    log.emit(self.logger, "error", "request_timeout", {
+      ["client_id"] = handle.client_id, ["type"] = kind })
+  end
+  return received
 end
 
 function Pool:close()

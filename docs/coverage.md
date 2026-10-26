@@ -12,8 +12,8 @@ it must support native `--coverage`.
 
 On Linux, use GCC 14 or newer and the matching `gcov`. Use the same OpenSSL mode
 as the installed SDK. System OpenSSL needs its development files and
-`pkg-config`, as for the ordinary build. `make coverage-run` wraps the runner in
-`timeout 120s`, so it needs the same `timeout` command as `make test`.
+`pkg-config`, as for the ordinary build. `make coverage-run` uses the
+`TEST_TIMEOUT` execution budget and the same `timeout` command as `make test`.
 
 ## Build and run
 

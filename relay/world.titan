@@ -234,7 +234,6 @@ local function Engine:request_loop(): nil
         if self.pending[job.request_id] == pending then
           self.pending[job.request_id] = nil; self.count = self.count - 1
           pending:complete(408, wire.error_body("Foundry request timed out"))
-          log.emit(self.logger, "error", "request_timeout", {["client_id"] = self.bootstrap.handle.client_id, ["type"] = message_type(job.action)})
         end
         return nil
       end)

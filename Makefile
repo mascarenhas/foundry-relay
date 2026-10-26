@@ -1,5 +1,6 @@
 TITANC ?= titanc
 TITAN_JOBS ?= 2
+TEST_TIMEOUT ?= 300
 TITAN_PREFIX ?= $(abspath $(dir $(shell command -v $(firstword $(TITANC)) 2>/dev/null))/..)
 TITAN_STDLIB ?= $(TITAN_PREFIX)/lib/titan/0.6
 export TITAN_ROCKS_ROOT := $(TITAN_PREFIX)
@@ -91,7 +92,7 @@ build/relay-tests: $(TEST_OBJECTS) $(BUILD_INPUTS)
 	mv build/tests/router_test $@
 
 test: build/foundry-relay build/relay-tests
-	TITAN_PATH_0_6="$(TITAN_STDLIB)" RELAY_TEST_EXECUTABLE="$(ROOT)/build/foundry-relay" timeout 120s build/relay-tests $(TEST_ARGS)
+	TITAN_PATH_0_6="$(TITAN_STDLIB)" RELAY_TEST_EXECUTABLE="$(ROOT)/build/foundry-relay" timeout $(TEST_TIMEOUT)s build/relay-tests $(TEST_ARGS)
 
 # Coverage objects live in .coverage directories; ordinary builds are unaffected.
 # These two images reset/dump counters independently while the suite is active,
@@ -105,7 +106,7 @@ coverage-build: $(SOURCES) Makefile | check-sdk check-openssl
 coverage-run:
 	rm -rf build/coverage-tests/.coverage/report build/coverage-app/.coverage/report
 	mkdir -p build/coverage-tests/.coverage/report build/coverage-app/.coverage/report
-	env -u TITAN_FILTER -u GCOV_PREFIX -u GCOV_PREFIX_STRIP TITAN_PATH_0_6="$(TITAN_STDLIB)" RELAY_TEST_EXECUTABLE="$(ROOT)/build/coverage-app/main" RELAY_TEST_COVERAGE_REPORT="$(ROOT)/build/coverage-app/.coverage/report" timeout 120s build/coverage-tests/tests/router_test
+	env -u TITAN_FILTER -u GCOV_PREFIX -u GCOV_PREFIX_STRIP TITAN_PATH_0_6="$(TITAN_STDLIB)" RELAY_TEST_EXECUTABLE="$(ROOT)/build/coverage-app/main" RELAY_TEST_COVERAGE_REPORT="$(ROOT)/build/coverage-app/.coverage/report" timeout $(TEST_TIMEOUT)s build/coverage-tests/tests/router_test
 
 coverage: coverage-build
 	$(MAKE) coverage-run
