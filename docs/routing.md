@@ -1,8 +1,8 @@
 # Declarative HTTP routing
 
-`relay.router` parses route declarations with Titan's Relabel PEG notation,
-then compiles each declaration into an anchored PEG matcher. Its shape follows
-the parse-parts-then-compile approach in
+`relay/router.titan` parses route declarations with Titan's Relabel PEG
+notation, then compiles each declaration into an anchored PEG matcher. Its
+shape follows the parse-parts-then-compile approach in
 [mk.routes](https://github.com/mascarenhas/mk/blob/master/src/mk/routes.lua).
 The declaration grammar initializes once; each route matcher initializes once
 in `Route.new`. Matching a request compiles no grammar.
@@ -10,19 +10,22 @@ in `Route.new`. Matching a request compiles no grammar.
 ```titan
 local router = import "relay.router"
 
-local routes = router.Router({
-  router.Route("GET", "/worlds/:worldId", "world"),
-  router.Route("POST", "/worlds/:worldId/action", "action"),
-  router.Route("*", "/assets/*", "assets"),
-})
-
-local resolution = routes:match("GET", "/worlds/Polis%20Sector?tag=a&tag=b")
+function resolve(): router.Resolution
+  local routes = router.Router({
+    router.Route("GET", "/worlds/:worldId", "world"),
+    router.Route("POST", "/worlds/:worldId/action", "action"),
+    router.Route("*", "/assets/*", "assets"),
+  })
+  return routes:match("GET", "/worlds/Polis%20Sector?tag=a&tag=b")
+end
 ```
 
 Routes match in declaration order. A method of `*` accepts any method; other
 methods compare exactly. The resulting `Match` contains the route, action,
-decoded named parameters, and query maps. The server dispatches the action;
-the router owns no application callbacks or network resources.
+decoded named parameters, and query maps. The caller dispatches the action;
+the router owns no application callbacks or network resources. The relay's
+own table is `relay/routes.titan` `create`, and the [API](api.md) documents
+its routes.
 
 ## Route syntax
 
@@ -49,7 +52,8 @@ parameters, inline parameter suffixes, and nonterminal wildcards are outside
 this route syntax. Literal punctuation is matched as bytes, without regex or
 Relabel source interpolation.
 
-Parameter names must be unique. The wildcard reserves the name `wildcard`.
+Parameter names must be unique, and a `:wildcard` parameter conflicts with a
+final `*`.
 Patterns are bounded to 1,024 bytes and 64 parts so declarations remain small
 and fit the PEG engine's construction limits.
 
@@ -66,9 +70,10 @@ The `+` byte remains literal in paths.
 `parse_target` validates the request target once and parses its query. Query
 names and values decode percent escapes and treat `+` as a space. The `query`
 map retains each name's first occurrence. The `query_values` map retains all
-occurrences in wire order. Empty values and names are preserved. Targets are
-bounded to 16 KiB and 256 query fields. Malformed percent escapes, encoded NUL,
-raw controls, and fragments are rejected.
+occurrences in wire order. Empty values and names are preserved; empty fields
+such as `&&` are skipped but count toward the field limit. Targets are bounded
+to 16 KiB and 256 query fields. Malformed percent escapes, encoded NUL, raw
+controls, and fragments are rejected.
 
 ## Results and diagnostics
 
@@ -81,9 +86,9 @@ raw controls, and fragments are rejected.
 | `404` | No matching path. |
 | `405` | Matching paths exist for other methods; `allowed` retains unique methods in declaration order. |
 
-`allow_header(allowed)` formats the HTTP `Allow` field. JSON response helpers
-set status, content type, and length. `error_response` encodes an `error` field
-with Titan's JSON module.
+`allow_header(allowed)` formats the HTTP `Allow` field. `json_response` sets
+the status, `Content-Type: application/json; charset=utf-8`, and
+`Content-Length`; `error_response` writes an `error` field through it.
 
 `parse_route(pattern)` returns `(parts?, RouteError?)`. `Route.new` raises that
 same error for invalid declarations. `RouteError` exposes `code`, `message`,
@@ -102,11 +107,11 @@ byte where the expected construct is missing or invalid.
 | `percent_escape` | A literal percent escape lacks two hex digits. |
 | `nul_escape` | A literal percent escape represents NUL. |
 | `control_character` | A raw control byte appears in the declaration. |
-| `duplicate_parameter` | A named parameter is repeated or collides with `wildcard`. |
+| `duplicate_parameter` | A named parameter is repeated, or `:wildcard` accompanies a final `*`. |
 | `route_limit` | The byte or part limit is exceeded. |
 | `invalid_declaration` | Method or action is empty. |
 | `trailing_input` | Unexpected trailing declaration input. |
 
-The native router tests cover typed parts, exact labels and byte positions,
-percent-encoded boundaries, ordered matching, 404/405 results, query repetitions,
-and reusable matchers with independent capture state.
+`tests/router_test.titan` covers typed parts, exact labels and byte positions,
+percent-encoded boundaries, ordered matching, 404/405 results, query
+repetitions, and reusable matchers with independent capture state.

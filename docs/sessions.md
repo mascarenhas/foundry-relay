@@ -1,21 +1,30 @@
 # Headless Foundry sessions
 
-The relay can own a Chrome instance that logs in to an already running Foundry
-world and keeps its REST API module connected. The four authenticated endpoints
-follow the [upstream session API](https://foundryrestapi.com/docs/api/session).
+The relay can own a Chromium-based browser that logs in to an already running
+Foundry world and keeps its REST API module connected. The four authenticated
+endpoints follow the [upstream session API](https://foundryrestapi.com/docs/api/session).
 This implementation requires an existing pairing and does not launch worlds
-through Foundry's administration screen. See the [REST catalog](api.md) and
-[operator setup](../README.md) for the ordinary relay configuration.
+through Foundry's administration screen. The [API](api.md#upstream-compatibility)
+summarizes the differences, and the [README](../README.md#run) covers ordinary
+relay configuration.
+
+`relay/sessions.titan` `Manager` owns admission, handshakes, and session
+lifetime. `relay/foundry_session.titan` `start` performs login and readiness
+checks, `relay/browser.titan` `Browser` owns the browser process and profile,
+and `relay/session_crypto.titan` holds the RSA key.
 
 ## Enable sessions
 
-Configure the ordinary relay executable. Leave `RELAY_CHROME` unset to disable session
-creation. Chrome remains a separate installed dependency, controlled by native
-Titan CDP; the relay does not invoke Node, Python, or the Titan compiler.
+Configure the ordinary relay executable. Leave `RELAY_CHROME` unset or empty to
+disable session creation. The browser remains a separate installed dependency,
+controlled by native Titan CDP; the relay does not invoke Node, Python, or the
+Titan compiler. The numeric settings are validated at startup even when
+sessions are disabled; `Server.new` checks them after opening the database, so
+an invalid value stops the relay with status 1 before the listener opens.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `RELAY_CHROME` | empty, disabled | Chrome/Chromium executable or launcher path |
+| `RELAY_CHROME` | empty, disabled | Chrome, Chromium, or Edge executable or launcher path |
 | `RELAY_BROWSER_PROFILES` | `build/browser-profiles` | Existing parent directory for disposable private profiles |
 | `RELAY_MAX_SESSIONS` | `4` | Maximum admitted sessions, including startup and retirement; range 1–64 |
 | `RELAY_SESSION_TIMEOUT_MS` | `120000` | Total startup budget; range 1–600000 milliseconds |
@@ -54,7 +63,8 @@ Before starting a session:
    and non-default port are significant. The session URL must use HTTP or HTTPS
    and must not contain a query string.
 
-`x-world-name` may identify the existing pairing by exact world ID or title.
+`x-world-name`, or the start body's `worldName`, may identify the existing
+pairing by exact world ID or title among the pairings for that Foundry origin.
 Omitting it succeeds only when exactly one existing pairing matches the Foundry
 origin. The relay resolves a title to its concrete world ID and validates the
 loaded world against that ID. It does not create or repair a pairing, change
@@ -76,7 +86,10 @@ This is the same format accepted by the
 | `POST /session-handshake` | Headers `x-foundry-url`, `x-username`; optional `x-world-name` | `token`, `publicKey`, `nonce`, `instanceId`, `foundryUrl`, `username`, `expires` |
 | `POST /start-session` | JSON `handshakeToken`, `encryptedPassword`; optional `worldName` override | `{"success":true,"sessionId":"...","clientId":"..."}` |
 | `GET /session` | No extra inputs | `{"activeSessions":[...]}` |
-| `DELETE /end-session?sessionId=...` | Session ID in the query, or JSON `sessionId` when the query is absent | `{"status":"ok","message":"Session ended"}` |
+| `DELETE /end-session?sessionId=...` | Session ID in the query, or JSON `sessionId` when the query value is absent or empty | `{"status":"ok","message":"Session ended"}` |
+
+Each handshake header may appear at most once. `x-foundry-url` is limited to
+4,096 bytes, `x-username` to 1–256 bytes, and `x-world-name` to 256 bytes.
 
 The relay creates one ephemeral RSA key when its enabled session manager starts
 and reuses that public key until shutdown. Each handshake has its own random
@@ -86,8 +99,8 @@ request a new one before retrying. At most 32 unexpired handshakes are retained.
 Neither private keys nor passwords are written to SQLite. Runtime strings are
 garbage collected; the relay does not claim secure erasure of their contents.
 
-`captureBrowserConsole` is unsupported: omit it or pass an empty string. A
-nonempty value returns 400. Browser console messages, screenshots, page contents,
+`captureBrowserConsole` is unsupported: omit it or pass an empty string. Any
+other value returns 400. Browser console messages, screenshots, page contents,
 and authentication payloads are not written to relay logs.
 
 Use HTTPS for the REST connection when it crosses a network. Password encryption
@@ -178,12 +191,19 @@ the caller. See the [cryptography RSA guide](https://cryptography.io/en/latest/h
 
 ## Lifetime and failures
 
-Each admitted session owns one sandboxed Chrome process, a separate disposable
-profile, and an off-the-record browser context. Cookies and client storage stay
-in memory in that context. CDP listens on a random loopback port; sandboxing,
-certificate verification, proxy settings, and Foundry's existing authentication
-remain enabled. The Chrome child inherits desktop integration variables but
-receives empty relay API-key and pairing-code environment values.
+Each admitted session owns one browser process, a separate disposable profile,
+and an off-the-record browser context. Cookies and client storage stay in
+memory in that context. CDP listens on a random loopback port. The relay passes
+no flags that disable sandboxing, certificate verification, or proxy settings,
+and Foundry's own authentication still applies. The browser inherits desktop
+integration variables but receives empty relay API-key and pairing-code
+environment values.
+
+The browser publishes its CDP endpoint in the profile's `DevToolsActivePort`
+file. On Windows the file can appear while the browser still holds an
+exclusive write handle, so only that busy open (`EBUSY` from `fs.open`) counts
+as not ready yet (`relay/browser.titan` `read_endpoint`). Other errors fail
+startup.
 
 Startup must complete browser initialization, navigation, GM login, world/module/
 pairing checks, relay authentication, and a `world-info` reply within the total
@@ -193,8 +213,10 @@ additional cleanup allowance; the startup timeout is not a total HTTP-response
 deadline including cleanup.
 
 The manager reserves a client before starting its controller, so two API starts
-cannot launch the same paired world concurrently. An already connected world
-returns 409. An external browser with the same existing pairing credential still
+cannot launch the same paired world concurrently. A world that is already
+connected or already has an admitted session returns 409. If a module
+connection for that world appears while the browser is starting, startup
+fails. An external browser with the same existing pairing credential still
 uses the relay's normal reconnect behavior and can replace a connection during
 startup or later. Ownership checks then reject or retire the headless session;
 reusing that credential does not establish exclusive admission against external
@@ -210,8 +232,8 @@ List entries contain `sessionId`, `clientId`, `foundryUrl`, `username`, `worldNa
 `startedAt`, `lastActivity`, and six world/system metadata fields: `worldId`,
 `worldTitle`, `foundryVersion`, `systemId`, `systemTitle`, and `systemVersion`.
 `worldName` is the resolved world ID. Times are Unix epoch milliseconds with
-one-second clock resolution; currently both timestamps record admission, and
-`lastActivity` does not measure REST traffic or implement an inactivity timeout.
+one-second clock resolution. Both timestamps record admission: `lastActivity`
+is not updated by REST traffic and does not implement an inactivity timeout.
 Only published active sessions appear in this list.
 
 Ending a session cancels and awaits its controller, closes the owned browser,
@@ -221,7 +243,7 @@ connection is preserved. Shutdown does the same before closing shared relay
 resources. Ordinary stop and failed startup preserve the
 existing pairing token. If retirement fails, the manager logs a static cleanup
 error and retains the reservation; ending that session returns 503 and another
-start for the same world remains blocked. Unknown session IDs return 404.
+start for the same world returns 409. Unknown session IDs return 404.
 Malformed inputs return 400, a nonce mismatch returns 401, disallowed Foundry
 origins return 403, capacity limits return 429, expired startup deadlines return
 408, other startup failures return 500, and disabled session creation returns
@@ -237,13 +259,3 @@ excluded from these diagnostics. API errors retain their generic message.
 Sessions, handshakes, and RSA keys exist only in memory. Restart does not resume
 sessions, replay handshakes, load `.world`, or retrieve stored Foundry passwords.
 SQLite retains ordinary world pairings independently of this lifecycle.
-
-## Validation boundaries
-
-The Linux session implementation passed all four endpoints against a live HTTPS
-Foundry world, including read-only world requests, a fresh session after ending
-the first, and SIGTERM retirement. After the Windows endpoint-file fix, the Linux
-native suite passed 327 cases with one Windows-only fixture skipped, including
-independent crypto interoperability, lifecycle races, loopback HTTP/CDP fixtures,
-and real Chrome retirement. See the [session validation record](session-validation.md)
-for the tested SDK, browser, platform boundaries, and Windows results.

@@ -1,88 +1,118 @@
 # Threads and request ownership
 
-The main thread accepts connections and reads request headers with demand reads.
-It then transfers the HTTP exchange, including buffered bytes, through a bounded
-channel. Each WebSocket world connection gets a dedicated Titan OS thread. API
-requests go to persistent workers in round-robin order; `RELAY_API_CONCURRENCY`
-selects their count and defaults to 1. A later request on a keep-alive connection
-returns to the main dispatcher and advances the same worker index. A later
-`/relay` upgrade receives its own world thread.
+The relay runs three kinds of Titan OS thread. Each has its own Lua state,
+async Runtime, and Tasks. They share no Titan objects and communicate only
+through bounded `thread.channel` endpoints.
 
-Each handling thread owns its socket I/O and asynchronous Tasks. First and
-subsequent HTTP request headers have a 10-second deadline. This deadline does
-not time request handlers, bodies, response writes, or SSE streams. Connections
-still waiting for their first headers remain with the standard HTTP server and
-are bounded by that deadline when its listener closes.
+- **Main thread**, `relay/server.titan` `Server`, runs the HTTP listener, the
+  coordinator (`Server:control_loop`), the dispatcher for returned keep-alive
+  requests, and the logging sink. It also owns the live world directory and
+  event-stream registry (`relay/hub.titan` `Hub`) and the headless session
+  manager (`relay/sessions.titan` `Manager`).
+- **API workers**, `relay/api_worker.titan` `run`, are
+  `RELAY_API_CONCURRENCY` persistent threads that start before the listener
+  opens.
+- **World threads**, `relay/world.titan` `run`, are started one per module
+  connection by `Server:start_world`.
+
+## Dispatch
+
+The listener disables read-ahead, so connections are read only on demand.
+After it parses a request's headers, `Server:handle` converts the exchange,
+including any bytes already buffered, into a transfer payload.
+`Server:deliver` then starts a world thread for `/relay` with a nonempty `id`
+and sends every other request to the next API worker in round-robin order.
+
+On a keep-alive connection, the API worker handles the first request itself.
+Each later request returns to the main dispatcher, which takes the next worker
+from the same round-robin cursor, or starts a world thread for a `/relay`
+upgrade. The listener and each adopted exchange wait at most 10 seconds for
+request headers. That deadline does not time handlers, bodies, response
+writes, or event streams. A connection still waiting for its first headers
+stays with the main thread's HTTP server.
+
+| Channel | Carries | Capacity | Direction |
+| --- | --- | ---: | --- |
+| `controls` | `messages.ControlRequest` | 256 | workers to coordinator |
+| `returned` | `messages.Handoff` | 128 | API workers to dispatcher |
+| `log_lines` | encoded log records | 1,024 | workers to logging sink |
+| API worker inbox | `messages.Handoff` | 128 | dispatcher to one worker |
+| world `requests` | `world_protocol.WorldRequest` | `RELAY_MAX_PENDING` | API workers to one world |
+| world `commands` | `world_protocol.WorldCommand` | 256 | main to one world |
+| world `health` | nothing; closed by main after joining the thread | 1 | main to everyone holding the handle |
+| reply lease | `world_protocol.WorldReply` | 1 | world to one API worker |
+| subscriber | event text | 128 | world to one event stream |
+
+HTTP exchanges cross threads as manually owned transfer payloads, never as
+live connection values. A sender owns the payload until enqueue succeeds.
+After that the receiving thread adopts it at once, or the channel's owner
+disposes of it with `http.Exchange.discard_transfer_payload` after the
+consumer has joined (`relay/messages.titan` `Handoff`).
 
 ## World requests and replies
 
-API workers send requests directly to the selected world's channel. A message
-contains a request ID, the complete wire JSON, an absolute deadline, and the
-sending endpoint of a reply channel. The world owns WebSocket correlation,
-reader, writer, heartbeat, output queue, and pending-request limit. It checks
-cancellation and the deadline again immediately before writing queued work.
-Requests are never automatically replayed after possible transmission.
+API workers send requests directly to the selected world's `requests`
+channel. A `WorldRequest` carries the request ID, the action, the complete
+wire JSON, an absolute deadline, and the sending endpoint of a reply lease.
+The world's `Engine` owns correlation, the reader, the writer, the heartbeat,
+the output queue (at most `RELAY_MAX_PENDING` + 16 messages), and the
+pending-request limit. Just before writing queued work, it checks again that
+the request is still pending, uncancelled, and within its deadline
+(`Outgoing:should_send`). Requests are never replayed after possible
+transmission.
 
-Each API worker has four reply-channel leases. A request exclusively acquires a
-lease, sends its endpoint, receives its matching reply, and returns the lease.
-FIFO waiters share the pool. Its wait, queue admission, and response all consume
-the same request deadline. Timeout, cancellation, or uncertain completion closes
-and replaces the lease so a late reply cannot reach a later borrower. Request
-IDs also reject duplicate or stale messages. The four leases bound each API
-worker to four simultaneous world calls; the OS thread count is independent.
+Each API worker owns a `relay/replies.titan` `Pool` of four reply-channel
+leases. A request exclusively acquires a lease, sends its endpoint, receives
+its matching reply, and returns the lease. Waiters are served FIFO, and the
+wait counts against the request's [deadline](api.md#deadlines-and-failures).
+Timeout, cancellation, or uncertain completion closes and replaces the lease,
+so a late reply cannot reach a later borrower, and request IDs reject duplicate
+or stale messages. The leases limit each worker to four simultaneous world
+calls, independently of the thread count. Leases exist because reusing a reply
+channel is cheaper than creating one and transferring its endpoint for every
+request. Headless readiness checks on the main thread use a one-lease pool
+(`hub.Session:request`).
 
-World failure fails pending calls with 503 and retires that exact connection.
-Unexpected API-worker termination closes the server and reports failure rather
-than silently reducing configured concurrency. Shutdown cancels and joins owned
-HTTP and world Tasks before their database handles and logging queues close.
-Native payloads use explicit adoption or disposal; they are never embedded as
-live connection values in a generic channel message.
+A world failure fails its pending calls with 503 and retires that exact
+connection. An API worker that terminates unexpectedly makes the server log
+`server_failed` and shut down rather than silently lose capacity; a world
+thread's exit affects only its own connection.
+
+`Server:shutdown` closes the listener, then cancels and awaits coordinator
+operations. It closes the session manager and the world directory, then
+cancels and joins the API workers. Each worker cancels and awaits the Tasks
+serving its exchanges and disposes of queued payloads. Next the world threads
+are cancelled and joined, and the coordinator, dispatcher, and logging
+channels close. The main thread's Store closes last. Each worker closes its
+own Store handle and forwarding logger as it exits.
 
 ## Persistent state and live coordination
 
-API and world workers use independent Store handles and SQLite connections for
-ordinary database operations. Writers reserve a transaction with `BEGIN
-IMMEDIATE`. SQLite busy waits are disabled: a complete failed operation rolls
-back and closes its connection before retrying `SQLITE_BUSY` with cooperative,
-bounded backoff. Retry admission has a five-second budget. Cancellation and
-other error codes propagate; a committed write is never replayed. The initial
-database is protected before schema initialization, and workers attach without
-repeating initialization.
+Each thread uses its own `relay/store.titan` `Store` handle. The main thread
+creates the handle with `store.open`, which restricts the database to mode
+0600 before creating the schema. Workers use `store.attach`, which does no
+schema work. A handle runs its operations one at a time in FIFO order, and
+each operation opens and closes its own SQLite connection. Writers reserve the
+database with `BEGIN IMMEDIATE`, and SQLite's busy timeout is zero. On
+`SQLITE_BUSY`, the failed operation rolls back and closes its connection,
+then retries with a backoff that starts at 1 ms and doubles up to 25 ms. The
+retry budget is five seconds from FIFO admission. Cancellation and other
+errors propagate, and a committed write is never replayed.
 
-The main thread owns the live world directory, persistent SSE subscriptions,
-and headless browsers, credentials, and reservations. Channels coordinate final
-authentication and publication, revocation or deletion with disconnect, and
-headless admission. Once a revoke/delete transition is admitted, an independent
-coordinator Task completes both the credential mutation and the captured
-connection's retirement even if its API caller is cancelled. A reconnect
-quiesces the incumbent world and waits for acknowledgment that its data writer
-has retired before replacing it. Graceful WebSocket retirement then runs in
-the background. Headless cleanup retains the exact captured connection identity.
+Coordinator requests (`relay/control.titan` `call`) carry data and channel
+endpoints only. `Hub:transition` serializes changes to the world directory.
+Once a revoke or delete transition is admitted, `Server:coordinate` runs it in
+an independent Task. That Task completes both the credential mutation and the
+retirement of the captured connection even if the API caller is cancelled.
 
-SSE streams stay in API workers. Worlds send events directly through bounded
-subscription channels. The main registry survives reconnects, and every new
-world receives all six subscription counts, including zero. Overflow retires
-only the affected subscriber. Workers forward bounded JSON log records to the
-main logging sink.
+When a module reconnects, `Hub:publish_authenticated` first quiesces the
+incumbent world. The world stops admitting requests, fails its pending
+requests with 503, and cancels and joins its data writer before
+acknowledging. Only then is the replacement published, and the incumbent's
+graceful Close 1000 runs in the background. Revocation, deletion, and
+shutdown retire connections without a graceful Close. Headless cleanup
+retires only the exact connection it captured.
 
-## Channel cost measurements
-
-The initial production Linux x86_64 benchmark used Titan `a5a6bb2` on an AMD
-Ryzen AI 9 HX 370. Five rounds each completed 3,000 round trips with exactly one
-outstanding request, worker startup excluded, and GC enabled. The table gives
-the median of the five per-round average costs. Socket I/O, JSON encoding, and
-Foundry execution were excluded.
-
-| Reply strategy | Median round trip |
-| --- | ---: |
-| New reply channel per request | 35.999 microseconds |
-| Reuse four reply channels | 28.866 microseconds |
-| Transfer a fixed reply endpoint once at startup | 20.264 microseconds |
-
-The four-channel experiment measures reuse, not the lease manager or contended
-relay performance. Reuse saved 19.8% in that experiment. Local channel creation
-and close cost 0.625 microseconds, plus 0.316 microseconds for final collection.
-A nested endpoint message cost 11.805 microseconds, compared with 6.457 for a
-matched small string field. Endpoint transfer and lifetime handling are the
-larger opportunity for a separate Titan optimization. These measurements do
-not predict end-to-end Foundry latency.
+Event streams run in API workers. Worlds write events directly into the
+bounded subscriber channels that the main registry owns; the
+[event streams](api.md#event-streams) section gives their contract.
