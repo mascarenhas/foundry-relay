@@ -29,9 +29,13 @@ the OpenSSL objects already carried by the SDK and does not invoke `pkg-config`.
 `OPENSSL_MODE` must match the installed SDK; it does not rebuild or reconfigure
 that SDK.
 
-`build/foundry-relay` is the server. `build/relay-tests` is one native `titan.test` runner selected with `--tree . --test-dir tests`, including every `tests/*_test.titan` module. All compiler-generated files live under `build`, preserving the source hierarchy, and builds compile authored sources in place.
+`build/foundry-relay` is the server. `build/relay-tests` is one native `titan.test` runner selected with `--tree . --test-dir tests`, including every `tests/*_test.titan` module. Generated module C, headers, and objects preserve the source hierarchy under `build`; target-specific runner and entrypoint files live under `build/.titan-links/<key>/synthetic/`. Builds compile authored sources in place.
 
 Both images use `--static --incremental --output build`, with `--exe` selecting their final paths. Make always invokes `titanc` for each requested image; the compiler owns import discovery, dependency scheduling, object certification, and final-link reuse. An unchanged build compiles and links nothing. The application and runner share unchanged production objects and the compiled Titan standard provider. There is no project module graph or configuration stamp to maintain when adding sources, changing imports, or updating the SDK or native flags. `make clean` removes `build`.
+
+The compiler keeps a disposable precise-stat digest cache at `build/.titan/digests`, separate from object and link certificates. Missing or malformed cache data is ignored; inputs without matching precise observations are read again. Keep source-root spelling consistent between invocations: different `--tree` spellings can change generated source locations and legitimately miss. Incompatible configurations should use separate output trees.
+
+Use `make TITANC="titanc -v"` for native command echoes and object/native/link decisions on stderr. Capture both streams for a complete build log, for example `make TITANC="titanc -v" 2>&1 | tee build.log`. The compiler also sends worker output and diagnostics to stderr.
 
 `TITANC=/absolute/path/bin/titanc` selects a compiler and its SDK prefix. `TITAN_STDLIB=/absolute/path/lib/titan/0.6` overrides the standard-provider directory; the test command also supplies it to child fixtures through `TITAN_PATH_0_6`. `TITAN_JOBS` (default 2) bounds compiler workers and native compilation inside each `titanc` call. On a restricted development host, set `CCACHE_DIR` to a writable location; `TITAN_PROBE_CACHE_DISABLE=1` keeps persistent native-header probes from writing to an immutable SDK and is also useful after a failed sandboxed probe.
 
