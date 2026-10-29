@@ -62,7 +62,7 @@ function Start-NativeProcess([string]$Executable, [string]$Directory,
   # Deliberately exclude MSYS2, LLVM, the compiler, and SDK module-path overrides.
   $process.StartInfo.EnvironmentVariables['PATH'] = "$env:SystemRoot\System32;$env:SystemRoot"
   foreach ($name in @('LUA_PATH', 'LUA_CPATH', 'LUA_PATH_5_5', 'LUA_CPATH_5_5',
-      'LUA_INIT', 'LUA_INIT_5_5', 'TITAN_PATH_0_6', 'TITAN_ROCKS_ROOT')) {
+      'LUA_INIT', 'LUA_INIT_5_5', 'TITAN_PATH_0_6', 'TITAN_PATH', 'TITAN_ROOT')) {
     $process.StartInfo.EnvironmentVariables.Remove($name)
   }
   foreach ($name in $Environment.Keys) {

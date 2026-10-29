@@ -84,7 +84,7 @@ function test_relocated_executable_runs_without_compiler_or_provider(_context: t
     os.with_env("RELAY_CHROME", ""), os.with_env("RELAY_MAX_SESSIONS", "4"),
     os.with_env("RELAY_SESSION_TIMEOUT_MS", "120000"),
     os.with_env("TITAN_PATH_0_6", "/nonexistent-foundry-relay-provider"),
-    os.with_env("TITAN_ROCKS_ROOT", "/nonexistent-foundry-relay-sdk"),
+    os.with_env("TITAN_ROOT", "/nonexistent-foundry-relay-sdk"),
     os.with_env("LUA_PATH", ""), os.with_env("LUA_CPATH", ""),
     os.with_env("PATH", "/nonexistent-foundry-relay-tools"))
   defer stop(process)
