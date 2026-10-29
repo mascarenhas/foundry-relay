@@ -6,7 +6,7 @@ The server and tests are Titan. On POSIX, application modules and the Titan stan
 
 ## Build and test
 
-Use a prepared Titan installation containing `thread`, `http`, `websocket`, `sqlite3`, `json`, and `peg`, including channel endpoint transfer, portable demand reads, HTTP exchange transfer/disposal, and `Exchange:serve` header deadlines. The compiled `titan.test.Case`/`run` API, HTTP `Response:abort()`, and `--output` support are also required. GNU Make 4.3 or newer is required for grouped module outputs. `Makefile` builds on Linux and macOS; Windows uses [`Makefile.windows`](#windows-build). Builds and native coverage use `titanc` from `PATH`, without pinning a Titan source revision. Prepend another installation's `bin` directory to `PATH` to select its compiler and matching standard library.
+Use a prepared Titan installation containing `thread`, `http`, `websocket`, `sqlite3`, `json`, and `peg`, including channel endpoint transfer, portable demand reads, HTTP exchange transfer/disposal, and `Exchange:serve` header deadlines. The compiled `titan.test.Case`/`run` API, HTTP `Response:abort()`, compiler-owned incremental builds, native input switches, `--output`, `--exe`, and `--test-dir`/`--test-exclude` support are also required. `Makefile` builds on Linux and macOS; Windows uses [`Makefile.windows`](#windows-build). Builds and native coverage use `titanc` from `PATH`, without pinning a Titan source revision. Prepend another installation's `bin` directory to `PATH` to select its compiler and matching standard library.
 
 ```sh
 export PATH=/path/to/titan-prefix/bin:$PATH
@@ -17,9 +17,9 @@ make test TEST_ARGS="--filter='^tests[.]integration_test'"
 
 The POSIX build defaults to `OPENSSL_MODE=system`, matching Titan's default SDK.
 Install OpenSSL 3.0 or newer development files and `pkg-config`; the build adds
-`pkg-config --cflags --libs openssl` to the corresponding compiler and linker
-inputs while preserving caller-supplied `TITAN_EXTRA_CPPFLAGS` and
-`TITAN_EXTRA_LDFLAGS`. Set `PKG_CONFIG=/path/to/pkg-config` if needed. The
+`pkg-config --cflags --libs openssl` as explicit `titanc` native switches.
+Caller-supplied `TITAN_EXTRA_CPPFLAGS`, `TITAN_EXTRA_CFLAGS`, and
+`TITAN_EXTRA_LDFLAGS` remain ambient compiler inputs. Set `PKG_CONFIG=/path/to/pkg-config` if needed. The
 resulting executable embeds Titan's standard provider and uses the system
 OpenSSL libraries at runtime.
 
@@ -29,11 +29,15 @@ the OpenSSL objects already carried by the SDK and does not invoke `pkg-config`.
 `OPENSSL_MODE` must match the installed SDK; it does not rebuild or reconfigure
 that SDK.
 
-`build/foundry-relay` is the server. `build/relay-tests` is one native `titan.test` runner containing every `tests/*_test.titan` module (`TEST_ROOTS` in `Makefile`). All compiler-generated files live under `build`, preserving the source hierarchy, and builds compile authored sources in place.
+`build/foundry-relay` is the server. `build/relay-tests` is one native `titan.test` runner selected with `--tree . --test-dir tests`, including every `tests/*_test.titan` module. Generated module C, headers, and objects preserve the source hierarchy under `build`; target-specific runner and entrypoint files live under `build/.titan-links/<key>/synthetic/`. Builds compile authored sources in place.
 
-Both images use `--static --incremental --output build`. Make compiles each changed module separately with `-c`, then links from the current objects, so an unchanged `make` compiles and links nothing. Only `tests/` modules are compiled with `--test`; the application and the runner share the same production objects and compiled Titan standard provider. `Makefile.modules` records each module's project imports so an edited producer rebuilds its consumers; keep it current when adding or renaming modules or changing imports. A configuration stamp under `build` tracks the source inventory and caller settings, and compiler, SDK, provider, native tool, and OpenSSL files are ordinary Make prerequisites, so replacing the SDK or changing flags rebuilds the shared objects. `make clean` removes `build`.
+Both images use `--static --incremental --output build`, with `--exe` selecting their final paths. Make always invokes `titanc` for each requested image; the compiler owns import discovery, dependency scheduling, object certification, and final-link reuse. An unchanged build compiles and links nothing. The application and runner share unchanged production objects and the compiled Titan standard provider. There is no project module graph or configuration stamp to maintain when adding sources, changing imports, or updating the SDK or native flags. `make clean` removes `build`.
 
-`TITANC=/absolute/path/bin/titanc` selects a compiler and its SDK prefix. `TITAN_STDLIB=/absolute/path/lib/titan/0.6` overrides the standard-provider directory; the test command also supplies it to child fixtures through `TITAN_PATH_0_6`. `TITAN_JOBS` (default 2) bounds parallel C compilation inside each `titanc` call. On a restricted development host, set `CCACHE_DIR` to a writable location; `TITAN_PROBE_CACHE_DISABLE=1` keeps persistent native-header probes from writing to an immutable SDK and is also useful after a failed sandboxed probe.
+The compiler keeps a disposable precise-stat digest cache at `build/.titan/digests`, separate from object and link certificates. Missing or malformed cache data is ignored; inputs without matching precise observations are read again. Keep source-root spelling consistent between invocations: different `--tree` spellings can change generated source locations and legitimately miss. Incompatible configurations should use separate output trees.
+
+Use `make TITANC="titanc -v"` for native command echoes and object/native/link decisions on stderr. Capture both streams for a complete build log, for example `make TITANC="titanc -v" 2>&1 | tee build.log`. The compiler also sends worker output and diagnostics to stderr.
+
+`TITANC=/absolute/path/bin/titanc` selects a compiler and its SDK prefix. `TITAN_STDLIB=/absolute/path/lib/titan/0.6` overrides the standard-provider directory; the test command also supplies it to child fixtures through `TITAN_PATH_0_6`. `TITAN_JOBS` (default 2) bounds compiler workers and native compilation inside each `titanc` call. On a restricted development host, set `CCACHE_DIR` to a writable location; `TITAN_PROBE_CACHE_DISABLE=1` keeps persistent native-header probes from writing to an immutable SDK and is also useful after a failed sandboxed probe.
 
 `make test` runs the suite under `timeout 300s` by default and passes `TEST_ARGS` to the runner. `TEST_TIMEOUT=<seconds>` overrides the POSIX test and coverage execution budget, including optional installed-Chromium checks. Both need a `timeout` command on `PATH`, such as GNU coreutils'; macOS does not ship one. It sets `RELAY_TEST_EXECUTABLE`, so `tests/process_test.titan` can run a relocated copy of the server without the compiler or Titan provider on its search paths and stop it with SIGTERM. Optional capabilities enable more cases:
 
@@ -167,7 +171,7 @@ make -f Makefile.windows PREFIX=/c/Titan/sdk
 make -f Makefile.windows test PREFIX=/c/Titan/sdk
 ```
 
-Windows builds use a launcher EXE and application DLL. The application payload is `build/windows/app`: run `bin/foundry-relay.exe` and retain the entire `bin`, `lib`, and license layout. Its six runtime DLLs live beside the EXE; `lib/titan/0.6` contains the application and Titan standard providers. The payload contains no Titan compiler. The build copies runtime files from the SDK and does not modify that SDK. Application and test links use `--incremental --output` and share the generated objects under `build/windows/out`, with module dependencies and SDK/settings invalidation as on POSIX. Final compiler outputs are copied into the application and test payloads.
+Windows builds use a launcher EXE and application DLL. The application payload is `build/windows/app`: run `bin/foundry-relay.exe` and retain the entire `bin`, `lib`, and license layout. Its six runtime DLLs live beside the EXE; `lib/titan/0.6` contains the application and Titan standard providers. The payload contains no Titan compiler. The build copies runtime files from the SDK and does not modify that SDK. Application and test builds always invoke `titanc --incremental --output`, sharing compiler-certified objects under `build/windows/out`. `--exe` selects the two launchers under that tree's `bin`; the launchers and providers are then copied into the application and test payloads. Test roots are discovered with `--test-dir tests --test-exclude tests.process_test`; the explicit `tests.router_test` root preserves the packaged test provider's identity.
 
 The Windows test runner contains every test module except `tests/process_test.titan`. The test target runs `scripts/check-windows.ps1`, which audits every shipped PE image for unexpected regular or delay-loaded imports. It then copies the application to a Unicode path on local NTFS and runs it from another working directory, with `PATH` reduced to the Windows system directories and the Lua and Titan search variables removed. The script checks health, pairing, authenticated client listing, and credential-free JSON logs, then ends the application with `Process.Kill`; server shutdown is covered by the native tests instead. Finally it runs the native suite, passing `RELAY_TEST_OPENSSL` and `RELAY_TEST_CHROME` through and placing browser profiles in its scratch directory. Production sessions call OpenSSL directly. PowerShell script execution must be permitted by local policy; the target does not change that policy.
 
