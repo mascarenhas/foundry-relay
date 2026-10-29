@@ -1,9 +1,10 @@
 # Run from an MSYS2 CLANG64 shell with a prepared native Windows Titan SDK.
 # Use a local NTFS checkout distinct from the Unix source/object tree.
 PREFIX ?= /c/Titan/sdk
-TITAN_LUA := $(abspath $(PREFIX))/bin/lua.exe
-TITAN_COMPILER := $(abspath $(PREFIX))/lib/luarocks/rocks-5.5/titan/0.6.0-1/bin/titanc
-TITANC = "$(TITAN_LUA)" "$(WINDOWS_PREFIX)/lib/luarocks/rocks-5.5/titan/0.6.0-1/bin/titanc"
+# The Windows SDK ships the compiler as its own program and keeps the frontend
+# script under share/lua/5.5/titan-compiler; the program resolves it itself.
+TITAN_COMPILER := $(abspath $(PREFIX))/bin/titanc.exe
+TITANC = "$(WINDOWS_PREFIX)/bin/titanc.exe"
 TITAN_JOBS := 1
 WINDOWS_ROOT := $(shell cygpath -m "$(abspath .)")
 WINDOWS_PREFIX := $(shell cygpath -m "$(abspath $(PREFIX))")
@@ -19,7 +20,7 @@ export AR := llvm-ar
 export RANLIB := llvm-ranlib
 export RC := llvm-rc
 export MSYS2_ARG_CONV_EXCL := *
-export TITAN_ROCKS_ROOT := $(WINDOWS_PREFIX)
+export TITAN_ROOT := $(WINDOWS_PREFIX)
 export TITAN_RUNTIME_PREBUILT := 1
 export TITAN_PROBE_CACHE_DISABLE := 1
 export TITAN_PATH_0_6 := $(WINDOWS_PREFIX)/lib/titan/0.6
@@ -30,7 +31,7 @@ export TITAN_PATH_0_6 := $(WINDOWS_PREFIX)/lib/titan/0.6
 
 require-clang64:
 	test "$(MSYSTEM)" = CLANG64
-	test -f "$(TITAN_LUA)" -a -f "$(TITAN_COMPILER)" -a -f "$(PREFIX)/lib/titan/0.6/titan.dll"
+	test -f "$(TITAN_COMPILER)" -a -f "$(PREFIX)/lib/titan/0.6/titan.dll"
 
 # Both final images share compiler-owned objects, but keep relocatable payloads.
 all: require-clang64
