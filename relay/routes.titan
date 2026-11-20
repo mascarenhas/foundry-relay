@@ -22,6 +22,6 @@ function create(): router.Router
     router.Route("GET", "/actor/subscribe", "sse:actor-events"),
     router.Route("GET", "/scene/subscribe", "sse:scene-events") }
   -- Specific local routes precede the upstream route table.
-  for i = 1, #declarations do local_routes[#local_routes + 1] = declarations[i] end
+  for index = 1, #declarations do local_routes[#local_routes + 1] = declarations[index] end
   return router.Router(local_routes)
 end

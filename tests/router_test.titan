@@ -36,8 +36,11 @@ function test_not_found_and_method_not_allowed(_context: test.Context)
   })
   local rejected = routes:match("DELETE", "/resource/one")
   test.assert(rejected.status == 405 and rejected.match == nil)
+  test.assert(rejected.allowed is const {string}, "405 allowed methods were not const")
   test.assert(#rejected.allowed == 2, "allowed methods were not deduplicated")
   test.assert(router.allow_header(rejected.allowed) == "GET, POST")
+  local ok = routes:match("GET", "/resource/one")
+  test.assert(ok.allowed is const {string} and #ok.allowed == 0, "200 allowed methods were not empty const")
   test.assert(routes:match("GET", "/missing").status == 404)
   test.assert(routes:match("GET", "/resource/").status == 404)
 end
@@ -74,9 +77,19 @@ end
 
 function test_decoding_distinguishes_path_plus(_context: test.Context)
   local parsed = router.parse_target("/a+b?literal=a%2Bb&form=a+b")
+  test.assert(parsed.segments is const {string}, "target segments were not const")
   test.assert(parsed.segments[1] == "a+b")
   test.assert(parsed.query["literal"] == "a+b")
   test.assert(parsed.query["form"] == "a b")
+end
+
+function test_percent_decode_fast_path_and_escapes(_context: test.Context)
+  test.assert(router.percent_decode("") == "")
+  test.assert(router.percent_decode("plain-ASCII_123+ok") == "plain-ASCII_123+ok")
+  test.assert(router.percent_decode("plain-ASCII", true) == "plain-ASCII")
+  test.assert(router.percent_decode("a+b%20c+d", true) == "a b c d")
+  test.assert(router.percent_decode("%2Fedge%2F", false) == "/edge/")
+  test.assert(router.percent_decode("prefix%20middle%2B") == "prefix middle+")
 end
 
 local function malformed_case(context: test.Context, name: string, target: string)
