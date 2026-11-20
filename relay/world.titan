@@ -38,8 +38,20 @@ record Bootstrap
   const log_lines: thread.Sender<|string|>?
 end
 
+local const event_channels: {string: string} = {
+  ["chat-event"] = "chat-events",
+  ["roll-data"] = "roll-events",
+  ["hook-event"] = "hooks",
+  ["combat-event"] = "combat-events",
+  ["actor-event"] = "actor-events",
+  ["scene-event"] = "scene-events",
+}
+
 local const message_types: {string: boolean}?
 local function message_type(kind: string): string return message_types[kind] and kind or "unknown" end
+
+local function noop_stop() end
+local function noop_close(_: function (): async.SubscriptionBatch<|Outgoing|>) end
 
 local record Pending
   const job: protocol.WorldRequest
@@ -88,9 +100,9 @@ end
 local function Engine.new(bootstrap: Bootstrap, connection: websocket.Connection, logger: log.Logger?): Engine
   local publish: (function (Outgoing): boolean)? = nil
   local finish: (function (): boolean)? = nil
-  local outbox = async.BufferedSubscription<|Outgoing, string|>(function (p, _fail, f)
+  local outbox = async.BufferedSubscription<|Outgoing, string|>(function (p, _, f)
     publish = p; finish = f
-    return async.SubscriptionActions<|Outgoing|>(function () end, function (_drain) end)
+    return async.SubscriptionActions<|Outgoing|>(noop_stop, noop_close)
   end)
   return {bootstrap = bootstrap, connection = connection, pending = {}, targets = {}, counts = {},
     outbox = outbox, publish = publish, finish = finish, logger = logger, writer = nil,
@@ -119,12 +131,12 @@ local function Engine:quiesce()
     local code? = self.connection:close_status()
     log.emit(self.logger, "info", "websocket_disconnected", {["client_id"] = self.bootstrap.handle.client_id, ["close_code"] = code})
     self.finish()
-    for _, pending in iteration.pairs(self.pending) do
-      pending:complete(503, wire.error_body("Foundry world disconnected"))
-    end
     -- Detach all queued mutations before any retirement can yield.
+    local disconnected: string? = nil
     for id, pending in iteration.pairs(self.pending) do
+      if not disconnected then disconnected = wire.error_body("Foundry world disconnected") end
       self.pending[id] = nil
+      pending:complete(503, disconnected)
       retired[#retired + 1] = pending
     end
     self.count = 0
@@ -267,7 +279,7 @@ end
 local function Engine:command_loop(): nil
   for _, command in self.bootstrap.commands:incoming() do
     case command
-    when quiesce(_reason, ack) then
+    when quiesce(_, ack) then
       self:quiesce()
       do ack:try_send(true) catch end
     when stop(graceful) then
@@ -295,16 +307,6 @@ catch
   return nil
 end
 
-local function event_channel(kind: string): string?
-  if kind == "chat-event" then return "chat-events" end
-  if kind == "roll-data" then return "roll-events" end
-  if kind == "hook-event" then return "hooks" end
-  if kind == "combat-event" then return "combat-events" end
-  if kind == "actor-event" then return "actor-events" end
-  if kind == "scene-event" then return "scene-events" end
-  return nil
-end
-
 local function Engine:receive(text: string)
   if not self.admitting then return end
   local message = wire.object(text)
@@ -312,7 +314,7 @@ local function Engine:receive(text: string)
   local id = self.bootstrap.handle.client_id
   log.emit(self.logger, "debug", "websocket_message_received", {["client_id"] = id, ["type"] = message_type(kind), ["bytes"] = #text})
   if kind == "ping" then self:enqueue("{\"type\":\"pong\"}", nil, "pong"); return end
-  local channel? = event_channel(kind)
+  local channel? = event_channels[kind]
   if channel then
     local dropped: {protocol.SubscriptionTarget} = {}
     for key, target in iteration.pairs(self.targets) do
@@ -328,9 +330,8 @@ local function Engine:receive(text: string)
     end
     if #dropped > 0 then self:notify(channel, (self.counts[channel] or #dropped) - #dropped) end
     for index = 1, #dropped do
-      local target = dropped[index]
-      control.notify(self.bootstrap.coordinator, self.bootstrap.worker_id, "drop-subscription",
-        wire.encode({["key"] = target.key}), nil, nil)
+      control.notify(self.bootstrap.coordinator, self.bootstrap.worker_id,
+        messages.ControlAction.unsubscribe(dropped[index].key))
     end
     return
   end
@@ -350,23 +351,20 @@ local function Engine:read_loop()
   while not self.closed do
     local kind?, data? = self.connection:read()
     if not kind then return end
-    if kind ~= websocket.TEXT then
+    case kind
+    when text() then self:receive(data)
+    else
       log.emit(self.logger, "error", "websocket_failed", {["client_id"] = self.bootstrap.handle.client_id, ["reason"] = "text_messages_required"})
       return
     end
-    self:receive(data)
   end
 catch self:log_failure("message_or_transport_failed", error)
 end
 
-local function origin_allowed(request: http.Request, settings: config.Config): boolean
-  local origins = request.headers:values("Origin")
-  if #origins == 0 then return true end
-  if #origins ~= 1 then return false end
-  local origin = origins[1]
-  if origin == request.url.scheme .. "://" .. request.url.authority then return true end
-  for index = 1, #settings.origins do if origin == settings.origins[index] then return true end end
-  return false
+local function reject_auth(connection: websocket.Connection, logger: log.Logger?)
+  log.emit(logger, "info", "websocket_authentication_rejected")
+  connection:write(websocket.TEXT, "{\"type\":\"auth-failed\",\"error\":\"invalid pairing token\"}")
+  connection:shutdown(1008, "authentication failed", 1000)
 end
 
 local function execute(bootstrap: Bootstrap, logger: log.Logger?): nil
@@ -389,7 +387,11 @@ local function execute(bootstrap: Bootstrap, logger: log.Logger?): nil
   defer exchange:close()
   local request = exchange.request
   local response = exchange.response
-  if not origin_allowed(request, bootstrap.settings) then router.error_response(response, 403, "origin is not allowed"); return nil end
+  if not bootstrap.settings:request_origin_allowed(request.headers:values("Origin"),
+      request.url.scheme, request.url.authority) then
+    router.error_response(response, 403, "origin is not allowed")
+    return nil
+  end
   local connection = websocket.accept(request, response, websocket.AcceptOptions {
     allowed_origins = bootstrap.settings.origins, read_limit = 16777216, handshake_timeout = bootstrap.settings.auth_timeout})
   defer connection:close()
@@ -403,7 +405,9 @@ local function execute(bootstrap: Bootstrap, logger: log.Logger?): nil
   defer tasks.drain(deadline)
   local kind?, text? = connection:read()
   if not kind then return nil end
-  if kind ~= websocket.TEXT then
+  case kind
+  when text() then
+  else
     log.emit(logger, "error", "websocket_failed", {["reason"] = "authentication_requires_text"}); return nil
   end
   log.emit(logger, "debug", "websocket_message_received", {["type"] = "authentication", ["bytes"] = #text})
@@ -411,25 +415,22 @@ local function execute(bootstrap: Bootstrap, logger: log.Logger?): nil
   local token = wire.text(auth, "token")
   local client? = database:authenticate(bootstrap.handle.client_id, token)
   if wire.text(auth, "type") ~= "auth" or not client then
-    log.emit(logger, "info", "websocket_authentication_rejected")
-    connection:write(websocket.TEXT, "{\"type\":\"auth-failed\",\"error\":\"invalid pairing token\"}")
-    connection:shutdown(1008, "authentication failed", 1000); return nil
+    reject_auth(connection, logger)
+    return nil
   end
   tasks.drain(deadline)
   database:update(client.client_id, client.world_id, opening.world_title ~= "" and opening.world_title or client.world_title,
     opening.module_version, opening.metadata_json)
-  local published = control.call(bootstrap.coordinator, bootstrap.worker_id, "auth-publish",
-    wire.encode({["id"] = client.client_id, ["token"] = token}), bootstrap.handle, nil)
-  if published.status ~= 200 or not engine.admitting then
-    if engine.admitting then
-      log.emit(logger, "info", "websocket_authentication_rejected")
-      connection:write(websocket.TEXT, "{\"type\":\"auth-failed\",\"error\":\"invalid pairing token\"}")
-      connection:shutdown(1008, "authentication failed", 1000)
-    end
+  local published = control.call(bootstrap.coordinator, bootstrap.worker_id,
+    messages.ControlAction.auth_publish(bootstrap.handle, token))
+  local activation: protocol.Activation? = nil
+  case published
+  when published(snapshot) then activation = snapshot
+  else
+    if engine.admitting then reject_auth(connection, logger) end
     return nil
   end
-  local activation = published.activation
-  if not activation then raise "World activation is missing" end
+  if not engine.admitting then return nil end
   for index = 1, #activation.targets do
     local target = activation.targets[index]
     if not target.events:is_closed() then engine.targets[target.key] = target end

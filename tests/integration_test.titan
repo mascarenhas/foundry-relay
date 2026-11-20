@@ -599,3 +599,54 @@ function test_session_headers_are_allowed_by_cors(_context: test.Context)
     test.assert(string.find(allowed, "X-Username") ~= nil and string.find(allowed, "X-World-Name") ~= nil)
   end)
 end
+
+function test_client_active_endpoint_reports_online_status(_context: test.Context)
+  with_relay(function(fixture)
+    test.assert(call(fixture, "GET", "/api/clients/unknown/active").status == 404)
+    local credentials = pair(fixture, "world")
+    local offline = call(fixture, "GET", "/api/clients/" .. credentials.id .. "/active")
+    test.assert(offline.status == 200 and wire.object(offline.body)["active"] == false)
+    local world = dial(fixture, credentials)
+    defer world:close()
+    local online = call(fixture, "GET", "/api/clients/" .. credentials.id .. "/active")
+    test.assert(online.status == 200 and wire.object(online.body)["active"] == true)
+    world:close()
+    while fixture.instance.worlds:online(credentials.id) do timer.yield() end
+    local after = call(fixture, "GET", "/api/clients/" .. credentials.id .. "/active")
+    test.assert(after.status == 200 and wire.object(after.body)["active"] == false)
+  end)
+end
+
+function test_sse_event_names_sanitize_line_breaks(_context: test.Context)
+  with_relay(function(fixture)
+    local credentials = pair(fixture, "world")
+    local world = dial(fixture, credentials)
+    defer world:close()
+    local headers = http.headers({http.Header("x-api-key", api_key)})
+    local hooks = http.get("http://127.0.0.1:" .. fixture.port .. "/hooks/subscribe?clientId=" .. credentials.id,
+      http.RequestOptions { headers = headers })
+    defer hooks:close()
+    test.assert(hooks.status == 200)
+    hooks:read_until("\n\n", true)
+    test.assert(message(world)["count"] == 1)
+    local hook_event: {string: value} = {["type"] = "hook-event",
+      ["data"] = {["hook"] = "bad\nname"}}
+    world:write(websocket.TEXT, wire.encode(hook_event))
+    local hook_frame = hooks:read_until("\n\n", true)
+    test.assert(string.sub(hook_frame, 1, 13) == "event: event\n",
+      "unsafe hook event name did not fall back to generic event")
+    local chat = http.get("http://127.0.0.1:" .. fixture.port .. "/chat/subscribe?clientId=" .. credentials.id,
+      http.RequestOptions { headers = headers })
+    defer chat:close()
+    test.assert(chat.status == 200)
+    chat:read_until("\n\n", true)
+    test.assert(message(world)["count"] == 1)
+    local chat_event: {string: value} = {["type"] = "chat-event",
+      ["data"] = {["eventType"] = "bad\r\ntype"}}
+    world:write(websocket.TEXT, wire.encode(chat_event))
+    local chat_frame = chat:read_until("\n\n", true)
+    test.assert(string.sub(chat_frame, 1, 12) == "event: chat\n",
+      "unsafe chat eventType did not fall back to channel prefix")
+    fixture.instance.worlds:close()
+  end)
+end

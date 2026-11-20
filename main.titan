@@ -8,7 +8,7 @@ local log = import "relay.log"
 local function run(logger: log.Logger, phase: string): integer
   local settings = config.load()
   phase = "database_or_session_initialization_failed"
-  local relay = server.Server(settings, nil, nil, logger)
+  local relay = server.Server { settings = settings, logger = logger }
   defer relay:close()
   phase = "listener_start_failed"
   relay:start()

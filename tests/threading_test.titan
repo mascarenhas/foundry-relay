@@ -271,10 +271,14 @@ function test_cancelled_subscription_reply_retires_its_unpublished_owner(context
   defer rx:close()
   rx:close()
   local id = "closed-subscription-reply"
-  fixture.instance.controls:send(messages.ControlRequest(id, 1, "subscribe",
-    wire.encode({["clientId"] = credential.id, ["channel"] = "chat-events"}), nil, nil, tx))
-  local barrier = control.call(fixture.instance.controls, 1, "online", "{}", nil, nil)
-  test.assert(barrier.status == 200 and fixture.instance.unclaimed[id] == nil)
+  fixture.instance.controls:send(messages.ControlRequest(id, 1,
+    messages.ControlAction.subscribe(credential.id, "chat-events"), tx))
+  local barrier = control.call(fixture.instance.controls, 1, messages.ControlAction.online())
+  local online_ok = false
+  case barrier
+  when online_ids() then online_ok = true
+  end
+  test.assert(online_ok and fixture.instance.unclaimed[id] == nil)
   test.assert(#fixture.instance.worlds:subscription_snapshot(credential.id).targets == 0,
               "failed reply publication leaked its subscription")
 end
@@ -288,17 +292,25 @@ function test_cancel_after_queued_subscription_reply_retires_unclaimed_owner(con
   defer tx:close()
   defer rx:close()
   local id = "abandoned-subscription-reply"
-  fixture.instance.controls:send(messages.ControlRequest(id, 1, "subscribe",
-    wire.encode({["clientId"] = credential.id, ["channel"] = "chat-events"}), nil, nil, tx))
-  local receiving = async.run<|messages.ControlReply, value|>(function(): messages.ControlReply return rx:receive() end)
+  fixture.instance.controls:send(messages.ControlRequest(id, 1,
+    messages.ControlAction.subscribe(credential.id, "chat-events"), tx))
+  local receiving = async.run<|messages.ControlReply, value|>(rx:receive)
   defer tasks.drain(receiving)
   local offered = bounded(receiving, "coordinator did not offer its subscription")
-  test.assert(offered.subscription ~= nil and fixture.instance.unclaimed[id] ~= nil,
+  local got_subscription = false
+  case offered
+  when subscribed() then got_subscription = true
+  end
+  test.assert(got_subscription and fixture.instance.unclaimed[id] ~= nil,
               "reply publication did not retain the unclaimed subscription owner")
   rx:close()
-  fixture.instance.controls:send(messages.ControlRequest(id, 1, "cancel", "{}", nil, nil, nil))
-  local barrier = control.call(fixture.instance.controls, 1, "online", "{}", nil, nil)
-  test.assert(barrier.status == 200 and fixture.instance.unclaimed[id] == nil)
+  fixture.instance.controls:send(messages.ControlRequest(id, 1, messages.ControlAction.cancel(), nil))
+  local barrier = control.call(fixture.instance.controls, 1, messages.ControlAction.online())
+  local online_ok = false
+  case barrier
+  when online_ids() then online_ok = true
+  end
+  test.assert(online_ok and fixture.instance.unclaimed[id] == nil)
   test.assert(#fixture.instance.worlds:subscription_snapshot(credential.id).targets == 0,
               "cancel after publication leaked an unclaimed subscription")
 end
@@ -319,8 +331,10 @@ local function cancelled_security_transition(context: test.Context, operation: s
   defer tx:close()
   defer rx:close()
   local id = "cancelled-security-" .. operation
-  fixture.instance.controls:send(messages.ControlRequest(id, 1, operation,
-    wire.encode({["clientId"] = credential.id, ["token"] = credential.token}), nil, nil, tx))
+  local action: messages.ControlAction? = nil
+  if operation == "revoke" then action = messages.ControlAction.revoke(credential.token)
+  else action = messages.ControlAction.delete_client(credential.id) end
+  fixture.instance.controls:send(messages.ControlRequest(id, 1, action, tx))
   local admitted = async.run<|nil, value|>(function(): nil
     while #database.waiters == 0 do timer.yield() end
     return nil
