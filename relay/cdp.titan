@@ -2,7 +2,7 @@
 local websocket = import "websocket"
 local async = import "async"
 local timer = import "timer"
-local hub = import "relay.hub"
+local tasks = import "relay.tasks"
 local wire = import "relay.wire"
 
 local record Failure
@@ -36,7 +36,10 @@ local function Connection:exchange(request: string, id: integer,
   while true do
     local kind?, contents? = self.stream:read()
     if not kind then raise Failure("CDP connection closed") end
-    if kind ~= websocket.TEXT then raise Failure("Invalid CDP response") end
+    case kind
+    when text() then
+    else raise Failure("Invalid CDP response")
+    end
     local envelope = wire.object(contents)
     local reply_id? = envelope["id"]
     if reply_id ~= nil then
@@ -47,10 +50,11 @@ local function Connection:exchange(request: string, id: integer,
         raise Failure("Unexpected CDP session")
       end
       if envelope["error"] ~= nil then raise Failure("CDP command rejected") end
-      if not (envelope["result"] is {string: value}) then
+      local result? = envelope["result"]
+      if not (result is {string: value}) then
         raise Failure("Invalid CDP result")
       end
-      return envelope["result"]
+      return result
     end
     -- Notifications are not queued: the session observes readiness explicitly.
     if not (envelope["method"] is string) then raise Failure("Invalid CDP notification") end
@@ -79,7 +83,7 @@ function Connection:call(method: string, params: {string: value},
     self:abort()
     return nil
   end)
-  defer hub.drain(deadline)
+  defer tasks.drain(deadline)
   do
     return self:exchange(request, id, session_id)
   catch
@@ -102,7 +106,8 @@ function Connection:evaluate(expression: string, session_id: string,
     ["returnByValue"] = true, ["timeout"] = timeout_ms or 10000 }
   local response = self:call("Runtime.evaluate", params, session_id, timeout_ms)
   if response["exceptionDetails"] ~= nil then raise "CDP evaluation failed" end
-  if not (response["result"] is {string: value}) then raise "Invalid CDP evaluation result" end
-  local result: {string: value} = response["result"]
+  local raw? = response["result"]
+  if not (raw is {string: value}) then raise "Invalid CDP evaluation result" end
+  local result: {string: value} = raw
   return result["value"]
 end

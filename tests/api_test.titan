@@ -26,6 +26,17 @@ end
 function test_catalog_is_complete(context: test.Context)
   local endpoints = api.definitions()
   test.assert(#endpoints == 91, "forwarding endpoint coverage changed")
+  test.assert(endpoints is const {api.Endpoint}, "catalog array is not const")
+  test.assert(api.is_known_action("entity") and api.is_known_action("use-item"),
+              "known action check rejected valid actions")
+  test.assert(not api.is_known_action("nonexistent-action"),
+              "known action check accepted an unknown action")
+  test.assert(api.endpoint_for("POST /upload"):is_upload(),
+              "upload endpoint did not report is_upload()")
+  test.assert(not api.endpoint_for("GET /get"):is_upload(),
+              "standard endpoint reported is_upload()")
+  test.assert(not api.endpoint_for("GET /download"):is_upload(),
+              "download endpoint reported is_upload()")
   local routes = router.Router(api.routes())
   for index = 1, #endpoints do
     local endpoint = endpoints[index]
@@ -37,8 +48,6 @@ function test_catalog_is_complete(context: test.Context)
   local macro = routes:match("POST", "/macro/Macro.test/execute")
   test.assert(macro.match.params["uuid"] == "Macro.test")
   test.assert(api.endpoint_for(macro.match.action).action == "macro-execute")
-  endpoints[1] = nil
-  test.assert(#api.definitions() == 91, "catalog array was exposed for mutation")
 end
 
 function test_query_coercion_preserves_false(_context: test.Context)

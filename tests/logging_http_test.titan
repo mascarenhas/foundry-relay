@@ -12,7 +12,7 @@ local server = import "relay.server"
 local config = import "relay.config"
 local sessions = import "relay.sessions"
 local wire = import "relay.wire"
-local hub = import "relay.hub"
+local tasks = import "relay.tasks"
 local integration = import "tests.integration_test.titan"
 
 local record Capture
@@ -22,7 +22,7 @@ end
 
 local function capture(level: string): Capture
   local lines: {string} = {}
-  local logger = log.Logger.new(level, function(line: string)
+  local logger = log.Logger(level, function(line: string)
     lines[#lines + 1] = line
   end)
   return Capture(logger, lines)
@@ -122,12 +122,12 @@ local function wait_event(recording: Capture, event: string)
     while event_count(recording, event) == 0 do timer.yield() end
     return nil
   end)
-  defer hub.drain(observed)
+  defer tasks.drain(observed)
   local deadline = async.run<|nil, value|>(function (): nil
     timer.sleep(3000)
     return nil
   end)
-  defer hub.drain(deadline)
+  defer tasks.drain(deadline)
   case async.any_two(observed, deadline)
   when first() then
   when second() then raise "expected log event did not arrive"
@@ -140,7 +140,7 @@ local function validate_lines(recording: Capture, level: string, secrets: {strin
   for index = 1, #recording.lines do
     local line = recording.lines[index]
     test.assert(string.sub(line, -1) == "\n", "log record is not newline terminated")
-    test.assert(not string.find(string.sub(line, 1, -2), "\n", 1, true),
+    test.assert(not string.find(string.sub(line, 1, -2), "\n", 1),
                 "log record spans multiple physical lines")
     local fields = wire.object(line)
     test.assert(wire.text(fields, "event") ~= "", "log record omitted its event")
@@ -150,7 +150,7 @@ local function validate_lines(recording: Capture, level: string, secrets: {strin
     if level == "info" then test.assert(severity ~= "debug", "info emitted a debug event") end
     if level == "error" then test.assert(severity == "error", "error emitted an info/debug event") end
     for secret = 1, #secrets do
-      test.assert(not string.find(line, secrets[secret], 1, true),
+      test.assert(not string.find(line, secrets[secret], 1),
                   "log record leaked request, credential, or WebSocket content")
     end
   end
@@ -177,8 +177,8 @@ function test_info_logs_api_admission_and_world_lifecycle_without_contents(_cont
                                integration.api_key).status == 400)
   test.assert(integration.call(fixture, "OPTIONS", "/LEAK_PREFLIGHT_PATH", nil, nil).status == 204)
   local rejected = http.get("http://127.0.0.1:" .. fixture.port .. "/clients",
-    http.headers({http.Header("Origin", "https://LEAK_ORIGIN.invalid"),
-                  http.Header("Authorization", "Bearer LEAK_HEADER")}))
+    http.RequestOptions { headers = http.headers({http.Header("Origin", "https://LEAK_ORIGIN.invalid"),
+                  http.Header("Authorization", "Bearer LEAK_HEADER")}) })
   defer rejected:close()
   test.assert(rejected.status == 403)
   integration.read_all(rejected)
@@ -234,7 +234,7 @@ function test_debug_logs_forwarding_and_websocket_metadata_without_payloads(_con
   local world = integration.dial(fixture, credentials)
   defer world:close()
   local pending = integration.request(fixture, "/world-info?clientId=" .. credentials.id)
-  defer hub.drain(pending)
+  defer tasks.drain(pending)
   local requested = integration.message(world)
   integration.answer(world, requested, {["result"] = "LEAK_RESULT_BODY"})
   test.assert(integration.await_reply(pending).status == 200)
@@ -281,7 +281,7 @@ function test_error_logs_timeout_and_protocol_failure_without_raw_errors(_contex
   local world = integration.dial(fixture, credentials)
   defer world:close()
   local pending = integration.request(fixture, "/world-info?clientId=" .. credentials.id)
-  defer hub.drain(pending)
+  defer tasks.drain(pending)
   integration.message(world)
   test.assert(integration.await_reply(pending).status == 408)
   world:write(websocket.TEXT, "LEAK_MALFORMED_JSON")
@@ -304,7 +304,7 @@ function test_sse_request_is_logged_while_its_response_remains_open(_context: te
   local world = integration.dial(fixture, integration.pair(fixture, "world"))
   defer world:close()
   local stream = http.get("http://127.0.0.1:" .. fixture.port .. "/chat/subscribe",
-    http.headers({http.Header("x-api-key", integration.api_key)}))
+    http.RequestOptions { headers = http.headers({http.Header("x-api-key", integration.api_key)}) })
   defer stream:close()
   test.assert(stream.status == 200)
   test.assert(stream:read_until("\n\n", true) ~= nil)
@@ -336,7 +336,7 @@ local function close_during_heartbeat(close_payload: string)
     fixture.port .. "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ..
     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
   local opening? = connection:read_until("\r\n\r\n", true)
-  test.assert(opening ~= nil and string.find(opening, "HTTP/1.1 101", 1, true) == 1)
+  test.assert(opening ~= nil and string.find(opening, "HTTP/1.1 101", 1) == 1)
   local peer = RawPeer(connection, "")
   peer:send(1, wire.encode({["type"] = "auth", ["token"] = credentials.token}))
   local received_ping = false

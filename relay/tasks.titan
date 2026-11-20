@@ -7,7 +7,7 @@ function await_terminal<|T|>(task: async.Task<|T, value|>)
   defer if remove then remove() end
   async.await_cleanup<|nil, nil|>(function (resolve, _reject, _fatal)
     if task:status():has_finished() then resolve(nil)
-    else remove = task:add_terminal_listener(function (_status) resolve(nil) end)
+    else remove = task:add_terminal_listener(function (_) resolve(nil) end)
     end
   end)
 end
@@ -15,4 +15,13 @@ end
 function drain<|T|>(task: async.Task<|T, value|>)
   if not task:status():has_finished() then task:cancel() end
   await_terminal(task)
+end
+
+function await_retirement(task: async.Task<|async.Error?, value|>, cancelled_message: string)
+  await_terminal(task)
+  case task:status()
+  when succeeded(failure) then if failure then failure:raise() end
+  when failed(failure) then failure:raise()
+  else raise cancelled_message
+  end
 end

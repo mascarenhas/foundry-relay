@@ -39,7 +39,7 @@ function Pool.new(size: integer?, logger: log.Logger?): Pool
   local count = size or 4
   if count < 1 then raise "reply pool size must be positive" end
   local leases: {Lease} = {}
-  for _ = 1, count do leases[#leases + 1] = Lease.new() end
+  for _ = 1, count do leases[#leases + 1] = Lease() end
   return { leases = leases, waiters = {}, logger = logger, closed = false }
 end
 
@@ -140,7 +140,9 @@ local function Pool:wait_reply(handle: protocol.WorldHandle, action: string,
       return reply(id, 408, "Foundry request timed out")
     end
     attempted = true
-    handle.requests:send(protocol.WorldRequest(id, action, encoded, deadline_ns, lease.sender))
+    handle.requests:send(protocol.WorldRequest {
+      request_id = id, action = action, payload_json = encoded,
+      deadline_ns = deadline_ns, reply = lease.sender })
     while true do
       if uv.hrtime() >= deadline_ns then
         return reply(id, 408, "Foundry request timed out")
@@ -188,24 +190,21 @@ local function Pool:wait_reply(handle: protocol.WorldHandle, action: string,
   when first(status) then
     case status
     when succeeded(received) then return received
-    when failed(failure) then raise failure
+    when failed(failure) then failure:raise()
     when cancelled(reason) then raise reason
     else raise "reply operation did not finish"
     end
   when second() then return reply(id, 408, "Foundry request timed out")
   when third() then return reply(id, 503, "Foundry world is offline")
   end
+  raise "reply operation did not finish"
 end
 
 function Pool:request(handle: protocol.WorldHandle, action: string,
                       payload: {string: value}, timeout_ms: integer): protocol.WorldReply
   local received = self:wait_reply(handle, action, payload, timeout_ms)
   if received.status == 408 then
-    local kind = "unknown"
-    local endpoints = api.definitions()
-    for index = 1, #endpoints do
-      if endpoints[index].action == action then kind = action; break end
-    end
+    local kind = api.is_known_action(action) and action or "unknown"
     -- Both the world deadline and this caller's deadline can expire first.
     -- The final returned result owns the event after transport cleanup ends.
     log.emit(self.logger, "error", "request_timeout", {

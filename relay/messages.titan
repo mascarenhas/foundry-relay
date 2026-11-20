@@ -2,22 +2,40 @@ local thread = import "thread"
 local world = import "relay.world_protocol"
 
 -- Coordinator requests contain data and channel endpoints, never a transport.
+union ControlAction
+  claim()
+  cancel()
+  unsubscribe(key: string)
+  session_discard(request_key: string)
+  auth_publish(world: world.WorldHandle, token: string)
+  online()
+  is_online(client_id: string)
+  select(client_id: string)
+  subscribe(client_id: string, channel: string)
+  revoke(token: string)
+  delete_client(client_id: string)
+  session_handshake(address: string, user: string, world: string)
+  session_start(request_key: string, body_json: string)
+  session_publish(request_key: string)
+  session_end(session_id: string)
+  session_list()
+end
+
+union ControlReply
+  ack()
+  response(status: integer, body: string)
+  online_ids(ids: const {string})
+  active(online: boolean)
+  selected(world: world.WorldHandle)
+  subscribed(world: world.WorldHandle, subscription: world.Subscription)
+  published(activation: world.Activation)
+end
+
 record ControlRequest
   const request_id: string
   const worker_id: integer
-  const operation: string
-  const body: string
-  const world: world.WorldHandle?
-  const subscription: world.Subscription?
+  const action: ControlAction
   const reply: thread.Sender<|ControlReply|>?
-end
-
-record ControlReply
-  const status: integer
-  const body: string
-  const world: world.WorldHandle?
-  const subscription: world.Subscription?
-  const activation: world.Activation?
 end
 
 -- The sender owns payload until enqueue succeeds. The queue then owns it until

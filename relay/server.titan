@@ -2,7 +2,6 @@ local http = import "http"
 local async = import "async"
 local thread = import "thread"
 local iteration = import "iteration"
-local string = import "string"
 local log = import "relay.log"
 local config = import "relay.config"
 local wire = import "relay.wire"
@@ -105,13 +104,10 @@ function Server.new(settings: config.Config, headless_options: sessions.Options?
   return result
 end
 
-local function reply(status: integer, body: string, selected: protocol.WorldHandle?,
-    subscription: protocol.Subscription?, activation: protocol.Activation?): messages.ControlReply
-  return messages.ControlReply(status, body, selected, subscription, activation)
-end
+local const ack_reply = messages.ControlReply.ack()
 
 local function error_reply(status: integer, text: string): messages.ControlReply
-  return reply(status, wire.error_body(text), nil, nil, nil)
+  return messages.ControlReply.response(status, wire.error_body(text))
 end
 
 local function Server:discard_provisional(key: string, worker_id: integer)
@@ -121,101 +117,98 @@ local function Server:discard_provisional(key: string, worker_id: integer)
   self.headless:discard(pending.entry)
 end
 
+local function Server:retire_credential(is_revoke: boolean, target: string): messages.ControlReply
+  async.checkpoint()
+  local response: messages.ControlReply? = nil
+  local failure: async.Error? = nil
+  -- An accepted native COMMIT can finish even when its waiter is cancelled.
+  -- Once admitted, the complete credential/disconnect transition owns its
+  -- lifetime independently of the API request that must wait for retirement.
+  local changing = async.run<|nil, value|>(function (): nil
+    local retired: hub.Session? = nil
+    response = self.worlds:transition<|messages.ControlReply|>(function (): messages.ControlReply
+      local id: string? = nil
+      if is_revoke then
+        id = self.database:revoke(target)
+        if not id then return error_reply(401, "invalid pairing token") end
+        log.emit(self.logger, "info", "pairing_revoked", {["client_id"] = id})
+      else
+        id = target
+        if not self.database:remove(id) then return error_reply(404, "unknown client") end
+        log.emit(self.logger, "info", "client_removed", {["client_id"] = id})
+      end
+      retired = self.worlds:disconnect(id)
+      return messages.ControlReply.response(200, "{\"success\":true}")
+    end)
+    if retired then retired:close() end
+    return nil
+  catch
+    failure = async.Error(error, traceback)
+    return nil
+  end)
+  tasks.await_terminal(changing)
+  if failure then failure:raise() end
+  return response
+end
+
 local function Server:coordinate(request: messages.ControlRequest): messages.ControlReply
-  local operation = request.operation
-  local data = wire.object(request.body)
-  if operation == "session-discard" then
-    self:discard_provisional(wire.text(data, "requestKey"), request.worker_id)
-    return reply(200, "{}", nil, nil, nil)
-  end
-  if operation == "unsubscribe" then
-    if request.subscription then self.worlds:unsubscribe(request.subscription.key) end
-    return reply(200, "{}", nil, nil, nil)
-  end
-  if operation == "drop-subscription" then
-    self.worlds:unsubscribe(wire.text(data, "key"))
-    return reply(200, "{}", nil, nil, nil)
+  case request.action
+  when session_discard(key) then
+    self:discard_provisional(key, request.worker_id)
+    return ack_reply
+  when unsubscribe(key) then
+    self.worlds:unsubscribe(key)
+    return ack_reply
+  else
   end
   if self.closed then return error_reply(503, "relay is closed") end
-  if operation == "auth-publish" then
-    local handle? = request.world
-    if not handle then return error_reply(400, "missing world") end
+  case request.action
+  when auth_publish(handle, token) then
     local slot? = self.world_workers[handle.key]
     if not slot or slot.id ~= request.worker_id or slot.handle.client_id ~= handle.client_id then
       return error_reply(503, "Foundry world disconnected")
     end
     return self.worlds:transition<|messages.ControlReply|>(function (): messages.ControlReply
-      local client? = self.database:authenticate(handle.client_id, wire.text(data, "token"))
+      local client? = self.database:authenticate(handle.client_id, token)
       if not client then return error_reply(401, "invalid pairing token") end
       if handle.health:is_closed() or (request.reply and request.reply:is_closed()) then
         return error_reply(503, "Foundry world disconnected")
       end
-      local _session, activation = self.worlds:publish_authenticated(slot.handle)
-      return reply(200, "{}", slot.handle, nil, activation)
+      local _, activation = self.worlds:publish_authenticated(slot.handle)
+      return messages.ControlReply.published(activation)
     end)
-  end
-  if operation == "online" then
-    local ids = self.worlds:online_ids()
-    local online: {string: value} = {}
-    for index = 1, #ids do online[ids[index]] = true end
-    return reply(200, wire.encode(online), nil, nil, nil)
-  end
-  if operation == "select" or operation == "subscribe" then
+  when online() then
+    return messages.ControlReply.online_ids(self.worlds:online_ids())
+  when is_online(client_id) then
+    return messages.ControlReply.active(self.worlds:online(client_id))
+  when select(client_id) then
+    local selected?, problem? = self.worlds:select(client_id)
+    if not selected then
+      local status = problem == "multiple worlds are online; specify clientId" and 400 or 503
+      return error_reply(status, problem)
+    end
+    return messages.ControlReply.selected(selected.world)
+  when subscribe(client_id, channel) then
     return self.worlds:transition<|messages.ControlReply|>(function (): messages.ControlReply
-      local selected?, problem? = self.worlds:select(wire.text(data, "clientId"))
-      if not selected then
-        local status = operation == "select" and problem == "multiple worlds are online; specify clientId" and 400 or 503
-        return error_reply(status, problem)
-      end
-      if operation == "subscribe" then
-        local subscription = self.worlds:subscribe(selected.id, wire.text(data, "channel"))
-        self.unclaimed[request.request_id] = Unclaimed(request.worker_id, subscription)
-        return reply(200, "{}", selected.world, subscription, nil)
-      end
-      return reply(200, "{}", selected.world, nil, nil)
+      local selected?, problem? = self.worlds:select(client_id)
+      if not selected then return error_reply(503, problem) end
+      local subscription = self.worlds:subscribe(selected.id, channel)
+      self.unclaimed[request.request_id] = Unclaimed(request.worker_id, subscription)
+      return messages.ControlReply.subscribed(selected.world, subscription)
     end)
-  end
-  if operation == "revoke" or operation == "delete" then
-    async.checkpoint()
-    local response: messages.ControlReply? = nil
-    local failure: async.Error? = nil
-    -- An accepted native COMMIT can finish even when its waiter is cancelled.
-    -- Once admitted, the complete credential/disconnect transition owns its
-    -- lifetime independently of the API request that must wait for retirement.
-    local changing = async.run<|nil, value|>(function (): nil
-      local retired: hub.Session? = nil
-      response = self.worlds:transition<|messages.ControlReply|>(function (): messages.ControlReply
-        local id: string? = nil
-        if operation == "revoke" then
-          id = self.database:revoke(wire.text(data, "token"))
-          if not id then return error_reply(401, "invalid pairing token") end
-          log.emit(self.logger, "info", "pairing_revoked", {["client_id"] = id})
-        else
-          id = wire.text(data, "clientId")
-          if not self.database:remove(id) then return error_reply(404, "unknown client") end
-          log.emit(self.logger, "info", "client_removed", {["client_id"] = id})
-        end
-        retired = self.worlds:disconnect(id)
-        return reply(200, "{\"success\":true}", nil, nil, nil)
-      end)
-      if retired then retired:close() end
-      return nil
-    catch
-      failure = async.Error(error, traceback)
-      return nil
-    end)
-    tasks.await_terminal(changing)
-    if failure then failure:raise() end
-    return response
-  end
-  if operation == "session-handshake" then
-    local result = self.headless:handshake(wire.text(data, "address"), wire.text(data, "user"), wire.text(data, "world"))
-    return reply(200, wire.encode(result), nil, nil, nil)
-  end
-  if operation == "session-start" then
-    local key = wire.text(data, "requestKey")
+  when revoke(token) then
+    return self:retire_credential(true, token)
+  when delete_client(client_id) then
+    return self:retire_credential(false, client_id)
+  when session_handshake(address, user, world) then
+    local result = self.headless:handshake(address, user, world)
+    return messages.ControlReply.response(200, wire.encode(result))
+  when session_start(key, body_json) then
     if key == "" or self.provisional[key] then return error_reply(400, "invalid session request") end
-    local entry = self.worlds:transition<|sessions.Entry|>(function (): sessions.Entry return self.headless:begin(data) end)
+    local data = wire.object(body_json)
+    local entry = self.worlds:transition<|sessions.Entry|>(function (): sessions.Entry
+      return self.headless:begin(data)
+    end)
     self.provisional[key] = Provisional(request.worker_id, entry)
     local delivered = false
     defer if not delivered then self:discard_provisional(key, request.worker_id) end
@@ -224,24 +217,24 @@ local function Server:coordinate(request: messages.ControlRequest): messages.Con
     delivered = true
     local result: {string: value} = {["success"] = true, ["sessionId"] = entry.session_id,
       ["clientId"] = entry.client_id}
-    return reply(200, wire.encode(result), nil, nil, nil)
-  end
-  if operation == "session-publish" then
-    local key = wire.text(data, "requestKey")
+    return messages.ControlReply.response(200, wire.encode(result))
+  when session_publish(key) then
     local pending? = self.provisional[key]
-    if not pending or pending.worker_id ~= request.worker_id then return error_reply(503, "session is no longer available") end
+    if not pending or pending.worker_id ~= request.worker_id then
+      return error_reply(503, "session is no longer available")
+    end
     self.headless:publish(pending.entry)
     self.provisional[key] = nil
-    return reply(200, "{}", nil, nil, nil)
-  end
-  if operation == "session-end" then
-    local id = wire.text(data, "sessionId")
+    return ack_reply
+  when session_end(id) then
     if id == "" then return error_reply(400, "sessionId is required") end
     self.headless:finish(id)
-    return reply(200, "{\"status\":\"ok\",\"message\":\"Session ended\"}", nil, nil, nil)
+    return messages.ControlReply.response(200, "{\"status\":\"ok\",\"message\":\"Session ended\"}")
+  when session_list() then
+    return messages.ControlReply.response(200, wire.encode(self.headless:list()))
+  else
+    return ack_reply
   end
-  if operation == "session-list" then return reply(200, wire.encode(self.headless:list()), nil, nil, nil) end
-  return error_reply(400, "unknown coordinator operation")
 catch
   if error is sessions.Error then
     local failure: sessions.Error = error
@@ -254,10 +247,13 @@ end
 
 local function Server:control_loop(): nil
   for _, request in self.control_inbox:incoming() do
-    if request.operation == "claim" then
+    case request.action
+    when claim() then
       local unclaimed? = self.unclaimed[request.request_id]
-      if unclaimed and unclaimed.worker_id == request.worker_id then self.unclaimed[request.request_id] = nil end
-    elseif request.operation == "cancel" then
+      if unclaimed and unclaimed.worker_id == request.worker_id then
+        self.unclaimed[request.request_id] = nil
+      end
+    when cancel() then
       local pending? = self.operations[request.request_id]
       if pending and pending.worker_id == request.worker_id then pending.task:cancel() end
       local unclaimed? = self.unclaimed[request.request_id]
@@ -273,13 +269,16 @@ local function Server:control_loop(): nil
         if request.reply then
           local accepted = false
           do accepted = request.reply:try_send(result) catch end
-          if not accepted and request.operation == "session-start" then
-            local data = wire.object(request.body)
-            self:discard_provisional(wire.text(data, "requestKey"), request.worker_id)
-          end
-          if not accepted and result.subscription then
-            self.unclaimed[id] = nil
-            self.worlds:unsubscribe(result.subscription.key)
+          if not accepted then
+            case request.action
+            when session_start(request_key, _) then
+              self:discard_provisional(request_key, request.worker_id)
+            end
+            case result
+            when subscribed(_, subscription) then
+              self.unclaimed[id] = nil
+              self.worlds:unsubscribe(subscription.key)
+            end
           end
         end
         return nil
@@ -312,7 +311,7 @@ local function discard_openings(inbox: thread.Receiver<|world.Opening|>)
 end
 
 local function wait_ready<|T|>(ready: thread.Receiver<|boolean|>, worker: thread.Thread<|T|>)
-  local waiting = async.run<|boolean, value|>(function (): boolean return ready:receive() end)
+  local waiting = async.run<|boolean, value|>(ready:receive)
   defer tasks.drain(waiting)
   case async.race_two(waiting, worker:task())
   when first(status) then
@@ -480,26 +479,41 @@ function Server:serve()
   if self.failure then self.failure:raise() end
 end
 
+local function drain_operations(ops: {string: Operation}, cancel: boolean)
+  local list: {async.Task<|nil, value|>} = {}
+  for _, pending in iteration.pairs(ops) do list[#list + 1] = pending.task end
+  if cancel then
+    for index = 1, #list do list[index]:cancel() end
+  end
+  for index = 1, #list do tasks.await_terminal(list[index]) end
+end
+
 local function Server:shutdown(): async.Error?
   local failure: async.Error? = nil
-  local attempt = function (operation: function (): ())
-    do operation() catch if not failure then failure = async.Error(error, traceback) end end
+  if self.listener then
+    do self.listener:close()
+    catch if not failure then failure = async.Error(error, traceback) end
+    end
   end
-  if self.listener then attempt(self.listener:close) end
-  local operations: {async.Task<|nil, value|>} = {}
-  for _, pending in iteration.pairs(self.operations) do operations[#operations + 1] = pending.task end
-  for index = 1, #operations do operations[index]:cancel() end
-  for index = 1, #operations do tasks.await_terminal(operations[index]) end
-  attempt(self.headless:close)
-  attempt(self.worlds:close)
+  drain_operations(self.operations, true)
+  do self.headless:close()
+  catch if not failure then failure = async.Error(error, traceback) end
+  end
+  do self.worlds:close()
+  catch if not failure then failure = async.Error(error, traceback) end
+  end
   for id, _ in iteration.pairs(self.unclaimed) do self.unclaimed[id] = nil end
   -- Keep the coordinator draining while cancelled HTTP children send cleanup.
   for index = 1, #self.api_workers do self.api_workers[index].worker:cancel() end
   for index = 1, #self.api_workers do
     local slot = self.api_workers[index]
-    attempt(function () slot.worker:join() end)
+    do slot.worker:join()
+    catch if not failure then failure = async.Error(error, traceback) end
+    end
     if slot.monitor then tasks.await_terminal(slot.monitor) end
-    attempt(function () discard_handoffs(slot.inbox) end)
+    do discard_handoffs(slot.inbox)
+    catch if not failure then failure = async.Error(error, traceback) end
+    end
     slot.sender:close()
     slot.inbox:close()
   end
@@ -508,28 +522,37 @@ local function Server:shutdown(): async.Error?
   for index = 1, #worlds do worlds[index].worker:cancel() end
   for index = 1, #worlds do
     local slot = worlds[index]
-    attempt(function () slot.worker:join() end)
+    do slot.worker:join()
+    catch if not failure then failure = async.Error(error, traceback) end
+    end
     slot.health:close()
     if slot.monitor then tasks.await_terminal(slot.monitor) end
-    attempt(function () discard_openings(slot.inbox) end)
+    do discard_openings(slot.inbox)
+    catch if not failure then failure = async.Error(error, traceback) end
+    end
     slot.sender:close()
     slot.inbox:close()
   end
   local pending_keys: {string} = {}
   for key, _ in iteration.pairs(self.provisional) do pending_keys[#pending_keys + 1] = key end
   for index = 1, #pending_keys do
-    local pending? = self.provisional[pending_keys[index]]
-    if pending then attempt(function () self:discard_provisional(pending_keys[index], pending.worker_id) end) end
+    local key = pending_keys[index]
+    local pending? = self.provisional[key]
+    if pending then
+      do self:discard_provisional(key, pending.worker_id)
+      catch if not failure then failure = async.Error(error, traceback) end
+      end
+    end
   end
   self.controls:close()
   if self.control_task then tasks.await_terminal(self.control_task) end
-  local remaining: {async.Task<|nil, value|>} = {}
-  for _, pending in iteration.pairs(self.operations) do remaining[#remaining + 1] = pending.task end
-  for index = 1, #remaining do tasks.await_terminal(remaining[index]) end
+  drain_operations(self.operations, false)
   self.control_inbox:close()
   self.returned:close()
   if self.return_task then tasks.await_terminal(self.return_task) end
-  attempt(function () discard_handoffs(self.return_inbox) end)
+  do discard_handoffs(self.return_inbox)
+  catch if not failure then failure = async.Error(error, traceback) end
+  end
   self.return_inbox:close()
   self.log_lines:close()
   if self.log_task then tasks.await_terminal(self.log_task) end
@@ -548,11 +571,5 @@ end
 function Server:close()
   if self.retirement and self.retirement:status():has_finished() then return end
   self:begin_close()
-  local retirement = self.retirement
-  tasks.await_terminal(retirement)
-  case retirement:status()
-  when succeeded(failure) then if failure then failure:raise() end
-  when failed(failure) then failure:raise()
-  else raise "relay shutdown cancelled"
-  end
+  tasks.await_retirement(self.retirement, "relay shutdown cancelled")
 end

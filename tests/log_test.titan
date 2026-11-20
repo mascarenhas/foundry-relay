@@ -1,5 +1,6 @@
 local test = import "test"
 local async = import "async"
+local iteration = import "iteration"
 local json = import "json"
 local string = import "string"
 local timer = import "timer"
@@ -214,4 +215,17 @@ function test_cancellation_does_not_interrupt_owned_writer_cleanup(_context: tes
   local contents = records(output:drain())
   test.assert(#contents == 1 and contents[1]["event"] == "accepted_before_close" and
     logger.worker:status():has_succeeded(), "close cancellation lost an accepted log record")
+end
+
+function test_fieldless_record_emits_exact_json_schema(_context: test.Context)
+  local logger, output = captured("info")
+  defer logger:close()
+  logger:emit("info", "simple_event")
+  logger:close()
+  local contents = records(output:drain())
+  test.assert(#contents == 1)
+  test.assert(contents[1]["event"] == "simple_event" and contents[1]["level"] == "info")
+  local count = 0
+  for _ in iteration.pairs(contents[1]) do count = count + 1 end
+  test.assert(count == 3, "fieldless log record had unexpected keys")
 end

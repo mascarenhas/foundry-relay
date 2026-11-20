@@ -3,9 +3,27 @@ local async = import "async"
 local iteration = import "iteration"
 local json = import "json"
 local os = import "os"
+local tasks = import "relay.tasks"
 local thread = import "thread"
 
 local const maximum_line_bytes = 16384
+local const encode_limit = json.EncodeOption.max_bytes(16384)
+
+local record SimpleRecord
+  const event: string
+  const level: string
+  const timestamp: string
+end
+
+local function write_stderr(text: string)
+  os.stderr:write(text)
+end
+
+local function noop_stop()
+end
+
+local function noop_close(_: function (): async.SubscriptionBatch<|string|>)
+end
 
 local function rank(level: string): integer?
   if level == "error" then return 1 end
@@ -21,14 +39,16 @@ function resolve_level(level: string?): string
 end
 
 local function line(level: string, event: string, fields: {string: value}?): string
-  local contents: {string: value} = {}
-  if fields then
-    for key, item in iteration.pairs(fields) do contents[key] = item end
+  local timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+  if fields == nil then
+    return json.encode(SimpleRecord(event, level, timestamp), encode_limit) .. "\n"
   end
-  contents["timestamp"] = os.date("!%Y-%m-%dT%H:%M:%SZ")
+  local contents: {string: value} = {}
+  for key, item in iteration.pairs(fields) do contents[key] = item end
+  contents["timestamp"] = timestamp
   contents["level"] = level
   contents["event"] = event
-  return json.encode(contents, json.EncodeOption.max_bytes(maximum_line_bytes)) .. "\n"
+  return json.encode(contents, encode_limit) .. "\n"
 end
 
 record Logger
@@ -83,9 +103,9 @@ function Logger.new(level: string?, sink: (function (string): ())?, capacity: in
   local source = async.BufferedSubscription<|string, nil|>(function (p, _fail, f)
     publish = p
     finish = f
-    return async.SubscriptionActions<|string|>(function () end, function (_drain) end)
+    return async.SubscriptionActions<|string|>(noop_stop, noop_close)
   end)
-  local destination = sink or function (text: string) os.stderr:write(text) end
+  local destination = sink or write_stderr
   local result: Logger = {minimum = rank(selected), sink = destination,
     source = source, publish = publish, finish = finish, capacity = maximum,
     queued = 0, dropped = 0, closed = false, failed = false, worker = nil}
@@ -148,22 +168,11 @@ function forward(level: string, lines: thread.Sender<|string|>?): Logger?
   end)
 end
 
-local function await_terminal(task: async.Task<|nil, value|>)
-  if task:status():has_finished() then return end
-  local remove: (function (): ())? = nil
-  defer if remove then remove() end
-  async.await_cleanup<|nil, nil|>(function (resolve, _reject, _fatal)
-    if task:status():has_finished() then resolve(nil)
-    else remove = task:add_terminal_listener(function (_status) resolve(nil) end)
-    end
-  end)
-end
-
 function Logger:close()
   if self.closed then return end
   self.closed = true
   self.finish()
-  if self.worker then await_terminal(self.worker) end
+  if self.worker then tasks.await_terminal(self.worker) end
 end
 
 -- Startup may fail before a Logger exists. Callers supply only fixed, safe

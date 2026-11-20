@@ -8,6 +8,7 @@ local sessions = import "relay.sessions.titan"
 local foundry = import "relay.foundry_session"
 local store = import "relay.store"
 local hub = import "relay.hub"
+local tasks = import "relay.tasks"
 local wire = import "relay.wire"
 local encryption = import "tests.session_crypto_test"
 local log = import "relay.log"
@@ -39,13 +40,7 @@ function Fake:close()
     timer.sleep(self.probe.cleanup_ms)
     return nil
   end)
-  local remove: (function(): ())? = nil
-  defer if remove then remove() end
-  async.await_cleanup<|nil, nil|>(function(resolve, _reject, _fatal)
-    if cleanup:status():has_finished() then resolve(nil)
-    else remove = cleanup:add_terminal_listener(function(_status) resolve(nil) end)
-    end
-  end)
+  tasks.await_terminal(cleanup)
   if self.probe.fail_cleanup then raise "private cleanup diagnostic" end
 end
 
@@ -176,7 +171,7 @@ function test_expiry_and_pending_bound(_context: test.Context)
   fixture.manager.handshakes[token] = sessions.Handshake(original.address, original.origin,
     original.user, original.world, original.nonce, uv.hrtime() - 1)
   expect_error(function() fixture.manager:begin({["handshakeToken"] = token}) end, 400)
-  for _index = 1, 32 do fixture.manager:handshake("https://example.test", "GM", "sandbox") end
+  for _ = 1, 32 do fixture.manager:handshake("https://example.test", "GM", "sandbox") end
   expect_error(function() fixture.manager:handshake("https://example.test", "GM", "sandbox") end, 429)
 end
 
@@ -244,7 +239,7 @@ function test_request_cancellation_retires_starting_browser(_context: test.Conte
     return nil
   end)
   timer.sleep(10)
-  hub.drain(waiting)
+  tasks.drain(waiting)
   test.assert(fixture.probe.closed == 1 and count(fixture.manager) == 0)
   fixture.probe.startup_ms = 1
   local next = fixture.manager:begin(request(fixture.manager))
@@ -329,7 +324,7 @@ function test_startup_failure_logs_finite_causes_and_keeps_secrets_private(conte
         "private-profile-path", "example.test", "/unused", original.token,
         data["handshakeToken"], data["encryptedPassword"]}
       for secret_index = 1, #secrets do
-        test.assert(string.find(contents, secrets[secret_index], 1, true) == nil,
+        test.assert(string.find(contents, secrets[secret_index], 1) == nil,
           "Startup log leaked private inputs or diagnostics")
       end
       fixture.probe.fail_start = false

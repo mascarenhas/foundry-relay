@@ -42,9 +42,15 @@ local const route_messages: {string: string} = {
   ["trailing_input"] = "unexpected byte in route pattern",
 }
 
+local record ErrorEnvelope
+  const error: string
+end
+
+local const empty_allowed: const {string} = {}
+
 record Target
   const path: string
-  const segments: {string}
+  const segments: const {string}
   const query: {string: string}
   const query_values: {string: {string}}
 end
@@ -53,7 +59,7 @@ record Route
   const method: string
   const pattern: string
   const action: string
-  local const parts: {RoutePart}
+  local const parts: const {RoutePart}
   local const matcher: peg.Pattern
 end
 
@@ -68,12 +74,12 @@ end
 record Resolution
   const status: integer
   const match: Match?
-  const allowed: {string}
+  const allowed: const {string}
   const error: string?
 end
 
 record Router
-  local const routes: {Route}
+  local const routes: const {Route}
 end
 
 local function hex_digit(byte: integer): integer?
@@ -85,31 +91,43 @@ end
 
 -- Decode each path segment independently: an encoded slash stays within its segment.
 function percent_decode(subject: string, plus_as_space: boolean?): string
-  local result = string.writer()
+  local result: string.StringWriter? = nil
+  local span_start = 1
   local index = 1
-  while index <= #subject do
+  local length = #subject
+  while index <= length do
     local byte: integer = string.byte(subject, index)
     if byte == 37 then
-      if index + 2 > #subject then raise "incomplete percent escape" end
+      if index + 2 > length then raise "incomplete percent escape" end
       local high? = hex_digit(string.byte(subject, index + 1))
       local low? = hex_digit(string.byte(subject, index + 2))
       if high == nil or low == nil then raise "invalid percent escape" end
       local decoded = high * 16 + low
       if decoded == 0 then raise "NUL is not allowed in a request target" end
-      result:write(string.char(decoded))
+      local writer = result or string.writer()
+      result = writer
+      if index > span_start then writer:write(string.sub(subject, span_start, index - 1)) end
+      writer:write(string.char(decoded))
       index = index + 3
+      span_start = index
     elseif plus_as_space and byte == 43 then
-      result:write(" ")
+      local writer = result or string.writer()
+      result = writer
+      if index > span_start then writer:write(string.sub(subject, span_start, index - 1)) end
+      writer:write(" ")
       index = index + 1
+      span_start = index
     else
       if byte == 0 or byte < 32 or byte == 127 then
         raise "control character in request target"
       end
-      result:write(string.char(byte))
       index = index + 1
     end
   end
-  return result:drain()
+  if result == nil then return subject end
+  local writer = result
+  if span_start <= length then writer:write(string.sub(subject, span_start, length)) end
+  return writer:drain()
 end
 
 -- Query maps expose the first value; query_values retains all occurrences in wire order.
@@ -133,11 +151,14 @@ function parse_target(target: string): Target
   local query: {string: string} = {}
   local query_values: {string: {string}} = {}
   if query_source ~= "" then
-    local fields: {string} = {}
-    for field in string.split(query_source, "&") do fields[#fields + 1] = field end
-    if #fields > max_query_fields then raise "too many query parameters" end
-    for index = 1, #fields do
-      local field = fields[index]
+    local field_count = 1
+    for index = 1, #query_source do
+      if string.byte(query_source, index) == 38 then
+        field_count = field_count + 1
+        if field_count > max_query_fields then raise "too many query parameters" end
+      end
+    end
+    for field in string.split(query_source, "&") do
       if field ~= "" then
         local equals? = string.find(field, "=")
         local key = field
@@ -158,7 +179,8 @@ function parse_target(target: string): Target
       end
     end
   end
-  return Target(path, segments, query, query_values)
+  local frozen_segments = segments as const {string}
+  return Target(path, frozen_segments, query, query_values)
 end
 
 local function route_error(pattern: string, code: string, position: integer): RouteError
@@ -166,20 +188,20 @@ local function route_error(pattern: string, code: string, position: integer): Ro
   return RouteError(code, route_messages[code] or "invalid route pattern", position, line, column)
 end
 
-local function literal_part(position: value, text: value): RoutePart
+local function literal_part(position: integer, text: string): RoutePart
   return RoutePart.literal(text, position)
 end
 
-local function parameter_part(position: value, name: value): RoutePart
+local function parameter_part(position: integer, name: string): RoutePart
   return RoutePart.parameter(name, position)
 end
 
-local function wildcard_part(position: value): RoutePart
+local function wildcard_part(position: integer): RoutePart
   return RoutePart.wildcard(position)
 end
 
 -- A declaration mismatch is data; Route.new raises this same diagnostic record.
-function parse_route(pattern: string): ({RoutePart}?, RouteError?)
+function parse_route(pattern: string): (const {RoutePart}?, RouteError?)
   if #pattern > max_route_bytes then return nil, route_error(pattern, "route_limit", max_route_bytes + 1) end
   local captured, label, position = route_grammar:match(pattern)
   if captured == nil then
@@ -206,7 +228,8 @@ function parse_route(pattern: string): ({RoutePart}?, RouteError?)
     end
     parts[index] = part
   end
-  return parts, nil
+  local frozen = parts as const {RoutePart}
+  return frozen, nil
 end
 
 local const hex_alphabet = "0123456789ABCDEF"
@@ -228,7 +251,7 @@ local function literal_matcher(text: string): peg.Pattern
   return result
 end
 
-local function compile_route(parts: {RoutePart}): peg.Pattern
+local function compile_route(parts: const {RoutePart}): peg.Pattern
   local result = peg.literal("/")
   local segment = peg.one_or_more(peg.difference(peg.any(), peg.literal("/")))
   for index = 1, #parts do
@@ -262,7 +285,8 @@ end
 function Router.new(routes: {Route}): Router
   local snapshot: {Route} = {}
   for index = 1, #routes do snapshot[index] = routes[index] end
-  return {routes = snapshot}
+  local frozen = snapshot as const {Route}
+  return {routes = frozen}
 end
 
 local function Route:parameters(path: string): ({string: string})?
@@ -283,7 +307,7 @@ function Router:match(method: string, target: string): Resolution
     if params then
       if route.method == method or route.method == "*" then
         local found = Match(route, route.action, params, parsed.query, parsed.query_values)
-        return Resolution(200, found, {}, nil)
+        return Resolution(200, found, empty_allowed, nil)
       end
       if not seen[route.method] then
         seen[route.method] = true
@@ -291,10 +315,13 @@ function Router:match(method: string, target: string): Resolution
       end
     end
   end
-  if #allowed > 0 then return Resolution(405, nil, allowed, nil) end
-  return Resolution(404, nil, {}, nil)
+  if #allowed > 0 then
+    local frozen_allowed = allowed as const {string}
+    return Resolution(405, nil, frozen_allowed, nil)
+  end
+  return Resolution(404, nil, empty_allowed, nil)
 catch
-  if error is string then return Resolution(400, nil, {}, error) end
+  if error is string then return Resolution(400, nil, empty_allowed, error) end
   raise
 end
 
@@ -306,15 +333,14 @@ function json_response(response: http.Response, status: integer, body: string)
 end
 
 function error_body(message: string): string
-  local body: {string: value} = {["error"] = message}
-  return json.encode(body)
+  return json.encode(ErrorEnvelope(message))
 end
 
 function error_response(response: http.Response, status: integer, message: string)
   json_response(response, status, error_body(message))
 end
 
-function allow_header(methods: {string}): string
+function allow_header(methods: const? {string}): string
   local result = string.writer()
   for index = 1, #methods do
     if index > 1 then result:write(", ") end

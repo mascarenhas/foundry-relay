@@ -1,33 +1,19 @@
 local test = import "test"
 local async = import "async"
 local fs = import "fs"
+local gc = import "gc"
 local os = import "os"
 local string = import "string"
 local timer = import "timer"
 local crypto = import "relay.session_crypto"
 local api = import "relay.api"
-local hub = import "relay.hub"
+local tasks = import "relay.tasks"
 local wire = import "relay.wire"
 
 local function consume(stream: os.InputStream): string
   local output = string.writer()
   for chunk in stream:read do output:write(chunk) end
   return output:drain()
-end
-
-local function await_cleanup(task: async.Task<|async.Error?, value|>)
-  local remove: (function (): ())? = nil
-  defer if remove then remove() end
-  async.await_cleanup<|nil, nil|>(function (resolve, _reject, _fatal)
-    if task:status():has_finished() then resolve(nil)
-    else remove = task:add_terminal_listener(function (_status) resolve(nil) end)
-    end
-  end)
-  case task:status()
-  when succeeded(failure) then if failure then failure:raise() end
-  when failed(failure) then failure:raise()
-  else raise "OpenSSL child cleanup was cancelled"
-  end
 end
 
 local function stop(process: os.Process)
@@ -42,7 +28,7 @@ local function stop(process: os.Process)
     return nil
   catch return async.Error(error, traceback)
   end)
-  await_cleanup(cleanup)
+  tasks.await_retirement(cleanup, "OpenSSL child cleanup was cancelled")
 end
 
 -- Independent client implementation: OpenSSL reads only the returned public
@@ -72,9 +58,9 @@ function encrypt(public_key: string, plaintext: string,
   local errors: async.Task<|string, value|>? = nil
   local deadline: async.Task<|nil, value|>? = nil
   defer do
-    defer if deadline then hub.drain(deadline) end
-    defer if output then hub.drain(output) end
-    defer if errors then hub.drain(errors) end
+    defer if deadline then tasks.drain(deadline) end
+    defer if output then tasks.drain(output) end
+    defer if errors then tasks.drain(errors) end
     stop(child)
   end
   output = async.run<|string, value|>(function (): string return consume(child.stdout) end)
@@ -183,4 +169,33 @@ function test_closed_key_rejects_decrypt_and_close_is_idempotent(_context: test.
   defer replacement:close()
   local plaintext = credentials("")
   test.assert(replacement:decrypt(encrypt(replacement.public_key, plaintext)) == plaintext)
+end
+
+function test_decrypt_preserves_exact_length_boundaries_and_binary_bytes(_context: test.Context)
+  local key = crypto.generate()
+  defer key:close()
+  local short_payload = "x"
+  test.assert(key:decrypt(encrypt(key.public_key, short_payload)) == short_payload,
+    "Single-byte plaintext did not round-trip")
+  local binary_payload = "prefix\0middle\0suffix"
+  local decrypted_binary = key:decrypt(encrypt(key.public_key, binary_payload))
+  test.assert(#decrypted_binary == #binary_payload and decrypted_binary == binary_payload,
+    "Binary plaintext with embedded NUL bytes was truncated or corrupted")
+  local maximum_payload = string.rep("M", 190)
+  local decrypted_max = key:decrypt(encrypt(key.public_key, maximum_payload))
+  test.assert(#decrypted_max == 190 and decrypted_max == maximum_payload,
+    "Maximum 190-byte OAEP plaintext did not round-trip")
+end
+
+local function generate_abandoned_key(): string
+  local transient = crypto.generate()
+  return transient.public_key
+end
+
+function test_unclosed_key_finalizes_cleanly_on_gc(_context: test.Context)
+  local public_key = generate_abandoned_key()
+  test.assert(string.find(public_key, "-----BEGIN PUBLIC KEY-----", 1) == 1,
+    "Generated key did not produce an SPKI PEM public key")
+  gc.collect()
+  gc.collect()
 end

@@ -1,15 +1,16 @@
 # HTTP and WebSocket API
 
-This is the contract for every route the relay serves. The route table is
-built by `relay/routes.titan` `create`: local handlers first, then the
-forwarding catalog from `relay/api.titan`. [Routing](routing.md) describes how
-targets are matched. API worker threads handle HTTP routes in
-`relay/api_worker.titan` `Worker:dispatch`; each module WebSocket runs in
-`relay/world.titan` `execute` on its own thread.
+External HTTP, Server-Sent Events, and WebSocket contract for `foundry-relay`.
+Local routes take precedence over the 91 forwarding routes. For environment
+configuration, reverse proxies, and logging, see
+[Configuration, Deployment, and Logging](configuration.md); for internal
+routing, request translation, and worker threading, see
+[Inside `foundry-relay`](index.md), [Chapter 1](threading.md), and
+[Chapter 2](routing.md).
 
 ## Request rules
 
-These rules apply to every route, including the public ones:
+These rules apply to every route, including public ones:
 
 - **Origin.** A request may omit `Origin`, send its own scheme and authority, or
   send one of the exact `RELAY_ALLOWED_ORIGINS` entries. Anything else,
@@ -22,22 +23,21 @@ These rules apply to every route, including the public ones:
 - **Authentication.** Every route except `/health`, `/auth/pair`,
   `/api/self-unpair`, `/api/clients/:clientId/active`, and `/relay` requires
   exactly one `x-api-key` header equal to `FOUNDRY_REST_API_KEY`. A missing,
-  wrong or repeated header returns 401.
-- **Bodies.** A route that reads a body requires `Content-Type:
-  application/json` and a JSON object, nested at most 64 levels, when the body
-  is nonempty; an empty body counts as `{}`. Bodies are capped at 16 MiB. The
-  one exception is a raw `POST /upload`, described under
-  [responses](#responses).
-- **World selection.** Forwarding routes and event streams take `clientId`
-  from the query; forwarding routes also accept a string `clientId` in the
-  body. When it is omitted and exactly one world is online, that world is
-  used. Several online worlds return 400 for forwarding routes and 503 for
-  event streams. An unknown or offline world, or no online world, returns 503.
-- **Errors.** Failures use a JSON body `{"error":"..."}`. A malformed target
+  wrong, or repeated header returns 401.
+- **Bodies.** A route that reads a JSON body requires `Content-Type:
+  application/json` and a JSON object nested at most 64 levels when the body is
+  nonempty; an empty body counts as `{}`. Bodies are capped at 16 MiB. Raw
+  `POST /upload` is the sole exception, specified under [responses](#responses).
+- **World selection.** Forwarding routes and event streams take `clientId` from
+  the query; forwarding routes also accept a string `clientId` in the body. When
+  it is omitted and exactly one world is online, that world is used. Several
+  online worlds return 400 for forwarding routes and 503 for event streams. An
+  unknown or offline world, or no online world, returns 503.
+- **Errors.** Failures return a JSON body `{"error":"..."}`. A malformed target
   returns 400; an unmatched path returns 404; a path declared only for other
-  methods returns 405 with an `Allow` header. Invalid parameters, an
-  oversized or non-JSON body, and other rejected input return 400 with the
-  generic message `invalid request`.
+  methods returns 405 with an `Allow` header. Invalid parameters, an oversized
+  or non-JSON body, and other rejected input return 400 with the generic
+  message `invalid request`.
 
 ## Local routes
 
@@ -61,37 +61,38 @@ returns 401 and a missing `worldId` returns 400. Submitted codes are compared
 exactly with the uppercased `FOUNDRY_PAIRING_CODE`. The response contains
 `token`, `clientId`, and `relayUrl` (`RELAY_PUBLIC_URL`).
 
-`relay/store.titan` `Store:pair` reuses an existing registration, with its
-client ID and token, when the request matches it by `existingClientId` and
-`worldId`, then by `worldId` and `serverFingerprint`, then by `worldId` and
-`serverOrigin`. A stored origin must agree with a supplied one. Otherwise it
-creates a new client ID (16 random bytes, hex) and token (32 random bytes,
-hex) from the operating system's CSPRNG.
+Pairing reuses an existing registration, with its client ID and token, when the
+request matches it by `existingClientId` and `worldId`, then by `worldId` and
+`serverFingerprint`, then by `worldId` and `serverOrigin`. A stored origin must
+agree with a supplied one. Otherwise the relay allocates a new client ID (16
+random bytes, hex) and token (32 random bytes, hex) from the operating system's
+CSPRNG.
 
 The module connects to `/relay?id=<clientId>` with nonsecret world and system
 query metadata. Its first text frame must be `{"type":"auth","token":"..."}`
-within `RELAY_AUTH_TIMEOUT_MS`. The relay answers `{"type":"auth-success"}`,
-or `{"type":"auth-failed","error":"invalid pairing token"}` followed by Close
-1008. A new authenticated connection for the same client replaces the old
-one, which is closed with code 1000. The relay pings every
-`RELAY_HEARTBEAT_MS` and answers module `ping` messages with `pong`. Module
-messages must be text and at most 16 MiB. The relay records the query
-metadata on each successful authentication.
+within `RELAY_AUTH_TIMEOUT_MS`. The relay answers `{"type":"auth-success"}`, or
+`{"type":"auth-failed","error":"invalid pairing token"}` followed by Close
+1008. A new authenticated connection for the same client replaces the old one,
+closing the incumbent with code 1000. The relay pings every
+`RELAY_HEARTBEAT_MS` (5-second Pong deadline) and answers module `ping`
+messages with `pong`. Module frames must be text and at most 16 MiB. Query
+metadata is saved on each successful authentication.
 
 `POST /api/self-unpair` takes `{"token":"..."}`. It replaces that token with a
 fresh one, keeps the registration, disconnects the world, and returns
 `{"success":true}`; an unknown token returns 401. Re-pairing then returns the
-fresh token. `DELETE /clients/:clientId` also disconnects the world.
+fresh token. `DELETE /clients/:clientId` removes the registration and
+disconnects the world.
 
 ### Client list
 
 `GET /clients` returns a JSON array of every registered world, online or not,
-ordered by world title. Each entry has `id` and `clientId` (both the client
-ID), `worldId`, `worldTitle`, `version` (module version), `lastSeen` (Unix
-seconds of the last pairing or authentication), and `connected`. The query
-metadata from the module's last authenticated connection is then copied into
-the entry, except keys named `id`, `token`, `clientId`, and `connected`.
-Tokens never appear.
+ordered by world title (then client ID). Each entry has `id` and `clientId`
+(both the client ID), `worldId`, `worldTitle`, `version` (module version),
+`lastSeen` (Unix seconds of the last pairing or authentication), and
+`connected`. Query metadata from the module's last authenticated connection is
+copied into the entry, except keys named `id`, `token`, `clientId`, and
+`connected`. Tokens never appear.
 
 ### Event streams
 
@@ -104,39 +105,42 @@ Tokens never appear.
 | `/actor/subscribe` | `actor-events` | `actor-event` |
 | `/scene/subscribe` | `scene-events` | `scene-event` |
 
-A stream opens with `event: connected` and data `{"clientId":"..."}`. Each
-module event is written with its inner object-valued `data`, or the whole
-message when `data` is not an object. Event names are `roll` for rolls; the
-event's `hook` or `hookName` (default `hook`) for hooks; and
-`<chat|combat|actor|scene>-<eventType>` (default `eventType` `create`) for the
-others. A `: keepalive` comment follows every 15 seconds without an event.
+Streams respond with `Content-Type: text/event-stream`, `Cache-Control:
+no-cache`, and `X-Accel-Buffering: no`, opening with `event: connected` and
+data `{"clientId":"..."}`. Each module event is written with its inner
+object-valued `data`, or the whole message when `data` is not an object. Event
+names are `roll` for rolls; the event's `hook` or `hookName` (default `hook`,
+or `event` if the name contains CR/LF) for hooks; and
+`<chat|combat|actor|scene>-<eventType>` (default `eventType` `create`, or the
+channel prefix if the name contains CR/LF) for the others. A `: keepalive`
+comment follows every 15 seconds without an event.
 
-Each subscriber has a 128-event queue. A subscriber whose queue is full is
-retired, and its stream ends after the queued events. Subscriptions belong to
-the main registry, so they survive a world reconnect. Foundry receives
+Each subscriber has a 128-event queue. A subscriber whose queue fills is
+retired, and its stream ends after draining queued events. Subscriptions belong
+to the main registry, so they survive a world reconnect. Foundry receives
 `{"type":"event-subscription-update","channel":...,"count":...}` whenever a
-channel's subscriber count changes, and all six counts, including zero, after
-each authentication, so it can enable only the hooks in use. The streaming
-handler is `relay/api_worker.titan` `Worker:stream`.
+channel's subscriber count changes, and all six counts (including zero) after
+each authentication, so it can enable only the hooks in use. See
+[Chapter 2](routing.md) for stream dispatch and fanout.
 
 ## Forwarding behavior
 
-The relay forwards 91 declarations from the reference Go relay to the
-selected world. Use `userId` (a Foundry user ID or username) to request
-permission-scoped operations; when it is omitted, the module uses the
-connected GM's authority. The D&D5e routes require a compatible D&D5e world.
+The relay forwards 91 declarations from the reference Go relay to the selected
+world. Pass `userId` (a Foundry user ID or username) to request
+permission-scoped operations; when it is omitted, the module uses the connected
+GM's authority. The D&D5e routes require a compatible D&D5e world.
 
 ### Parameters
 
-`relay/api.titan` `build_payload` reads only the declared parameters, in their
-declared source order, and sends them as top-level fields of the WebSocket
-message. The relay sets `type` and `requestId` itself and never forwards
-`clientId`. Undeclared fields, including `_scopes`, are dropped. A false or
-zero body value counts as present; an empty query value counts as absent.
-When `data` is absent, an empty object is sent. Explicit JSON nulls, nested or
-trailing in arrays, survive the round trip.
+Each forwarding route reads only its declared parameters, in their declared
+source order, and sends them as top-level fields of the WebSocket message (see
+[Chapter 2](routing.md) for the parameter compiler). The relay sets `type` and
+`requestId` itself and never forwards `clientId`. Undeclared fields, including
+`_scopes`, are dropped. A `false` or `0` body value counts as present; an empty
+query value counts as absent. When `data` is absent, an empty object is sent.
+Explicit JSON nulls, nested or trailing in arrays, survive the round trip.
 
-Values are checked against their declared kind (`Param:coerce`):
+Values are checked against their declared kind:
 
 - `boolean` accepts JSON booleans and the strings `true` and `false` in any
   case.
@@ -147,14 +151,13 @@ Values are checked against their declared kind (`Param:coerce`):
 - `value` (`speaker`) is forwarded unchanged, so a body may send a string or a
   Foundry speaker object while a query value arrives as a string.
 
-Besides required parameters, some routes need at least one of a group
-(`relay/api.titan` `validate`): `/search` needs `query` or `filter`;
-`POST /select` needs `uuids`, `name`, `data`, or `all`; `GET`, `PUT`, and
-`DELETE /user` need `id` or `name`; `GET /scene` needs `sceneId`, `name`,
-`active`, `viewed`, or `all`; `PUT /scene` needs `sceneId`, `name`, or
-`active`; `DELETE /scene` and `/switch-scene` need `sceneId` or `name`; and
-`/sheet` needs `uuid` or `selected`. `/upload` needs `path`, `filename`, and a
-`fileData` data URL.
+Besides required parameters, several routes require at least one parameter from
+a group: `/search` needs `query` or `filter`; `POST /select` needs `uuids`,
+`name`, `data`, or `all`; `GET`, `PUT`, and `DELETE /user` need `id` or `name`;
+`GET /scene` needs `sceneId`, `name`, `active`, `viewed`, or `all`;
+`PUT /scene` needs `sceneId`, `name`, or `active`; `DELETE /scene` and
+`/switch-scene` need `sceneId` or `name`; and `/sheet` needs `uuid` or
+`selected`. `/upload` needs `path`, `filename`, and a `fileData` data URL.
 
 Canvas `documentType` must be `tokens`, `tiles`, `drawings`, `lights`,
 `sounds`, `notes`, `templates`, `walls`, or `regions`; the relay adds the
@@ -164,17 +167,17 @@ matching Foundry `className`. Most other defaults are applied by the module.
 
 A successful reply is the complete Foundry result object, including its
 `<action>-result` type and the relay's request ID. A result with a top-level
-`error` field is returned unchanged with status 400. `relay/api.titan`
-`response` converts three routes to binary unless `format=base64` is given:
+`error` field is returned unchanged with status 400. Three routes decode binary
+responses unless `format=base64` is given:
 
 - `GET /download` decodes `fileData` and sets `Content-Type` from `mimeType`
-  (default `application/octet-stream`) and an attachment
-  `Content-Disposition` from the file name.
+  (default `application/octet-stream`) and an attachment `Content-Disposition`
+  from the file name.
 - `GET /sheet` and `GET /scene/image` decode `imageData` (top-level or inside
   `data`), set `Content-Type` from `mimeType` (default `image/png`), and add
-  `X-Image-Width` and `X-Image-Height` when the result has numeric
-  dimensions. Both default to `format` `png` and `quality` 0.9; `/sheet`
-  also defaults `scale` to 1.
+  `X-Image-Width` and `X-Image-Height` when the result has numeric dimensions.
+  Both default to `format` `png` and `quality` `0.9`; `/sheet` also defaults
+  `scale` to `1`.
 
 A result without file or image data is returned as JSON, and
 `GET /scene/image/raw` always returns the module's ordinary JSON result.
@@ -182,12 +185,12 @@ A result without file or image data is returned as JSON, and
 `POST /upload` takes JSON `path`, `filename`, and `fileData` formatted as
 `data:<mime>;base64,<bytes>`; `source` defaults to `data`. A body with any
 other `Content-Type` is uploaded raw: the relay encodes it as a data URL with
-that content type and takes the other parameters from the query. Files pass
+that content type and reads the other parameters from the query. Files pass
 through Foundry's file API and are not stored by the relay.
 
 ### Deadlines and failures
 
-Each declaration has a deadline. It is 10 seconds unless listed here:
+Each route has a default deadline of 10 seconds unless listed here:
 
 | Deadline | Routes |
 | --- | --- |
@@ -196,18 +199,19 @@ Each declaration has a deadline. It is 10 seconds unless listed here:
 | 30 s | `POST /scene`, `PUT /scene`, `POST /switch-scene`, `POST` and `PUT /canvas/:documentType`, `GET /scene/image`, `GET /scene/image/raw`, `POST /upload` |
 | 45 s | `GET /download` |
 
-`RELAY_REQUEST_TIMEOUT_MS` replaces every deadline. The deadline covers the
-whole request, including time spent queued in the relay. When it expires the
-relay returns 408. The request may already have reached Foundry and
-performed a mutation; it is never retried. A world disconnect returns 503 to
-its pending requests. A world with `RELAY_MAX_PENDING` requests in flight
-returns 429, and a full output queue returns 503. [Threading](threading.md)
-describes how these requests are owned.
+[`RELAY_REQUEST_TIMEOUT_MS`](configuration.md#environment-variables) replaces
+every route deadline. The deadline covers the entire request, including time
+queued in the relay. On expiry the relay returns 408; the request may already
+have reached Foundry and performed a mutation, and it is never retried. A world
+disconnect returns 503 to pending requests. A world with
+[`RELAY_MAX_PENDING`](configuration.md#environment-variables) requests in
+flight returns 429, and a full output queue returns 503. [Chapter 1](threading.md)
+describes cross-thread request ownership and reply leases.
 
 ## Forwarding routes
 
-The catalog is `relay/api.titan` `catalog`. The last column lists the
-parameters that must be present; some routes add the one-of rules described
+The relay exposes 91 forwarding routes (70 general and 21 D&D5e). The last
+column lists parameters that must be present; routes with one-of rules appear
 under [parameters](#parameters).
 
 | Method | Path | WebSocket action | Required parameters |
@@ -406,8 +410,8 @@ Names marked `*` are required. The source list gives the lookup order:
 The route and protocol reference is ThreeHats' Go relay at
 [`65ce83d6a534ea6d340c8a89d72251f4c6a0294e`](https://github.com/ThreeHats/foundryvtt-rest-api-relay/tree/65ce83d6a534ea6d340c8a89d72251f4c6a0294e/go-relay),
 together with the unversioned [official API documentation](https://foundryrestapi.com/docs/api).
-All 91 of its ordinary forwarding routes are present: 70 general and 21
-D&D5e. A matching method and path does not imply identical behavior:
+All 91 of its ordinary forwarding routes are present: 70 general and 21 D&D5e.
+A matching method and path does not imply identical behavior:
 
 - **Client list.** `GET /clients` returns a bare array with `connected`. The
   reference returns `{"total":n,"clients":[...]}` with `isOnline` and other
@@ -419,36 +423,36 @@ D&D5e. A matching method and path does not imply identical behavior:
   ends streams when a world disconnects, limits the subscription count, and
   requires `clientId`; this relay keeps streams across reconnects with a
   bounded queue and selects a single online world automatically. This relay
-  also unwraps object-valued event `data` on every channel, where the
+  also unwraps object-valued event `data` on every channel, whereas the
   reference unwraps it only for combat events and otherwise sends the whole
   event object.
 - **Capacity.** Request bodies and module messages are limited to 16 MiB,
-  including base64 and JSON overhead. The reference accepts uploads of up to
+  including Base64 and JSON overhead. The reference accepts uploads of up to
   250 MiB. Large downloads and screenshots can exceed the module message limit.
 - **Script screening.** `POST /execute-js` and Macro `POST /create` are
   forwarded without the reference's forbidden-pattern screen or scope checks.
   The single API key has full authority over every paired world.
-- **Input and errors.** This relay requires typed JSON input and a data URL
-  for JSON uploads. It returns 503 for an offline world, 400 for an ambiguous
+- **Input and errors.** This relay requires typed JSON input and a data URL for
+  JSON uploads. It returns 503 for an offline world, 400 for an ambiguous
   forwarding selection, and 429 at the pending limit, where the reference
   returns 404 or starts the world. Error bodies differ.
-- **Canvas.** `POST /canvas/:documentType` requires an object `data`, as the
-  reference does, although the official documentation also describes arrays.
+- **Canvas.** `POST /canvas/:documentType` requires an object `data`, matching
+  the reference Go implementation, although the official documentation also
+  describes arrays.
 - **Sessions.** The [session API](sessions.md) reuses an existing pairing
-  instead of minting a connection token, keeps all session state in memory,
-  and does not capture the browser console. It encrypts credentials with one
-  ephemeral RSA key shared by all pending handshakes, where the reference
-  creates a new key for each handshake.
+  instead of minting a connection token, keeps all session state in memory, and
+  omits browser console capture. It encrypts credentials with one ephemeral RSA
+  key shared by all pending handshakes, whereas the reference creates a fresh
+  key for each handshake.
 
-These reference surfaces are absent: the consumer WebSocket `GET /ws/api`,
-including its subscriptions and interactive sheet control; the cross-world
-module tunnel (`remote-request`); the deprecated `GET /contents/*`, which
-returns 404 here; `GET /api/status` and `GET /api/health` (the local
-`/health` is not schema-compatible); and `/openapi.json`, `/asyncapi.json`,
-and `/api/docs`.
+These reference surfaces are omitted: the consumer WebSocket `GET /ws/api`
+(including its subscriptions and interactive sheet control); the cross-world
+module tunnel (`remote-request`); the deprecated `GET /contents/*` (returns
+404); `GET /api/status` and `GET /api/health` (the local `/health` is not
+schema-compatible); and `/openapi.json`, `/asyncapi.json`, and `/api/docs`.
 
-The service features of the reference are out of scope for this single-user
-relay: delegated key requests, accounts and scoped API keys, dashboard pairing
-and the credential vault, notifications and activity logs, administration,
-billing, metrics, Redis clustering, and the web frontend.
-`DELETE /clients/:clientId` is a local extension.
+Service features of the reference are outside this single-user relay's scope:
+delegated key requests, accounts and scoped API keys, dashboard pairing and the
+credential vault, notifications and activity logs, administration, billing,
+metrics, Redis clustering, and the web frontend. `DELETE /clients/:clientId` is
+a local extension.

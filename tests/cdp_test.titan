@@ -3,7 +3,7 @@ local async = import "async"
 local http = import "http"
 local websocket = import "websocket"
 local os = import "os"
-local hub = import "relay.hub"
+local tasks = import "relay.tasks"
 local wire = import "relay.wire"
 local cdp = import "relay.cdp"
 
@@ -20,8 +20,8 @@ local function Fixture:close()
   self.closed = true
   if self.client then self.client:close() end
   self.listener:close()
-  if self.peer then hub.drain(self.peer) end
-  if self.serving then hub.drain(self.serving) end
+  if self.peer then tasks.drain(self.peer) end
+  if self.serving then tasks.drain(self.serving) end
 end
 
 local function Fixture:finish_peer()
@@ -178,7 +178,7 @@ function test_concurrent_command_is_rejected_before_output(_context: test.Contex
   local calling = async.run<|{string: value}, value|>(function (): {string: value}
     return peer.client:call("Page.enable", {})
   end)
-  defer hub.drain(calling)
+  defer tasks.drain(calling)
   test.assert(received(), "CDP peer did not acknowledge the first command")
   expect_error(function() peer.client:call("Page.disable", {}) end, "CDP command already in progress")
   release(true)
@@ -262,7 +262,7 @@ function test_cancelled_command_retires_connection(_context: test.Context)
   catch
     return nil
   end)
-  defer hub.drain(calling)
+  defer tasks.drain(calling)
   test.assert(received(), "CDP peer did not acknowledge the owned command")
   calling:cancel()
   test.assert(async.join(calling):has_cancelled(), "CDP changed the authoritative cancellation state")

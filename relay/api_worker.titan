@@ -39,9 +39,29 @@ local record Worker
   const logger: log.Logger?
 end
 
-local function Worker:ask(operation: string, data: {string: value},
-    subscription: protocol.Subscription?): messages.ControlReply
-  return control.call(self.coordinator, self.id, operation, wire.encode(data), nil, subscription)
+local const online_action = messages.ControlAction.online()
+local const session_list_action = messages.ControlAction.session_list()
+
+local const known_methods: {string: boolean} = {
+  ["GET"] = true, ["POST"] = true, ["PUT"] = true, ["PATCH"] = true,
+  ["DELETE"] = true, ["OPTIONS"] = true, ["HEAD"] = true,
+  ["CONNECT"] = true, ["TRACE"] = true,
+}
+
+local function wait_keepalive(): nil
+  timer.sleep(15000)
+  return nil
+end
+
+local function Worker:ask(action: messages.ControlAction): messages.ControlReply
+  return control.call(self.coordinator, self.id, action)
+end
+
+local function write_reply(response: http.Response, reply: messages.ControlReply)
+  case reply
+  when response(status, body) then router.json_response(response, status, body)
+  else router.error_response(response, 500, "unexpected coordinator reply")
+  end
 end
 
 local function body(request: http.Request): string
@@ -55,25 +75,18 @@ local function body(request: http.Request): string
   return output:drain()
 end
 
-local function json_body(request: http.Request): {string: value}
-  local source = body(request)
-  if source == "" then return {} end
+local function require_json_header(request: http.Request)
   local content_type = string.lower(request.headers:get("Content-Type") or "")
   if string.sub(content_type, 1, 16) ~= "application/json" then
     raise "request body must use application/json"
   end
-  return wire.object(source)
 end
 
-
-local function Worker:origin_allowed(request: http.Request): boolean
-  local origins = request.headers:values("Origin")
-  if #origins == 0 then return true end
-  if #origins ~= 1 then return false end
-  local origin = origins[1]
-  if origin == request.url.scheme .. "://" .. request.url.authority then return true end
-  for i = 1, #self.settings.origins do if origin == self.settings.origins[i] then return true end end
-  return false
+local function json_body(request: http.Request): {string: value}
+  local source = body(request)
+  if source == "" then return {} end
+  require_json_header(request)
+  return wire.object(source)
 end
 
 local function Worker:authorized(request: http.Request): boolean
@@ -98,26 +111,28 @@ local function Worker:pair(request: http.Request, response: http.Response)
   router.json_response(response, 200, wire.encode(result))
 end
 
-
 local function sse_name(channel: string, data: {string: value}): string
-  local event_type = wire.text(data, "eventType", "create")
   if channel == "roll-events" then return "roll" end
-  if channel == "hooks" then return wire.text(data, "hook", wire.text(data, "hookName", "hook")) end
+  if channel == "hooks" then
+    local name = wire.text(data, "hook", wire.text(data, "hookName", "hook"))
+    if string.find(name, "\n") or string.find(name, "\r") then return "event" end
+    return name
+  end
   local prefix = "chat"
-  if channel == "combat-events" then prefix = "combat" end
-  if channel == "actor-events" then prefix = "actor" end
-  if channel == "scene-events" then prefix = "scene" end
-  local name = prefix .. "-" .. event_type
+  if channel == "combat-events" then prefix = "combat"
+  elseif channel == "actor-events" then prefix = "actor"
+  elseif channel == "scene-events" then prefix = "scene"
+  end
+  local name = prefix .. "-" .. wire.text(data, "eventType", "create")
   if string.find(name, "\n") or string.find(name, "\r") then return prefix end
   return name
 end
-
 
 local function Worker:forward(request: http.Request, response: http.Response, match: router.Match)
   local endpoint = api.endpoint_for(match.action)
   local data: {string: value} = {}
   local content_type = request.headers:get("Content-Type") or "application/octet-stream"
-  if endpoint.special == "upload" and string.sub(string.lower(content_type), 1, 16) ~= "application/json" then
+  if endpoint:is_upload() and string.sub(string.lower(content_type), 1, 16) ~= "application/json" then
     -- Binary upload metadata comes from the declared query parameters.
     data["fileData"] = "data:" .. content_type .. ";base64," .. api.encode_base64(body(request))
   else
@@ -125,15 +140,16 @@ local function Worker:forward(request: http.Request, response: http.Response, ma
   end
   local payload = api.build_payload(endpoint, match, data)
   local client_id? = match.query["clientId"]
-  if not client_id and data["clientId"] is string then client_id = data["clientId"] as string end
-  local selected = self:ask("select", {["clientId"] = client_id}, nil)
-  if selected.status ~= 200 or not selected.world then
-    router.json_response(response, selected.status, selected.body)
-    return
+  if not client_id and data["clientId"] is string then client_id = data["clientId"] end
+  local world: protocol.WorldHandle? = nil
+  case self:ask(messages.ControlAction.select(client_id or ""))
+  when selected(handle) then world = handle
+  when response(status, body) then router.json_response(response, status, body); return
+  else router.error_response(response, 500, "unexpected coordinator reply"); return
   end
   local timeout = self.settings.request_timeout
   if timeout == 0 then timeout = endpoint.timeout_ms end
-  local reply = self.pool:request(selected.world, endpoint.action, payload, timeout)
+  local reply = self.pool:request(world, endpoint.action, payload, timeout)
   if reply.status ~= 200 then router.json_response(response, reply.status, reply.body); return end
   local converted = api.response(endpoint, wire.object(reply.body), match.query["format"])
   response:set_status(converted.status)
@@ -142,12 +158,19 @@ local function Worker:forward(request: http.Request, response: http.Response, ma
   response:write(converted.body)
 end
 
-
 local function Worker:clients(response: http.Response)
   local clients = self.database:list()
-  local snapshot = self:ask("online", {}, nil)
-  if snapshot.status ~= 200 then router.json_response(response, snapshot.status, snapshot.body); return end
-  local online = wire.object(snapshot.body)
+  local online: {string: boolean} = {}
+  case self:ask(online_action)
+  when online_ids(ids) then
+    for index = 1, #ids do online[ids[index]] = true end
+  when response(status, body) then
+    router.json_response(response, status, body)
+    return
+  else
+    router.error_response(response, 500, "unexpected coordinator reply")
+    return
+  end
   local results: {value} = {}
   for index = 1, #clients do
     local client = clients[index]
@@ -164,24 +187,17 @@ local function Worker:clients(response: http.Response)
   router.json_response(response, 200, wire.encode(results))
 end
 
-local function next_event(subscription: protocol.Subscription): string?
-  case subscription.events:receive_result()
-  when message(text) then return text
-  else return nil
-  end
-end
-
 local function Worker:stream(response: http.Response, match: router.Match)
   local channel = string.sub(match.action, 5)
-  local reply = self:ask("subscribe", {["clientId"] = match.query["clientId"], ["channel"] = channel}, nil)
-  if reply.status ~= 200 or not reply.subscription then
-    router.json_response(response, reply.status, reply.body)
-    return
+  local subscription: protocol.Subscription? = nil
+  case self:ask(messages.ControlAction.subscribe(match.query["clientId"] or "", channel))
+  when subscribed(_, sub) then subscription = sub
+  when response(status, body) then router.json_response(response, status, body); return
+  else router.error_response(response, 500, "unexpected coordinator reply"); return
   end
-  local subscription = reply.subscription
   defer do
     subscription.events:close()
-    control.notify(self.coordinator, self.id, "unsubscribe", "{}", nil, subscription)
+    control.notify(self.coordinator, self.id, messages.ControlAction.unsubscribe(subscription.key))
   end
   response:set_header("Content-Type", "text/event-stream")
   response:set_header("Cache-Control", "no-cache")
@@ -190,8 +206,8 @@ local function Worker:stream(response: http.Response, match: router.Match)
   local reading: async.Task<|string?, value|>? = nil
   defer if reading then tasks.drain(reading) end
   while true do
-    if not reading then reading = async.run<|string?, value|>(function (): string? return next_event(subscription) end) end
-    local keepalive = async.run<|nil, value|>(function (): nil timer.sleep(15000); return nil end)
+    if not reading then reading = async.run<|string?, value|>(subscription:next) end
+    local keepalive = async.run<|nil, value|>(wait_keepalive)
     defer tasks.drain(keepalive)
     case async.race_two(reading, keepalive)
     when first(status) then
@@ -200,10 +216,8 @@ local function Worker:stream(response: http.Response, match: router.Match)
         if not text then return end
         local envelope = wire.object(text)
         local data: {string: value} = envelope
-        if envelope["data"] is {string: value} then data = envelope["data"] as {string: value} end
-        local name = sse_name(channel, data)
-        if string.find(name, "\n") or string.find(name, "\r") then name = "event" end
-        response:write("event: " .. name .. "\ndata: " .. wire.encode(data) .. "\n\n")
+        if envelope["data"] is {string: value} then data = envelope["data"] end
+        response:write("event: " .. sse_name(channel, data) .. "\ndata: " .. wire.encode(data) .. "\n\n")
         reading = nil
       else return
       end
@@ -222,35 +236,51 @@ end
 
 local function Worker:session_request(request: http.Request, response: http.Response, match: router.Match)
   response:set_header("Cache-Control", "no-store")
-  local data: {string: value} = {}
   if match.action == "session-handshake" then
-    data = {["address"] = single_header(request, "x-foundry-url", true),
-      ["user"] = single_header(request, "x-username", true),
-      ["world"] = single_header(request, "x-world-name", false)}
-  elseif match.action == "session-start" then
-    data = json_body(request)
+    local address = single_header(request, "x-foundry-url", true)
+    local user = single_header(request, "x-username", true)
+    local world = single_header(request, "x-world-name", false)
+    write_reply(response, self:ask(messages.ControlAction.session_handshake(address, user, world)))
+    return
+  end
+  if match.action == "session-start" then
+    local source = body(request)
+    if source == "" then
+      source = "{}"
+    else
+      require_json_header(request)
+      wire.object(source)
+    end
     local key = store.secure_token(16)
-    data["requestKey"] = key
-    defer control.notify(self.coordinator, self.id, "session-discard",
-      wire.encode({["requestKey"] = key}), nil, nil)
-    local reply = self:ask("session-start", data, nil)
-    router.json_response(response, reply.status, reply.body)
-    if reply.status == 200 then
-      local published = self:ask("session-publish", {["requestKey"] = key}, nil)
-      if published.status ~= 200 then response:abort() end
+    defer control.notify(self.coordinator, self.id, messages.ControlAction.session_discard(key))
+    case self:ask(messages.ControlAction.session_start(key, source))
+    when response(status, reply_body) then
+      router.json_response(response, status, reply_body)
+      if status == 200 then
+        case self:ask(messages.ControlAction.session_publish(key))
+        when ack() then
+        else response:abort()
+        end
+      end
+    else router.error_response(response, 500, "unexpected coordinator reply")
     end
     return
-  elseif match.action == "session-end" then
+  end
+  if match.action == "session-end" then
     local id = match.query["sessionId"] or ""
     if id == "" then id = wire.text(json_body(request), "sessionId") end
-    data = {["sessionId"] = id}
+    write_reply(response, self:ask(messages.ControlAction.session_end(id)))
+    return
   end
-  local reply = self:ask(match.action, data, nil)
-  router.json_response(response, reply.status, reply.body)
+  write_reply(response, self:ask(session_list_action))
 end
 
 local function Worker:dispatch(request: http.Request, response: http.Response, resolution: router.Resolution)
-  if not self:origin_allowed(request) then router.error_response(response, 403, "origin is not allowed"); return end
+  if not self.settings:request_origin_allowed(request.headers:values("Origin"),
+      request.url.scheme, request.url.authority) then
+    router.error_response(response, 403, "origin is not allowed")
+    return
+  end
   local origin? = request.headers:get("Origin")
   if origin then
     response:set_header("Access-Control-Allow-Origin", origin)
@@ -272,24 +302,26 @@ local function Worker:dispatch(request: http.Request, response: http.Response, r
   if match.action == "pair" then self:pair(request, response); return end
   if match.action == "relay" then router.error_response(response, 400, "id is required"); return end
   if match.action == "unpair" then
-    local reply = self:ask("revoke", json_body(request), nil)
-    router.json_response(response, reply.status, reply.body)
+    local data = json_body(request)
+    write_reply(response, self:ask(messages.ControlAction.revoke(wire.text(data, "token"))))
     return
   end
   if match.action == "active" then
     local id = match.params["clientId"]
     if not self.database:get(id) then router.error_response(response, 404, "unknown client"); return end
-    local snapshot = self:ask("online", {}, nil)
-    if snapshot.status ~= 200 then router.json_response(response, snapshot.status, snapshot.body); return end
-    router.json_response(response, 200, wire.encode({["active"] = wire.object(snapshot.body)[id] == true}))
+    case self:ask(messages.ControlAction.is_online(id))
+    when active(is_active) then
+      router.json_response(response, 200, is_active and "{\"active\":true}" or "{\"active\":false}")
+    when response(status, reply_body) then router.json_response(response, status, reply_body)
+    else router.error_response(response, 500, "unexpected coordinator reply")
+    end
     return
   end
   if not self:authorized(request) then router.error_response(response, 401, "invalid API key"); return end
   if string.sub(match.action, 1, 8) == "session-" then self:session_request(request, response, match); return end
   if match.action == "clients" then self:clients(response); return end
   if match.action == "forget" then
-    local reply = self:ask("delete", {["clientId"] = match.params["clientId"]}, nil)
-    router.json_response(response, reply.status, reply.body)
+    write_reply(response, self:ask(messages.ControlAction.delete_client(match.params["clientId"])))
     return
   end
   if string.sub(match.action, 1, 4) == "sse:" then self:stream(response, match); return end
@@ -311,10 +343,7 @@ local function Worker:handle(request: http.Request, response: http.Response)
   local resolution = self.routes:match(request.method, request.target)
   local route = "<unmatched>"
   if resolution.match then route = resolution.match.route.pattern end
-  local method = request.method
-  if method ~= "GET" and method ~= "POST" and method ~= "PUT" and method ~= "PATCH" and
-     method ~= "DELETE" and method ~= "OPTIONS" and method ~= "HEAD" and
-     method ~= "CONNECT" and method ~= "TRACE" then method = "OTHER" end
+  local method = known_methods[request.method] and request.method or "OTHER"
   log.emit(self.logger, "info", "http_request", {["method"] = method, ["route"] = route})
   self:dispatch(request, response, resolution)
 end

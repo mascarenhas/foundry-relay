@@ -217,14 +217,22 @@ end
 function test_secure_token_and_secret_comparison(_context: test.Context)
   local token = store.secure_token()
   local second = store.secure_token()
-  test.assert(#token == 64 and #store.secure_token(16) == 32,
+  test.assert(#token == 64 and #store.secure_token(16) == 32 and
+              #store.secure_token(1) == 2 and #store.secure_token(1024) == 2048,
               "random token has the wrong byte length")
   test.assert(token ~= second, "independent OS random tokens unexpectedly repeated")
   for index = 1, #token do
     local found? = string.find("0123456789abcdef", string.sub(token, index, index))
     test.assert(found ~= nil, "random token is not lowercase hex")
   end
-  test.assert(store.same_secret(token, token) and not store.same_secret(token, second) and
-              not store.same_secret(token, token .. "0"), "secret comparison gave the wrong result")
+  test.assert(store.same_secret(token, token) and store.same_secret("", "") and
+              not store.same_secret(token, second) and
+              not store.same_secret(token, token .. "0") and
+              not store.same_secret(token .. "0", token) and
+              not store.same_secret(token, token .. "\0") and
+              not store.same_secret("", "a") and
+              not store.same_secret("a", ""),
+              "secret comparison gave the wrong result")
   expect_error(function() store.secure_token(0) end, "random token size must be between 1 and 1024 bytes")
+  expect_error(function() store.secure_token(1025) end, "random token size must be between 1 and 1024 bytes")
 end

@@ -33,6 +33,25 @@ end
 local const client_columns = "client_id, token, world_id, world_title, " ..
   "server_fingerprint, server_origin, module_version, metadata_json, last_seen"
 
+local const hex_bytes: const {string} = {
+  "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "0a", "0b", "0c", "0d", "0e", "0f",
+  "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "1a", "1b", "1c", "1d", "1e", "1f",
+  "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "2a", "2b", "2c", "2d", "2e", "2f",
+  "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "3a", "3b", "3c", "3d", "3e", "3f",
+  "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "4a", "4b", "4c", "4d", "4e", "4f",
+  "50", "51", "52", "53", "54", "55", "56", "57", "58", "59", "5a", "5b", "5c", "5d", "5e", "5f",
+  "60", "61", "62", "63", "64", "65", "66", "67", "68", "69", "6a", "6b", "6c", "6d", "6e", "6f",
+  "70", "71", "72", "73", "74", "75", "76", "77", "78", "79", "7a", "7b", "7c", "7d", "7e", "7f",
+  "80", "81", "82", "83", "84", "85", "86", "87", "88", "89", "8a", "8b", "8c", "8d", "8e", "8f",
+  "90", "91", "92", "93", "94", "95", "96", "97", "98", "99", "9a", "9b", "9c", "9d", "9e", "9f",
+  "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "aa", "ab", "ac", "ad", "ae", "af",
+  "b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9", "ba", "bb", "bc", "bd", "be", "bf",
+  "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "ca", "cb", "cc", "cd", "ce", "cf",
+  "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9", "da", "db", "dc", "dd", "de", "df",
+  "e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "ea", "eb", "ec", "ed", "ee", "ef",
+  "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "fa", "fb", "fc", "fd", "fe", "ff",
+}
+
 -- libuv uses the operating system's cryptographically secure random source.
 -- The synchronous form retains no callbacks or borrowed native state.
 function secure_token(bytes: integer?): string
@@ -45,17 +64,19 @@ function secure_token(bytes: integer?): string
   if status ~= 0 then raise "secure random source failed: " .. uv.strerror(status) end
   local output = string.writer()
   for index = 1, count do
-    output:write(string.format("%02x", buffer:get(index)))
+    output:write(hex_bytes[buffer:get(index) + 1])
   end
   return output:drain()
 end
 
+-- Scan all bytes, including when lengths differ.
 function same_secret(first: string, second: string): boolean
-  if #first ~= #second then return false end
-  local difference = 0
-  for index = 1, #first do
-    local left: integer = string.byte(first, index)
-    local right: integer = string.byte(second, index)
+  local difference = #first ~ #second
+  local maximum = #first
+  if #second > maximum then maximum = #second end
+  for index = 1, maximum do
+    local left = string.byte(first, index) or 0
+    local right = string.byte(second, index) or 0
     difference = difference | (left ~ right)
   end
   return difference == 0
@@ -86,6 +107,8 @@ end
 
 local function connection(path: string): sqlite3.Connection
   local db = sqlite3.connect(path)
+  local ready = false
+  defer if not ready then db:close() end
   -- Each operation closes its own connection before handing the Store onward.
   -- SQLite reports BUSY promptly; cooperative retry owns the wait budget.
   do
@@ -93,10 +116,8 @@ local function connection(path: string): sqlite3.Connection
     defer statement:close()
     local cursor = statement:query()
     defer cursor:close()
-  catch
-    db:close()
-    raise
   end
+  ready = true
   return db
 end
 
@@ -135,12 +156,10 @@ local function Store:acquire()
     -- but before its deferred wake runs. Hand that reservation onward too.
     if self.owner == current then self:release() end
   end
-  do
-    async.suspend(waiter.token, detach)
-  catch
-    detach()
-    raise
-  end
+  local acquired = false
+  defer if not acquired then detach() end
+  async.suspend(waiter.token, detach)
+  acquired = true
 end
 
 -- Every attempt materializes its result, releases statements/cursors, and
@@ -155,21 +174,17 @@ local function retry_operation<|T|>(path: string, write: boolean,
     if previous ~= nil and uv.hrtime() >= deadline then raise previous end
     local committed = false
     do
-      return (function (): T
-        local db = connection(path)
-        defer db:close()
-        defer do
-          if write and not committed then db:rollback() end
-        end
-        if write then execute(db, "BEGIN IMMEDIATE") end
-        local result = operation(db)
-        if write then
-          db:commit()
-          -- Guard publication/cleanup failures after an acknowledged commit.
-          committed = true
-        end
-        return result
-      end)()
+      local db = connection(path)
+      defer db:close()
+      defer if write and not committed and not db:get_autocommit() then db:rollback() end
+      if write then execute(db, "BEGIN IMMEDIATE") end
+      local result = operation(db)
+      if write then
+        db:commit()
+        -- Guard publication/cleanup failures after an acknowledged commit.
+        committed = true
+      end
+      return result
     catch
       if committed or not (error is sqlite3.Error) then raise end
       local failure: sqlite3.Error = error

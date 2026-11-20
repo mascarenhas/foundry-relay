@@ -1,8 +1,6 @@
 -- Main-state live directory and persistent SSE registry. Transports live in world.
 local async = import "async"
-local timer = import "timer"
 local thread = import "thread"
-local uv = import "uv"
 local iteration = import "iteration"
 local wire = import "relay.wire"
 local store = import "relay.store"
@@ -34,9 +32,9 @@ record Session
   local retirement: async.Task<|nil, value|>?
 end
 
-local record Selection
-  const session: Session?
-  const problem: string?
+local union Selection
+  found(session: Session)
+  unavailable(problem: string)
 end
 
 local record Publication
@@ -59,8 +57,6 @@ function Hub.new(maximum: integer, heartbeat: integer, logger: log.Logger?): Hub
   return {sessions = {}, subscribers = {}, maximum = maximum, heartbeat = heartbeat,
     closed = false, logger = logger, owner = nil, waiters = {}}
 end
-
-function drain<|A|>(task: async.Task<|A, value|>) tasks.drain(task) end
 
 local function Hub:remove_waiter(waiter: Waiter)
   for index = 1, #self.waiters do
@@ -90,8 +86,10 @@ local function Hub:acquire()
     self:remove_waiter(waiter)
     if self.owner == current then self:release() end
   end
-  do async.suspend(waiter.token, detach)
-  catch detach(); raise end
+  local acquired = false
+  defer if not acquired then detach() end
+  async.suspend(waiter.token, detach)
+  acquired = true
 end
 
 -- Reentrant only for the same Task: Manager admission calls online/select.
@@ -183,13 +181,20 @@ end
 
 function Hub:subscription_snapshot(id: string): protocol.Activation
   local targets: {protocol.SubscriptionTarget} = {}
+  local by_channel: {string: integer} = {}
   for index = 1, #self.subscribers do
     local entry = self.subscribers[index]
-    if entry.subscription.client_id == id and not entry.target.events:is_closed() then targets[#targets + 1] = entry.target end
+    if entry.subscription.client_id == id and not entry.target.events:is_closed() then
+      targets[#targets + 1] = entry.target
+      local channel = entry.target.channel
+      by_channel[channel] = (by_channel[channel] or 0) + 1
+    end
   end
-  local channels: const {string} = {"chat-events", "roll-events", "hooks", "combat-events", "actor-events", "scene-events"}
   local counts: {protocol.ChannelCount} = {}
-  for index = 1, #channels do counts[index] = protocol.ChannelCount(channels[index], self:subscription_count(id, channels[index])) end
+  for index = 1, #protocol.SSE_CHANNELS do
+    local channel = protocol.SSE_CHANNELS[index]
+    counts[index] = protocol.ChannelCount(channel, by_channel[channel] or 0)
+  end
   return protocol.Activation(targets, counts)
 end
 
@@ -197,8 +202,8 @@ function Hub:publish_authenticated(world: protocol.WorldHandle): (Session, proto
   local published = self:transition<|Publication|>(function (): Publication
     if self.closed or world.health:is_closed() then raise "relay is closed" end
     local old? = self.sessions[world.client_id]
-    if old then old:quiesce("replacement") end
     if old then
+      old:quiesce("replacement")
       old.closed = true
       if self.sessions[old.id] == old then self.sessions[old.id] = nil end
       old.retirement = async.run<|nil, value|>(function (): nil return old:stop(true) end)
@@ -229,35 +234,42 @@ function Hub:online(id: string): boolean
   end)
 end
 
-function Hub:online_ids(): {string}
-  return self:transition<|{string}|>(function (): {string}
+function Hub:online_ids(): const {string}
+  return self:transition<|const {string}|>(function (): const {string}
     local ids: {string} = {}
     if not self.closed then
-      for id, session in iteration.pairs(self.sessions) do if not session.closed and not session.world.health:is_closed() then ids[#ids + 1] = id end end
+      for id, session in iteration.pairs(self.sessions) do
+        if not session.closed and not session.world.health:is_closed() then ids[#ids + 1] = id end
+      end
     end
-    return ids
+    return ids as const {string}
   end)
 end
 
 function Hub:select(id: string?): (Session?, string?)
   local selected = self:transition<|Selection|>(function (): Selection
-    if self.closed then return Selection(nil, "relay is closed") end
+    if self.closed then return Selection.unavailable("relay is closed") end
     if id and id ~= "" then
       local session? = self.sessions[id]
-      if session and not session.closed and not session.world.health:is_closed() then return Selection(session, nil) end
-      return Selection(nil, "Foundry world is offline")
+      if session and not session.closed and not session.world.health:is_closed() then
+        return Selection.found(session)
+      end
+      return Selection.unavailable("Foundry world is offline")
     end
-    local selected: Session? = nil
+    local found: Session? = nil
     for _, session in iteration.pairs(self.sessions) do
       if not session.closed and not session.world.health:is_closed() then
-        if selected then return Selection(nil, "multiple worlds are online; specify clientId") end
-        selected = session
+        if found then return Selection.unavailable("multiple worlds are online; specify clientId") end
+        found = session
       end
     end
-    if not selected then return Selection(nil, "no Foundry worlds are online") end
-    return Selection(selected, nil)
+    if not found then return Selection.unavailable("no Foundry worlds are online") end
+    return Selection.found(found)
   end)
-  return selected.session, selected.problem
+  case selected
+  when found(session) then return session, nil
+  when unavailable(problem) then return nil, problem
+  end
 end
 
 function Session:request(action: string, payload: {string: value}, timeout: integer): Reply
@@ -275,10 +287,13 @@ function Hub:subscribe(id: string, channel: string): protocol.Subscription
     local tx, rx = thread.channel<|string|>(128)
     local key = store.secure_token(16)
     local subscription = protocol.Subscription(key, id, channel, rx)
-    self.subscribers[#self.subscribers + 1] = Subscriber(subscription, protocol.SubscriptionTarget(key, channel, tx))
+    local target = protocol.SubscriptionTarget(key, channel, tx)
+    self.subscribers[#self.subscribers + 1] = Subscriber(subscription, target)
     do
       local session? = self.sessions[id]
-      if session and not session.closed then session.world.commands:send(protocol.WorldCommand.subscribe(self.subscribers[#self.subscribers].target, self:subscription_count(id, channel))) end
+      if session and not session.closed then
+        session.world.commands:send(protocol.WorldCommand.subscribe(target, self:subscription_count(id, channel)))
+      end
     catch self:unsubscribe(key); raise end
     return subscription
   end)

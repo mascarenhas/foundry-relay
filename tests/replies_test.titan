@@ -8,6 +8,7 @@ local uv = import "uv"
 local protocol = import "relay.world_protocol"
 local replies = import "relay.replies.titan"
 local log = import "relay.log"
+local tasks = import "relay.tasks"
 local wire = import "relay.wire"
 
 local record Fixture
@@ -37,28 +38,13 @@ local function Fixture:close()
   self.handle.health:close()
 end
 
-local function finish<|T|>(task: async.Task<|T, value|>)
-  if task:status():has_finished() then return end
-  local remove: (function (): ())? = nil
-  defer if remove then remove() end
-  async.await_cleanup<|nil, nil|>(function (resolve, _reject, _fatal)
-    if task:status():has_finished() then resolve(nil)
-    else remove = task:add_terminal_listener(function (_status) resolve(nil) end)
-    end
-  end)
-end
-
-local function stop<|T|>(task: async.Task<|T, value|>)
-  task:cancel()
-  finish(task)
-end
-
 local function result<|T|>(task: async.Task<|T, value|>): T
   case async.join(task)
   when succeeded(item) then return item
-  when failed(failure) then raise failure
+  when failed(failure) then failure:raise()
   else raise "test request did not succeed"
   end
+  raise "test request failed"
 end
 
 local function wait_for(predicate: function (): boolean)
@@ -120,13 +106,13 @@ function test_four_leases_reuse_with_nine_concurrent_requests_and_fifo_waiters(_
   defer do worker:cancel(); worker:join() end
   local original: {thread.Sender<|protocol.WorldReply|>} = {}
   for _, lease in iteration.ipairs(f.pool.leases) do original[#original + 1] = lease.sender end
-  local tasks: {async.Task<|protocol.WorldReply, value|>} = {}
-  defer for _, task in iteration.ipairs(tasks) do stop(task) end
-  for index = 1, 9 do tasks[#tasks + 1] = request(f, "request-" .. index, 5000) end
+  local pending: {async.Task<|protocol.WorldReply, value|>} = {}
+  defer for _, task in iteration.ipairs(pending) do tasks.drain(task) end
+  for index = 1, 9 do pending[#pending + 1] = request(f, "request-" .. index, 5000) end
   wait_for(function (): boolean return #f.pool.waiters == 5 end)
   test.assert(#f.pool.leases == 4, "pool allocated more than four concurrent reply channels")
   gate:send(nil)
-  for index, task in iteration.ipairs(tasks) do
+  for index, task in iteration.ipairs(pending) do
     local received = result(task)
     test.assert(received.status == 200 and received.body == "request-" .. index)
     test.assert(observations:receive() == "request-" .. index, "lease waiters were not FIFO")
@@ -146,7 +132,7 @@ function test_complete_wire_payload_uses_secure_id_and_does_not_mutate_input(_co
   local task = async.run<|protocol.WorldReply, value|>(function (): protocol.WorldReply
     return f.pool:request(f.handle, "entity", payload, 1000)
   end)
-  defer stop(task)
+  defer tasks.drain(task)
   local message = f.incoming:receive()
   local envelope = wire.object(message.payload_json)
   test.assert(#message.request_id == 32 and message.request_id ~= "old-id")
@@ -162,13 +148,13 @@ function test_cancelled_acquire_withdraws_without_poisoning_another_lease(_conte
   local f = fixture(1)
   defer f:close()
   local first = request(f)
-  defer stop(first)
+  defer tasks.drain(first)
   local message = f.incoming:receive()
   local sender = f.pool.leases[1].sender
   local waiting = request(f)
-  defer stop(waiting)
+  defer tasks.drain(waiting)
   wait_for(function (): boolean return #f.pool.waiters == 1 end)
-  stop(waiting)
+  tasks.drain(waiting)
   test.assert(waiting:status():has_cancelled() and #f.pool.waiters == 0)
   test.assert(f.pool.leases[1].sender == sender and not sender:is_closed())
   answer(message)
@@ -184,11 +170,11 @@ function test_cancelled_reserved_acquire_returns_the_slot(_context: test.Context
     if acquired then pool:release(acquired, true) end
     return nil
   end)
-  defer stop(waiting)
+  defer tasks.drain(waiting)
   wait_for(function (): boolean return #pool.waiters == 1 end)
   pool:release(first, true)
   waiting:cancel()
-  finish(waiting)
+  tasks.await_terminal(waiting)
   test.assert(waiting:status():has_cancelled() and not pool.leases[1].busy and #pool.waiters == 0,
               "cancelled deferred wake stranded its reserved reply lease")
 end
@@ -197,13 +183,13 @@ function test_cancelled_enqueue_retires_its_channel_and_does_not_deliver(_contex
   local f = fixture(2, 1)
   defer f:close()
   local first = request(f, "first")
-  defer stop(first)
+  defer tasks.drain(first)
   wait_for(function (): boolean return f.pool.leases[1].busy end)
   local old = f.pool.leases[2].sender
   local waiting = request(f, "cancelled")
-  defer stop(waiting)
+  defer tasks.drain(waiting)
   wait_for(function (): boolean return f.pool.leases[2].busy end)
-  stop(waiting)
+  tasks.drain(waiting)
   test.assert(waiting:status():has_cancelled() and old:is_closed() and
     f.pool.leases[2].sender ~= old, "cancelled enqueue retained a usable reply endpoint")
   local delivered = f.incoming:receive()
@@ -218,17 +204,17 @@ function test_cancelled_receive_rejects_late_reply_and_replaces_the_lease(_conte
   local f = fixture(1)
   defer f:close()
   local first = request(f)
-  defer stop(first)
+  defer tasks.drain(first)
   local message = f.incoming:receive()
   local old = f.pool.leases[1].sender
-  stop(first)
+  tasks.drain(first)
   test.assert(first:status():has_cancelled() and message.reply:is_closed() and
     f.pool.leases[1].sender ~= old)
   local rejected = false
   do answer(message) catch rejected = true end
   test.assert(rejected, "cancelled receiver accepted a late reply")
   local replacement = request(f, "replacement")
-  defer stop(replacement)
+  defer tasks.drain(replacement)
   answer(f.incoming:receive())
   test.assert(result(replacement).body == "replacement")
 end
@@ -237,10 +223,10 @@ function test_timeout_includes_waiting_for_a_lease(_context: test.Context)
   local f = fixture(1)
   defer f:close()
   local first = request(f)
-  defer stop(first)
+  defer tasks.drain(first)
   local held = f.incoming:receive()
   local expired = request(f, "expired", 10)
-  defer stop(expired)
+  defer tasks.drain(expired)
   test.assert(result(expired).status == 408 and #f.pool.waiters == 0)
   local delivered = f.incoming:try_receive()
   test.assert(not delivered, "expired lease waiter reached the world")
@@ -252,10 +238,10 @@ function test_timeout_includes_full_enqueue_backpressure(_context: test.Context)
   local f = fixture(2, 1)
   defer f:close()
   local first = request(f, "first")
-  defer stop(first)
+  defer tasks.drain(first)
   wait_for(function (): boolean return f.pool.leases[1].busy end)
   local expired = request(f, "expired", 10)
-  defer stop(expired)
+  defer tasks.drain(expired)
   test.assert(result(expired).status == 408)
   local held = f.incoming:receive()
   test.assert(held.action == "first")
@@ -287,7 +273,7 @@ function test_timed_out_reply_endpoint_is_closed_in_a_real_worker(_context: test
   defer do worker:cancel(); worker:join() end
   started:receive()
   local expired = request(f, "expired", 20)
-  defer stop(expired)
+  defer tasks.drain(expired)
   test.assert(result(expired).status == 408)
   gate:send(nil)
   test.assert(joined(worker), "old sending endpoint stayed usable in the world thread")
@@ -297,10 +283,10 @@ function test_reply_deadline_is_not_reset_after_lease_acquisition(_context: test
   local f = fixture(1)
   defer f:close()
   local first = request(f)
-  defer stop(first)
+  defer tasks.drain(first)
   local held = f.incoming:receive()
   local waiting = request(f, "waiting", 1000)
-  defer stop(waiting)
+  defer tasks.drain(waiting)
   wait_for(function (): boolean return #f.pool.waiters == 1 end)
   local registered = uv.hrtime()
   timer.sleep(1)
@@ -335,12 +321,12 @@ function test_world_failure_releases_receive_and_multiple_acquire_waiters(_conte
   local f = fixture(1)
   defer f:close()
   local first = request(f)
-  defer stop(first)
+  defer tasks.drain(first)
   f.incoming:receive()
   local second = request(f)
-  defer stop(second)
+  defer tasks.drain(second)
   local third = request(f)
-  defer stop(third)
+  defer tasks.drain(third)
   wait_for(function (): boolean return #f.pool.waiters == 2 end)
   f.health:close()
   test.assert(result(first).status == 503 and result(second).status == 503 and
@@ -353,10 +339,10 @@ function test_pool_close_releases_active_and_waiting_requests(_context: test.Con
   local f = fixture(1)
   defer f:close()
   local first = request(f)
-  defer stop(first)
+  defer tasks.drain(first)
   f.incoming:receive()
   local second = request(f)
-  defer stop(second)
+  defer tasks.drain(second)
   wait_for(function (): boolean return #f.pool.waiters == 1 end)
   f.pool:close()
   f.pool:close()
@@ -395,7 +381,7 @@ local function TimeoutCapture:assert_timeout(kind: string, secrets: {string})
     fields["client_id"] == "client" and fields["type"] == kind,
     "Timeout log omitted its finite event, client, or request category")
   for _, secret in iteration.ipairs(secrets) do
-    test.assert(string.find(line, secret, 1, true) == nil, "Timeout log leaked private request data")
+    test.assert(string.find(line, secret, 1) == nil, "Timeout log leaked private request data")
   end
 end
 
@@ -407,7 +393,7 @@ function test_caller_deadline_logs_once_without_a_world_timer(_context: test.Con
   local expired = async.run<|protocol.WorldReply, value|>(function (): protocol.WorldReply
     return f.pool:request(f.handle, "world-info", {["secret"] = "LEAK_TIMEOUT_PAYLOAD"}, 20)
   end)
-  defer stop(expired)
+  defer tasks.drain(expired)
   -- This fixture has no world deadline owner. Only the caller can expire it.
   local held = f.incoming:receive()
   test.assert(result(expired).status == 408 and held.reply:is_closed())
@@ -420,7 +406,7 @@ function test_world_timeout_reply_logs_once_before_the_caller_deadline(_context:
   local f = fixture(1, nil, capture.logger)
   defer f:close()
   local pending = request(f, "world-info", 5000)
-  defer stop(pending)
+  defer tasks.drain(pending)
   local held = f.incoming:receive()
   held.reply:send(protocol.WorldReply(held.request_id, 408, "LEAK_WORLD_TIMEOUT_BODY"))
   local response = result(pending)
@@ -447,7 +433,7 @@ function test_timeout_log_uses_unknown_for_an_unrecognized_action(_context: test
   local expired = async.run<|protocol.WorldReply, value|>(function (): protocol.WorldReply
     return f.pool:request(f.handle, "LEAK_TIMEOUT_ACTION", {["secret"] = "LEAK_UNKNOWN_PAYLOAD"}, 20)
   end)
-  defer stop(expired)
+  defer tasks.drain(expired)
   local held = f.incoming:receive()
   test.assert(result(expired).status == 408)
   capture:assert_timeout("unknown", {held.request_id, "LEAK_TIMEOUT_ACTION", "LEAK_UNKNOWN_PAYLOAD"})

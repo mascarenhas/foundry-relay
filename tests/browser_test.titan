@@ -11,7 +11,7 @@ local timer = import "timer"
 local uv = import "uv"
 local websocket = import "websocket"
 local browser = import "relay.browser.titan"
-local hub = import "relay.hub"
+local tasks = import "relay.tasks"
 local wire = import "relay.wire"
 
 local function debugging_listener_refused(port: integer): boolean
@@ -28,13 +28,13 @@ local function debugging_listener_refused(port: integer): boolean
       return false
     end
   end)
-  defer hub.drain(probe)
+  defer tasks.drain(probe)
   local deadline = async.run<|nil, value|>(function(): nil
     timer.sleep(1000)
     probe:cancel()
     return nil
   end)
-  defer hub.drain(deadline)
+  defer tasks.drain(deadline)
   case async.join(probe)
   when succeeded(refused) then return refused
   else return false
@@ -92,8 +92,8 @@ end
 
 local function BrowserPeer:close()
   self.listener:close()
-  for _, reader in iteration.ipairs(self.readers) do hub.drain(reader) end
-  if self.serving then hub.drain(self.serving) end
+  for _, reader in iteration.ipairs(self.readers) do tasks.drain(reader) end
+  if self.serving then tasks.drain(self.serving) end
 end
 
 local function BrowserPeer:finish()
@@ -354,7 +354,7 @@ function test_cancellation_reaps_child_and_profile(_context: test.Context)
     defer launched:close()
     return nil
   end)
-  defer hub.drain(starting)
+  defer tasks.drain(starting)
   local deadline = uv.hrtime() + 2000000000
   while not fs.lstat(instance.directory .. "/started") do
     test.assert(uv.hrtime() < deadline, "Fake browser did not start")
@@ -408,7 +408,7 @@ function test_concurrent_close_reuses_owned_retirement(_context: test.Context)
     timer.sleep(5)
   end
   local closing = async.run<|nil, value|>(function (): nil owner:close(); return nil end)
-  defer hub.drain(closing)
+  defer tasks.drain(closing)
   owner:close()
   case async.join(closing)
   when succeeded() then

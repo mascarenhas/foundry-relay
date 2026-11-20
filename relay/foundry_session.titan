@@ -66,9 +66,16 @@ local function session_metadata(response: hub.Reply, world: string): {string: va
     ["systemVersion"] = wire.text(system, "version") }
 end
 
+local const phase_errors: {string: string} = {
+  ["pairing-mismatch"] = "Foundry pairing settings do not match",
+  ["wrong-world"] = "Foundry loaded a different world",
+  ["wrong-user"] = "Foundry user is not the configured full GM",
+  ["admin-login"] = "Foundry administrator login is required",
+}
+
 local function owns_connection(worlds: hub.Hub, client_id: string,
                                expected: hub.Session): boolean
-  local current?, _problem? = worlds:select(client_id)
+  local current? = worlds:select(client_id)
   return current == expected
 end
 
@@ -184,7 +191,7 @@ function start(options: Options, executable: string, profile_parent: string,
     if not instance:running() then raise "Headless browser exited" end
     local phase = page_state(instance, remaining(deadline, 5000))
     if phase == "authenticated" and worlds:online(options.client.client_id) then
-      local relay?, _problem? = worlds:select(options.client.client_id)
+      local relay? = worlds:select(options.client.client_id)
       if relay then
         local response = relay:request("world-info", {}, remaining(deadline, 10000))
         local metadata = session_metadata(response, options.world)
@@ -194,7 +201,8 @@ function start(options: Options, executable: string, profile_parent: string,
         end
         remaining(deadline, 1)
         published = true
-        return Session(instance, relay, options.client.client_id, metadata)
+        return Session { browser = instance, relay = relay,
+          client_id = options.client.client_id, metadata = metadata }
       end
     elseif phase == "join" then
       if not submitted then
@@ -202,11 +210,7 @@ function start(options: Options, executable: string, profile_parent: string,
       end
     elseif phase ~= "waiting" and phase ~= "bound" and phase ~= "authenticated" then
       -- Only our finite phase names leave the page; no DOM or console data.
-      if phase == "pairing-mismatch" then raise "Foundry pairing settings do not match" end
-      if phase == "wrong-world" then raise "Foundry loaded a different world" end
-      if phase == "wrong-user" then raise "Foundry user is not the configured full GM" end
-      if phase == "admin-login" then raise "Foundry administrator login is required" end
-      raise "Foundry requires setup or an active REST API module"
+      raise phase_errors[phase] or "Foundry requires setup or an active REST API module"
     end
     timer.sleep(remaining(deadline, 100))
   end

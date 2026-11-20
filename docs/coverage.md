@@ -1,76 +1,104 @@
-# Native production source coverage
+# Appendix B: Executable Line Coverage
 
-The relay uses Titan's native `--coverage` support and the existing test suite.
-Each executable prints a Titan executable-line summary and writes its annotated
-report directly. The workflow requires a matching C coverage toolchain; it has
-no Python, gcovr, or relay-specific report-processing dependency.
+Executable-line coverage for `foundry-relay` builds directly on Titan's native
+`--coverage` compiler mode and the existing `titan.test` suite. Each
+instrumented binary prints a Titan executable-line summary and writes its own
+annotated `.gcov` report without Python, `gcovr`, or relay-specific
+post-processing scripts.
 
 ## Tools
 
-Use the Titan SDK selected for the [ordinary build](../README.md#build-and-test);
-it must support native `--coverage`.
+Use the prepared Titan SDK selected for
+[Build and test](../README.md#build-and-test) and
+[Appendix A: POSIX build](build-and-testing.md#posix-build); it must support
+native `--coverage`.
 
-On Linux, use GCC 14 or newer and the matching `gcov`. Use the same OpenSSL mode
-as the installed SDK. System OpenSSL needs its development files and
-`pkg-config`, as for the ordinary build. `make coverage-run` uses the
-`TEST_TIMEOUT` execution budget and the same `timeout` command as `make test`.
+On Linux, install GCC 14 or newer and the matching `gcov` binary. Match
+`OPENSSL_MODE` to the installed SDK (system OpenSSL requires OpenSSL 3.0+
+development headers and `pkg-config`). `make coverage-run` enforces the same
+`TEST_TIMEOUT` budget and requires the same `timeout` command on `PATH` as
+`make test`.
 
 ## Build and run
 
-From the relay repository, with the prepared SDK on `PATH`:
+From the repository root, with the prepared SDK on `PATH`:
 
 ```sh
 export PATH=/path/to/titan-sdk/bin:$PATH
 make coverage CC=/usr/bin/gcc COVERAGE_GCOV=/usr/bin/gcov
 ```
 
-`make coverage-build` removes and recompiles both coverage trees; it does not
-reuse incremental objects. `make coverage-run` runs the existing binaries and
-their native reporters without recompiling. Keep authored sources unchanged
-between those commands, and supply the same SDK and tool settings. `TITANC`,
-`TITAN_STDLIB`, `TITAN_JOBS`, and `OPENSSL_MODE` work as for ordinary builds.
+[`Makefile`](../Makefile) splits coverage into two targets:
 
-`COVERAGE_GCOV` defaults to the absolute path found for `gcov`. Use an absolute
-path when overriding it: the executable test deliberately gives its relay child
-an unusable `PATH`.
+- `make coverage-build` removes and recompiles `build/coverage-app` and
+  `build/coverage-tests` cleanly without `--incremental`, unsetting inherited
+  `GCOV_PREFIX` and `GCOV_PREFIX_STRIP`.
+- `make coverage-run` runs the compiled coverage binaries and their native
+  reporters without recompiling, clearing inherited `TITAN_FILTER`,
+  `GCOV_PREFIX`, and `GCOV_PREFIX_STRIP` and ignoring `TEST_ARGS`.
 
-Both executables compile authored sources directly using `--output`:
+Keep authored sources unchanged and tool variables identical between separate
+`coverage-build` and `coverage-run` invocations. `TITANC`, `TITAN_STDLIB`,
+`TITAN_JOBS`, and `OPENSSL_MODE` behave identically to
+[POSIX build](build-and-testing.md#posix-build). `COVERAGE_GCOV` defaults to
+`command -v gcov`; always pass an absolute path when overriding it, because
+`test_relocated_executable_runs_without_compiler_or_provider` in
+[`tests/process_test.titan`](../tests/process_test.titan) launches the relay
+child with `PATH=/nonexistent-foundry-relay-tools`.
+
+Each covered image compiles into its own `--output` tree:
 
 | Image | Executable | Native report |
 | --- | --- | --- |
 | Full native test runner | `build/coverage-tests/tests/router_test` | `build/coverage-tests/.coverage/report/coverage.gcov` |
 | Relay child | `build/coverage-app/main` | `build/coverage-app/.coverage/report/coverage.gcov` |
 
-Instrumented production C, headers, objects, and counters live in `.coverage` subdirectories
-inside those output trees. The two covered images use separate counter paths
-because each resets and dumps its own counters. Ordinary application and test
-links continue to share uninstrumented objects under `build`.
+Instrumented C, headers, objects, `.gcno` notes, and `.gcda` counters live in
+`.coverage` subdirectories inside each tree, leaving ordinary uninstrumented
+objects under `build/` untouched. Separate output trees are mandatory because
+both executables run concurrently during `make coverage-run`: each binary
+resets its own `.gcda` counters on startup and dumps them at exit through
+Titan's embedded reporter. Sharing one `--output` directory would let the
+spawned child overwrite the test runner's live counters.
 
-`coverage-run` runs the full suite, ignores `TEST_ARGS`, and clears inherited
-`TITAN_FILTER`, `GCOV_PREFIX`, and `GCOV_PREFIX_STRIP`. `tests/process_test.titan`
-launches the covered relay child through `RELAY_TEST_EXECUTABLE`, exercises
-startup and shutdown, checks the child's coverage summary and report path, and
-joins it before the runner finishes. Each executable then collects and reports
-through Titan's embedded reporter. Test failures retain their normal failing
-exit status.
+During `coverage-run`, Make sets `RELAY_TEST_EXECUTABLE` to
+`$(ROOT)/build/coverage-app/main` and `RELAY_TEST_COVERAGE_REPORT` to
+`$(ROOT)/build/coverage-app/.coverage/report`.
+[`tests/process_test.titan`](../tests/process_test.titan) launches the covered
+relay child, exercises live pairing, WebSocket, and SSE traffic, shuts it down
+with `SIGTERM`, verifies both the child's executable-line summary and report
+path on `stdout` (`assert_stdout`), and joins the child before the runner exits
+and emits its own summary. Test failures preserve their normal non-zero exit
+status.
 
-Repeated executions reset counters while retaining the `.gcno` notes. Keep the
-build outputs at their original absolute paths while running them, and serialize
-runs that share counter paths. Local tests use loopback fixtures and private
-files, without a live Foundry world.
+Repeated runs reset `.gcda` counters while keeping `.gcno` notes. Leave
+coverage outputs at their original absolute build paths while executing them,
+and serialize runs that target the same counter tree. Local cases use loopback
+fixtures and private temporary files without requiring a live Foundry world.
 
 ## Source selection and reports
 
-Titan selects production modules imported from source, excluding modules with
-top-level `test_` functions and prebuilt SDK/native dependencies. Both images
-retain all production modules in their source graph. The coverage test link also
-names `main` as a source root so its executable lines remain visible with zero
-hits when the runner does not call the application entry point.
+Titan automatically instruments every production module imported from source,
+excluding modules that declare top-level `test_` functions as well as prebuilt
+SDK and native dependencies. Both covered images include all 22 production
+modules in their source graph.
 
-The runner's report describes production behavior exercised by the tests. The
-child's report describes the standalone startup/shutdown execution. Each report
-retains unexecuted lines and refers to the original `.titan` sources. Read the
-printed summaries and annotated `coverage.gcov` files directly.
+The coverage test link passes `main` as an explicit source root alongside
+`--test --tree . --test-dir tests`: even though the test runner never invokes
+`main` in [`main.titan`](../main.titan), naming `main` keeps its executable
+lines visible with zero hits in the runner's denominator instead of silently
+omitting the entrypoint from the report.
 
-See Titan's `doc/language/native-coverage.md` at the selected revision for
-backend selection, source filters, and optional report formats.
+The runner report measures production code exercised across the native suite,
+while the child report measures standalone process startup and signal shutdown
+in [`main.titan`](../main.titan) and the server runtime. Both reports retain
+unexecuted lines mapped back to the original `.titan` source files.
+
+See Titan's `doc/language/toolchain.md#native-source-coverage` at the selected
+SDK revision for coverage backend selection (`gcc-gcov` and `llvm-gcov`),
+`--coverage-module` filters, and optional `gcovr` report formats (`html`,
+`lcov`, `cobertura`).
+
+---
+
+← Previous: [Appendix A: Native Builds, Windows Packaging, Testing, and Retired Records](build-and-testing.md) | [Table of Contents](index.md)

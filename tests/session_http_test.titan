@@ -12,6 +12,7 @@ local hub = import "relay.hub.titan"
 local server = import "relay.server.titan"
 local sessions = import "relay.sessions"
 local store = import "relay.store"
+local tasks = import "relay.tasks"
 local wire = import "relay.wire"
 local encryption = import "tests.session_crypto_test"
 
@@ -54,7 +55,7 @@ end
 
 local function Fixture:close()
   defer fs.unlink(self.path)
-  defer hub.drain(self.serving)
+  defer tasks.drain(self.serving)
   self.instance:close()
 end
 
@@ -122,7 +123,8 @@ local function call(fixture: Fixture, method: string, path: string,
   if extra then
     for index = 1, #extra do headers:add(extra[index].name, extra[index].contents) end
   end
-  local response = http.request(method, "http://127.0.0.1:" .. fixture.port .. path, headers, source)
+  local response = http.request(method, "http://127.0.0.1:" .. fixture.port .. path,
+    http.RequestOptions { headers = headers, body = source })
   defer response:close()
   test.assert(response.headers:get("Cache-Control") == "no-store",
     "Session HTTP response omitted its no-store policy")
