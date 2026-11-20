@@ -2,6 +2,7 @@ local test = import "test"
 local wire = import "relay.wire"
 local config = import "relay.config"
 local hub = import "relay.hub.titan"
+local tasks = import "relay.tasks"
 local world = import "relay.world.titan"
 local protocol = import "relay.world_protocol"
 local thread = import "thread"
@@ -50,7 +51,7 @@ function test_reply_completion_wakes_exact_pending_request(_context: test.Contex
   defer do rx:close(); tx:close() end
   local pending = world.Pending(protocol.WorldRequest("test", "entity", "{}", uv.hrtime() + 1000000000, tx), false, nil)
   local waiting = async.run<|protocol.WorldReply, value|>(rx:receive)
-  defer hub.drain(waiting)
+  defer tasks.drain(waiting)
   pending:complete(200, "first")
   pending:complete(400, "duplicate")
   case async.join(waiting)
@@ -142,7 +143,7 @@ function test_hub_shutdown_ends_waiters_and_stops_new_subscriptions(_context: te
     when closed() then return nil
     end
   end)
-  defer hub.drain(reading)
+  defer tasks.drain(reading)
   while reading:status():as_string() == "ready" do timer.yield() end
   worlds:close()
   case async.join(reading)
@@ -203,13 +204,13 @@ function test_replacement_selection_waits_for_local_quiescence(_context: test.Co
     local session, _activation = worlds:publish_authenticated(second.handle)
     return session
   end)
-  defer do first:close(); second:close(); hub.drain(replacing) end
+  defer do first:close(); second:close(); tasks.drain(replacing) end
   local ack = quiescence_ack(first)
   local selecting = async.run<|hub.Session?, value|>(function (): hub.Session?
     local selected?, _problem? = worlds:select("world")
     return selected
   end)
-  defer hub.drain(selecting)
+  defer tasks.drain(selecting)
   timer.yield()
   test.assert(not selecting:status():has_finished() and not original.closed,
     "selection observed an offline gap before the quiescence ACK")
@@ -249,7 +250,7 @@ function test_cancelled_replacement_finishes_quiescence_without_publication(_con
     worlds:publish_authenticated(second.handle)
     return nil
   end)
-  defer do first:close(); second:close(); hub.drain(replacing) end
+  defer do first:close(); second:close(); tasks.drain(replacing) end
   local ack = quiescence_ack(first)
   replacing:cancel()
   ack:send(true)
@@ -278,7 +279,7 @@ function test_failed_quiescence_delivery_waits_for_joined_health(_context: test.
     worlds:publish_authenticated(second.handle)
     return nil
   end)
-  defer do first:close(); second:close(); hub.drain(replacing) end
+  defer do first:close(); second:close(); tasks.drain(replacing) end
   local ack = quiescence_ack(first)
   ack:close()
   timer.yield()
@@ -301,13 +302,13 @@ function test_captured_close_holds_admission_until_quiescence_then_awaits_join(_
   defer endpoint:close()
   local session, _activation = worlds:publish_authenticated(endpoint.handle)
   local closing = async.run<|nil, value|>(function (): nil session:close(); return nil end)
-  defer do endpoint:close(); hub.drain(closing) end
+  defer do endpoint:close(); tasks.drain(closing) end
   local ack = quiescence_ack(endpoint)
   local selecting = async.run<|hub.Session?, value|>(function (): hub.Session?
     local selected?, _problem? = worlds:select("world")
     return selected
   end)
-  defer hub.drain(selecting)
+  defer tasks.drain(selecting)
   timer.yield()
   test.assert(not session.closed and not selecting:status():has_finished(),
     "captured close admitted a replacement before stopping world requests")
@@ -344,7 +345,7 @@ local function WriterFixture:close()
   self.engine.outbox:close()
   self.peer:close()
   self.listener:close()
-  hub.drain(self.serving)
+  tasks.drain(self.serving)
   self.endpoint:close()
   self.close_channels()
 end
@@ -373,7 +374,7 @@ local function writer_fixture(): WriterFixture
     return nil
   catch return async.Error(error, traceback) end)
   local transferred = false
-  defer if not transferred then listener:close(); hub.drain(serving) end
+  defer if not transferred then listener:close(); tasks.drain(serving) end
   local peer = websocket.connect("ws://127.0.0.1:" .. port .. "/writer")
   defer if not transferred then peer:close() end
   local connection = receive()
@@ -399,7 +400,7 @@ end
 
 local function bounded_writer(task: async.Task<|nil, value|>, message: string)
   local deadline = async.run<|nil, value|>(function (): nil timer.sleep(3000); return nil end)
-  defer hub.drain(deadline)
+  defer tasks.drain(deadline)
   case async.race_two(task, deadline)
   when first(status) then
     case status
@@ -418,7 +419,7 @@ function test_quiescence_retires_writer_before_acknowledging(_context: test.Cont
   engine:enqueue("queued mutation", nil, "entity")
   local writer = async.run<|nil, value|>(engine:write_loop)
   engine.writer = writer
-  defer hub.drain(writer)
+  defer tasks.drain(writer)
   -- FIFO runs the writer first: Connection:write schedules its native-work
   -- child behind this quiescer, so no native write has yet been accepted.
   local quiescing = async.run<|nil, value|>(function (): nil
@@ -429,7 +430,7 @@ function test_quiescence_retires_writer_before_acknowledging(_context: test.Cont
       "quiescence acknowledged while an uncommitted writer could still send")
     return nil
   end)
-  defer hub.drain(quiescing)
+  defer tasks.drain(quiescing)
   bounded_writer(quiescing, "Quiescence did not retire its data writer")
 end
 
@@ -440,7 +441,7 @@ function test_writer_origin_close_does_not_drain_itself(_context: test.Context)
   engine:enqueue("\255", nil, "entity")
   local writer = async.run<|nil, value|>(engine:write_loop)
   engine.writer = writer
-  defer hub.drain(writer)
+  defer tasks.drain(writer)
   bounded_writer(writer, "Writer-origin close tried to drain itself")
   test.assert(engine.closed and not engine.admitting,
     "Invalid outgoing text did not retire the world engine")

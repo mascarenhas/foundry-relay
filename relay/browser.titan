@@ -9,7 +9,7 @@ local timer = import "timer"
 local uv = import "uv"
 local websocket = import "websocket"
 local cdp = import "relay.cdp"
-local hub = import "relay.hub"
+local tasks = import "relay.tasks"
 
 local record Failure
   const message: string
@@ -239,7 +239,7 @@ local function Browser:retire(): async.Error?
       if not cleanup_stage(function () signal(self.process, "kill") end) then failed = true end
       return nil
     end)
-    defer hub.drain(escalation)
+    defer tasks.drain(escalation)
     if not cleanup_stage(function () signal(self.process, "term") end) then failed = true end
     if not cleanup_stage(function () self.process:wait() end) then
       failed = true
@@ -250,8 +250,8 @@ local function Browser:retire(): async.Error?
     if not cleanup_stage(function () if self.process.stdout then self.process.stdout:close() end end) then failed = true end
     if not cleanup_stage(function () if self.process.stderr then self.process.stderr:close() end end) then failed = true end
   end
-  if not cleanup_stage(function () if self.output then hub.drain(self.output) end end) then failed = true end
-  if not cleanup_stage(function () if self.diagnostics then hub.drain(self.diagnostics) end end) then failed = true end
+  if not cleanup_stage(function () if self.output then tasks.drain(self.output) end end) then failed = true end
+  if not cleanup_stage(function () if self.diagnostics then tasks.drain(self.diagnostics) end end) then failed = true end
   local retain_profile = false
   if self.process and self.process:is_running() then retain_profile = true end
   if self.debugging_endpoint and not requested_exit then retain_profile = true end

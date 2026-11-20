@@ -95,7 +95,8 @@ end
 local function request(fixture: Fixture, method: string, path: string, body: string?): Reply
   local headers = http.headers({http.Header("x-api-key", api_key)})
   if body then headers:add("Content-Type", "application/json") end
-  local response = http.request(method, "http://127.0.0.1:" .. fixture.port .. path, headers, body)
+  local response = http.request(method, "http://127.0.0.1:" .. fixture.port .. path,
+    http.RequestOptions { headers = headers, body = body })
   defer response:close()
   local output = string.writer()
   for chunk in response:read do output:write(chunk) end

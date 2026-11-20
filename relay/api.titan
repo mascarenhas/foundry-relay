@@ -52,6 +52,17 @@ function endpoint_for(key: string): Endpoint?
   return nil
 end
 
+function Endpoint:is_upload(): boolean
+  return self.special == "upload"
+end
+
+function is_known_action(action: string): boolean
+  for index = 1, #catalog do
+    if catalog[index].action == action then return true end
+  end
+  return false
+end
+
 local function Param:read(match: router.Match, body: {string: value}): (value, boolean)
   for source in string.split(self.sources) do
     if source == "b" then

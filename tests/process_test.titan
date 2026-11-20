@@ -9,7 +9,7 @@ local websocket = import "websocket"
 local timer = import "timer"
 local string = import "string"
 local wire = import "relay.wire"
-local hub = import "relay.hub"
+local tasks = import "relay.tasks"
 
 local function consume(stream: os.InputStream): string
   local output = string.writer()
@@ -96,17 +96,18 @@ function test_relocated_executable_runs_without_compiler_or_provider(_context: t
     wire.text(started, "level") == "info" and started["port"] == port,
     "relocated static executable failed to start")
   local stderr = async.run<|string, value|>(function (): string return consume(process.stderr) end)
-  defer hub.drain(stderr)
+  defer tasks.drain(stderr)
   local stdout = async.run<|string, value|>(function (): string return consume(process.stdout) end)
-  defer hub.drain(stdout)
+  defer tasks.drain(stdout)
   local health = http.get("http://127.0.0.1:" .. port .. "/health")
   defer health:close()
   local health_body = string.writer()
   for chunk in health:read do health_body:write(chunk) end
   test.assert(health.status == 200 and wire.text(wire.object(health_body:drain()), "status") == "ok")
   local headers = http.headers({http.Header("Content-Type", "application/json")})
-  local paired = http.request("POST", "http://127.0.0.1:" .. port .. "/auth/pair", headers,
-    [[{"code":"TEST42","worldId":"native-process","worldTitle":"Process"}]])
+  local paired = http.request("POST", "http://127.0.0.1:" .. port .. "/auth/pair",
+    http.RequestOptions { headers = headers,
+      body = [[{"code":"TEST42","worldId":"native-process","worldTitle":"Process"}]] })
   defer paired:close()
   local body = string.writer()
   for chunk in paired:read do body:write(chunk) end
@@ -125,7 +126,7 @@ function test_relocated_executable_runs_without_compiler_or_provider(_context: t
     if index == 1 then test.assert(wire.text(update, "type") == "auth-success") end
   end
   local streaming = http.get("http://127.0.0.1:" .. port .. "/chat/subscribe?clientId=" .. id,
-    http.headers({http.Header("x-api-key", "process-api-key")}))
+    http.RequestOptions { headers = http.headers({http.Header("x-api-key", "process-api-key")}) })
   defer streaming:close()
   test.assert(streaming.status == 200)
   streaming:read_until("\n\n", true)
@@ -139,7 +140,7 @@ function test_relocated_executable_runs_without_compiler_or_provider(_context: t
     end
     return nil
   end)
-  defer hub.drain(sending)
+  defer tasks.drain(sending)
   local _, unsubscribed? = world:read()
   local removed = wire.object(unsubscribed)
   test.assert(wire.text(removed, "channel") == "chat-events" and removed["count"] == 0,
@@ -168,9 +169,9 @@ function test_relocated_executable_runs_without_compiler_or_provider(_context: t
         if event == "http_request" then requests = requests + 1 end
         if event == "websocket_connected" then connected = connected + 1 end
         if event == "websocket_disconnected" then disconnected = disconnected + 1 end
-        test.assert(not string.find(line, "process-api-key", 1, true) and
-          not string.find(line, "TEST42", 1, true) and
-          not string.find(line, wire.text(credentials, "token"), 1, true),
+        test.assert(not string.find(line, "process-api-key", 1) and
+          not string.find(line, "TEST42", 1) and
+          not string.find(line, wire.text(credentials, "token"), 1),
           "standalone log exposed a credential")
       end
     end

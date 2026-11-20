@@ -1,6 +1,11 @@
 -- Cross-thread world addressing and messages. Only public transfer DTOs live here.
 local thread = import "thread"
 
+const SSE_CHANNELS: const {string} = {
+  "chat-events", "roll-events", "hooks",
+  "combat-events", "actor-events", "scene-events",
+}
+
 record WorldReply
   const request_id: string
   const status: integer

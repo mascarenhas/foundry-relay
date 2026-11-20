@@ -13,6 +13,7 @@ local crypto = import "relay.session_crypto"
 local foundry = import "relay.foundry_session"
 local hub = import "relay.hub"
 local store = import "relay.store"
+local tasks = import "relay.tasks"
 local wire = import "relay.wire"
 local log = import "relay.log"
 
@@ -338,7 +339,7 @@ function Manager:discard(entry: Entry)
   if entry.state == "stopped" then return end
   if not entry.published then
     entry.state = entry.state == "cleanup-failed" and "cleanup-failed" or "stopping"
-    if entry.worker then hub.drain(entry.worker) end
+    if entry.worker then tasks.drain(entry.worker) end
     if not entry.entered then self:retire(entry, nil) end
   end
 end
@@ -347,7 +348,7 @@ function Manager:finish(id: string)
   local entry? = self.entries[id]
   if not entry then raise Error(404, "Session not found") end
   if entry.state ~= "cleanup-failed" then entry.state = "stopping" end
-  if entry.worker then hub.drain(entry.worker) end
+  if entry.worker then tasks.drain(entry.worker) end
   if not entry.entered then self:retire(entry, nil) end
   if entry.state == "cleanup-failed" then raise Error(503, "Headless session cleanup failed") end
 end
@@ -377,7 +378,7 @@ function Manager:close()
   end
   for index = 1, #admitted do
     local worker? = admitted[index].worker
-    if worker then hub.drain(worker) end
+    if worker then tasks.drain(worker) end
     if not admitted[index].entered then self:retire(admitted[index], nil) end
   end
   if self.key then self.key:close(); self.key = nil end

@@ -60,8 +60,6 @@ function Hub.new(maximum: integer, heartbeat: integer, logger: log.Logger?): Hub
     closed = false, logger = logger, owner = nil, waiters = {}}
 end
 
-function drain<|A|>(task: async.Task<|A, value|>) tasks.drain(task) end
-
 local function Hub:remove_waiter(waiter: Waiter)
   for index = 1, #self.waiters do
     if self.waiters[index] == waiter then

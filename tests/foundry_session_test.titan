@@ -7,6 +7,7 @@ local browser = import "relay.browser.titan"
 local store = import "relay.store"
 local foundry = import "relay.foundry_session.titan"
 local hub = import "relay.hub.titan"
+local tasks = import "relay.tasks"
 local world = import "relay.world.titan"
 local protocol = import "relay.world_protocol"
 local messages = import "relay.messages"
@@ -52,15 +53,15 @@ local function relay_fixture(worlds: hub.Hub, id: string?): RelayFixture
     engine = world.Engine(bootstrap, stream, nil)
     defer do engine:close(); engine.outbox:close() end
     local requests = async.run<|nil, value|>(engine:request_loop)
-    defer hub.drain(requests)
+    defer tasks.drain(requests)
     local owner = async.run<|nil, value|>(function (): nil
       -- This terminal signal follows actual native transport close and children.
       defer health_tx:close()
-      defer hub.drain(requests)
+      defer tasks.drain(requests)
       defer engine:close()
       return engine:command_loop()
     end)
-    defer hub.drain(owner)
+    defer tasks.drain(owner)
     local session, _activation = worlds:publish_authenticated(handle)
     admit(session)
     released()
@@ -94,7 +95,7 @@ local function pending_request(fixture: RelayFixture): async.Task<|hub.Reply, va
     return fixture.session:request("world-info", {}, 60000)
   end)
   local transferred = false
-  defer if not transferred then hub.drain(requesting) end
+  defer if not transferred then tasks.drain(requesting) end
   -- Dequeuing the request synchronizes with its registered waiter, without a
   -- timer or scheduler polling. No writer sends it to the held relay peer.
   case fixture.engine.outbox:next()
@@ -122,7 +123,7 @@ local function assert_owned_relay_retirement(instance: browser.Browser)
   local session_owner = foundry.Session(instance, fixture.session, fixture.session.id, {})
   defer session_owner:close()
   local requesting = pending_request(fixture)
-  defer hub.drain(requesting)
+  defer tasks.drain(requesting)
   test.assert(worlds:online(fixture.session.id) and not fixture.peer.peer:status():has_finished())
   session_owner:close()
   test.assert(not worlds:online(fixture.session.id),
@@ -191,17 +192,17 @@ function test_session_close_runs_both_owners_after_browser_cleanup_failure(_cont
     return async.Error("Browser cleanup failed", "")
   end)
   instance.retirement = retirement
-  defer hub.drain(retirement)
+  defer tasks.drain(retirement)
   local session_owner = foundry.Session(instance, fixture.session, fixture.session.id, {})
   local requesting = pending_request(fixture)
-  defer hub.drain(requesting)
+  defer tasks.drain(requesting)
   local closing = async.run<|value, value|>(function(): value
     entered(true)
     session_owner:close()
     return nil
   catch return error
   end)
-  defer hub.drain(closing)
+  defer tasks.drain(closing)
   local released_cleanup = false
   local allow_cleanup = function()
     if not released_cleanup then

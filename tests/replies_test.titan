@@ -395,7 +395,7 @@ local function TimeoutCapture:assert_timeout(kind: string, secrets: {string})
     fields["client_id"] == "client" and fields["type"] == kind,
     "Timeout log omitted its finite event, client, or request category")
   for _, secret in iteration.ipairs(secrets) do
-    test.assert(string.find(line, secret, 1, true) == nil, "Timeout log leaked private request data")
+    test.assert(string.find(line, secret, 1) == nil, "Timeout log leaked private request data")
   end
 end
 

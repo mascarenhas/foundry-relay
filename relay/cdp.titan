@@ -2,7 +2,7 @@
 local websocket = import "websocket"
 local async = import "async"
 local timer = import "timer"
-local hub = import "relay.hub"
+local tasks = import "relay.tasks"
 local wire = import "relay.wire"
 
 local record Failure
@@ -79,7 +79,7 @@ function Connection:call(method: string, params: {string: value},
     self:abort()
     return nil
   end)
-  defer hub.drain(deadline)
+  defer tasks.drain(deadline)
   do
     return self:exchange(request, id, session_id)
   catch

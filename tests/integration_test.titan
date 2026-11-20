@@ -10,6 +10,7 @@ local string = import "string"
 local server = import "relay.server"
 local config = import "relay.config"
 local hub = import "relay.hub.titan"
+local tasks = import "relay.tasks"
 local world_engine = import "relay.world.titan"
 local protocol = import "relay.world_protocol"
 local thread = import "thread"
@@ -41,7 +42,7 @@ local function Fixture:close()
   if self.closed then return end
   self.closed = true
   self.instance:close()
-  hub.drain(self.serving)
+  tasks.drain(self.serving)
 end
 
 local function start(database: string, timeout: integer): Fixture
@@ -100,7 +101,8 @@ local function call(fixture: Fixture, method: string, path: string,
   local headers = http.headers()
   if key then headers:add("x-api-key", key) end
   if body then headers:add("Content-Type", "application/json") end
-  local response = http.request(method, "http://127.0.0.1:" .. fixture.port .. path, headers, body)
+  local response = http.request(method, "http://127.0.0.1:" .. fixture.port .. path,
+    http.RequestOptions { headers = headers, body = body })
   defer response:close()
   return Reply(response.status, read_all(response))
 end
@@ -180,7 +182,7 @@ function test_reconnect_sends_normal_close_and_keeps_replacement_usable(_context
     local incumbent = dial(fixture, credentials)
     defer incumbent:close()
     local pending = request(fixture, "/world-info")
-    defer hub.drain(pending)
+    defer tasks.drain(pending)
     message(incumbent)
     local reading = async.run<|nil, value|>(function (): nil
       local kind?, contents? = incumbent:read()
@@ -190,7 +192,7 @@ function test_reconnect_sends_normal_close_and_keeps_replacement_usable(_context
                   "replaced world would retry after an abnormal disconnect")
       return nil
     end)
-    defer hub.drain(reading)
+    defer tasks.drain(reading)
     local replacement = dial(fixture, credentials)
     defer replacement:close()
     case async.join(reading)
@@ -201,7 +203,7 @@ function test_reconnect_sends_normal_close_and_keeps_replacement_usable(_context
     test.assert(await_reply(pending).status == 503,
                 "replacement left an incumbent's request unresolved")
     local current = request(fixture, "/world-info")
-    defer hub.drain(current)
+    defer tasks.drain(current)
     answer(replacement, message(replacement), {["result"] = "replacement"})
     test.assert(wire.text(wire.object(await_reply(current).body), "result") == "replacement",
                 "retiring incumbent removed its replacement")
@@ -221,7 +223,7 @@ function test_reconnect_retires_an_incumbent_that_never_reads_close(_context: te
     local replacement = dial(fixture, credentials)
     defer replacement:close()
     local pending = request(fixture, "/world-info")
-    defer hub.drain(pending)
+    defer tasks.drain(pending)
     answer(replacement, message(replacement), {["result"] = "available"})
     test.assert(await_reply(pending).status == 200)
     local retirement? = previous.retirement
@@ -230,7 +232,7 @@ function test_reconnect_retires_an_incumbent_that_never_reads_close(_context: te
       timer.sleep(3000)
       return nil
     end)
-    defer hub.drain(watchdog)
+    defer tasks.drain(watchdog)
     case async.any_two(retirement, watchdog)
     when first(_) then
     when second(_) then raise "nonresponsive incumbent outlived its bounded shutdown"
@@ -299,7 +301,7 @@ function test_cancelled_queued_mutation_detaches_before_deadline_cleanup(_contex
   -- admitting its queued mutation before advisory cancel/timer cleanup arrives.
   rx:close()
   local observing = async.run<|boolean, value|>(function (): boolean return output:should_send(requests) end)
-  defer hub.drain(observing)
+  defer tasks.drain(observing)
   case async.join(observing)
   when succeeded(eligible) then test.assert(not eligible, "cancelled mutation remained eligible while its deadline retired")
   when failed(failure) then failure:raise()
@@ -321,7 +323,8 @@ function test_rest_authentication_and_public_health(_context: test.Context)
     test.assert(call(fixture, "GET", "/clients", nil, "wrong").status == 401)
     test.assert(get(fixture, "/clients").status == 200)
     local headers = http.headers({http.Header("x-api-key", api_key), http.Header("x-api-key", api_key)})
-    local response = http.get("http://127.0.0.1:" .. fixture.port .. "/clients", headers)
+    local response = http.get("http://127.0.0.1:" .. fixture.port .. "/clients",
+      http.RequestOptions { headers = headers })
     defer response:close()
     test.assert(response.status == 401, "duplicate API-key headers were accepted")
     local bad: {string: value} = {["code"] = "wrong", ["worldId"] = "world"}
@@ -345,7 +348,7 @@ function test_pairing_code_supports_two_worlds_and_explicit_routing(_context: te
     test.assert(#clients == 2)
     test.assert(not string.find(listing.body, first_credentials.token), "client listing exposed pairing token")
     local pending = request(fixture, "/world-info?clientId=" .. second_credentials.id)
-    defer hub.drain(pending)
+    defer tasks.drain(pending)
     local incoming = message(second)
     test.assert(wire.text(incoming, "type") == "world-info")
     test.assert(incoming["clientId"] == nil, "relay client ID leaked into action payload")
@@ -363,7 +366,7 @@ function test_single_world_is_default_and_pairing_is_stable(_context: test.Conte
     local world = dial(fixture, credentials)
     defer world:close()
     local pending = request(fixture, "/world-info")
-    defer hub.drain(pending)
+    defer tasks.drain(pending)
     answer(world, message(world), {["world"] = "default"})
     local response = await_reply(pending)
     test.assert(response.status == 200 and wire.text(wire.object(response.body), "world") == "default")
@@ -375,9 +378,9 @@ function test_concurrent_http_requests_correlate_out_of_order_replies(_context: 
     local world = dial(fixture, pair(fixture, "world"))
     defer world:close()
     local first = request(fixture, "/world-info?userId=first")
-    defer hub.drain(first)
+    defer tasks.drain(first)
     local second = request(fixture, "/world-info?userId=second")
-    defer hub.drain(second)
+    defer tasks.drain(second)
     local incoming_first = message(world)
     local incoming_second = message(world)
     test.assert(wire.text(incoming_first, "requestId") ~= wire.text(incoming_second, "requestId"))
@@ -416,7 +419,7 @@ function test_disconnect_settles_pending_http_request(_context: test.Context)
     local world = dial(fixture, credentials)
     defer world:close()
     local pending = request(fixture, "/world-info")
-    defer hub.drain(pending)
+    defer tasks.drain(pending)
     message(world) -- The relay has admitted and forwarded this request.
     world:close()
     test.assert(await_reply(pending).status == 503, "disconnect left a pending request unresolved")
@@ -432,13 +435,13 @@ function test_request_timeout_releases_waiter_and_session_remains_usable(_contex
   local world = dial(fixture, pair(fixture, "world"))
   defer world:close()
   local pending = request(fixture, "/world-info")
-  defer hub.drain(pending)
+  defer tasks.drain(pending)
   local expired = message(world)
   test.assert(await_reply(pending).status == 408)
   -- An expired response cannot steal the next request's waiter.
   answer(world, expired, {["result"] = "too late"})
   local next = request(fixture, "/world-info")
-  defer hub.drain(next)
+  defer tasks.drain(next)
   answer(world, message(world), {["result"] = "current"})
   local response = await_reply(next)
   test.assert(response.status == 200 and wire.text(wire.object(response.body), "result") == "current")
@@ -458,7 +461,7 @@ function test_credentials_survive_relay_restart(_context: test.Context)
   local world = dial(second, credentials)
   defer world:close()
   local pending = request(second, "/world-info?clientId=" .. credentials.id)
-  defer hub.drain(pending)
+  defer tasks.drain(pending)
   answer(world, message(world), {["result"] = "reconnected"})
   test.assert(wire.text(wire.object(await_reply(pending).body), "result") == "reconnected")
 end
@@ -472,7 +475,7 @@ function test_large_json_round_trip_uses_fragmented_websocket_messages(_context:
     local pending = async.run<|Reply, value|>(function (): Reply
       return call(fixture, "POST", "/chat", wire.encode(payload), api_key)
     end)
-    defer hub.drain(pending)
+    defer tasks.drain(pending)
     local incoming = message(world)
     test.assert(wire.text(incoming, "type") == "chat-send")
     test.assert(wire.text(incoming, "content") == content, "fragmented request JSON changed bytes")
@@ -488,7 +491,7 @@ function test_websocket_ping_and_application_ping_keep_session_live(_context: te
     local world = dial(fixture, pair(fixture, "world"))
     defer world:close()
     local reading = async.run<|{string: value}, value|>(function (): {string: value} return message(world) end)
-    defer hub.drain(reading)
+    defer tasks.drain(reading)
     world:ping(1000) -- Both peers have application readers to service control frames.
     world:write(websocket.TEXT, "{\"type\":\"ping\"}")
     case async.join(reading)
@@ -505,7 +508,8 @@ function test_sse_subscription_update_and_event_data(_context: test.Context)
     local world = dial(fixture, credentials)
     defer world:close()
     local headers = http.headers({http.Header("x-api-key", api_key)})
-    local response = http.get("http://127.0.0.1:" .. fixture.port .. "/chat/subscribe?clientId=" .. credentials.id, headers)
+    local response = http.get("http://127.0.0.1:" .. fixture.port .. "/chat/subscribe?clientId=" .. credentials.id,
+      http.RequestOptions { headers = headers })
     defer response:close()
     test.assert(response.status == 200 and response.headers:get("Content-Type") == "text/event-stream")
     local connected = response:read_until("\n\n", true)
@@ -535,7 +539,7 @@ function test_sse_client_disconnect_retires_subscription(_context: test.Context)
     local world = dial(fixture, credentials)
     defer world:close()
     local response = http.get("http://127.0.0.1:" .. fixture.port .. "/chat/subscribe?clientId=" .. credentials.id,
-      http.headers({http.Header("x-api-key", api_key)}))
+      http.RequestOptions { headers = http.headers({http.Header("x-api-key", api_key)}) })
     defer response:close()
     test.assert(response.status == 200)
     response:read_until("\n\n", true)
@@ -548,7 +552,7 @@ function test_sse_client_disconnect_retires_subscription(_context: test.Context)
       end
       return nil
     end)
-    defer hub.drain(sending)
+    defer tasks.drain(sending)
     local removed = message(world)
     test.assert(wire.text(removed, "channel") == "chat-events" and removed["count"] == 0,
       "closed SSE client retained its subscription")
@@ -575,7 +579,8 @@ function test_session_routes_share_rest_authentication(_context: test.Context)
     test.assert(call(fixture, "DELETE", "/end-session", "{\"sessionId\":\"missing\"}", api_key).status == 404)
     local headers = http.headers({http.Header("x-api-key", api_key),
       http.Header("x-foundry-url", "http://127.0.0.1:30000"), http.Header("x-username", "GM")})
-    local response = http.request("POST", "http://127.0.0.1:" .. fixture.port .. "/session-handshake", headers)
+    local response = http.request("POST", "http://127.0.0.1:" .. fixture.port .. "/session-handshake",
+      http.RequestOptions { headers = headers })
     defer response:close()
     test.assert(response.status == 503 and response.headers:get("Cache-Control") == "no-store")
     read_all(response)
@@ -585,7 +590,8 @@ end
 function test_session_headers_are_allowed_by_cors(_context: test.Context)
   with_relay(function(fixture)
     local headers = http.headers({http.Header("Origin", "http://127.0.0.1:30000")})
-    local response = http.request("OPTIONS", "http://127.0.0.1:" .. fixture.port .. "/session-handshake", headers)
+    local response = http.request("OPTIONS", "http://127.0.0.1:" .. fixture.port .. "/session-handshake",
+      http.RequestOptions { headers = headers })
     defer response:close()
     test.assert(response.status == 204)
     local allowed = response.headers:get("Access-Control-Allow-Headers") or ""

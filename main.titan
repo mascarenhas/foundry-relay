@@ -2,7 +2,7 @@ local os = import "os"
 local async = import "async"
 local config = import "relay.config"
 local server = import "relay.server"
-local hub = import "relay.hub"
+local tasks = import "relay.tasks"
 local log = import "relay.log"
 
 local function run(logger: log.Logger, phase: string): integer
@@ -24,19 +24,19 @@ local function run(logger: log.Logger, phase: string): integer
     close()
     return nil
   end)
-  defer hub.drain(termination)
+  defer tasks.drain(termination)
   local interrupt = async.run<|nil, value|>(function (): nil
     os.wait_signal("int")
     close()
     return nil
   end)
-  defer hub.drain(interrupt)
+  defer tasks.drain(interrupt)
   log.emit(logger, "info", "server_started", {["port"] = settings.port})
   relay:serve()
   -- Listener closure can wake serve before browser retirement completes.
   -- Await both signal owners and preserve a failed retirement in our exit code.
-  hub.drain(termination)
-  hub.drain(interrupt)
+  tasks.drain(termination)
+  tasks.drain(interrupt)
   if shutdown_error then shutdown_error:raise() end
   log.emit(logger, "info", "server_stopped")
   return 0

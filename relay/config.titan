@@ -76,3 +76,19 @@ function secret_equal(left: string, right: string): boolean
   end
   return different == 0
 end
+
+function Config:allows_origin(origin: string): boolean
+  for index = 1, #self.origins do
+    if self.origins[index] == origin then return true end
+  end
+  return false
+end
+
+function Config:request_origin_allowed(origin_headers: {string},
+                                       scheme: string, authority: string): boolean
+  if #origin_headers == 0 then return true end
+  if #origin_headers ~= 1 then return false end
+  local origin = origin_headers[1]
+  if origin == scheme .. "://" .. authority then return true end
+  return self:allows_origin(origin)
+end

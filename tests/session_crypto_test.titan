@@ -6,7 +6,7 @@ local string = import "string"
 local timer = import "timer"
 local crypto = import "relay.session_crypto"
 local api = import "relay.api"
-local hub = import "relay.hub"
+local tasks = import "relay.tasks"
 local wire = import "relay.wire"
 
 local function consume(stream: os.InputStream): string
@@ -72,9 +72,9 @@ function encrypt(public_key: string, plaintext: string,
   local errors: async.Task<|string, value|>? = nil
   local deadline: async.Task<|nil, value|>? = nil
   defer do
-    defer if deadline then hub.drain(deadline) end
-    defer if output then hub.drain(output) end
-    defer if errors then hub.drain(errors) end
+    defer if deadline then tasks.drain(deadline) end
+    defer if output then tasks.drain(output) end
+    defer if errors then tasks.drain(errors) end
     stop(child)
   end
   output = async.run<|string, value|>(function (): string return consume(child.stdout) end)

@@ -4,16 +4,23 @@ local json = import "json"
 local record Null
 end
 
-local const null: Null?
+local record ErrorEnvelope
+  const error: string
+end
+
+local const decode_null: json.DecodeOption?
+local const decode_max_bytes = json.DecodeOption.max_bytes(16777216)
+local const decode_max_depth = json.DecodeOption.max_depth(64)
+local const encode_null: json.EncodeOption?
+local const encode_max_bytes = json.EncodeOption.max_bytes(16777216)
+local const encode_max_depth = json.EncodeOption.max_depth(64)
 
 function decode(source: string): value
-  return json.decode(source, nil, json.DecodeOption.null_value(null),
-    json.DecodeOption.max_bytes(16777216), json.DecodeOption.max_depth(64))
+  return json.decode(source, nil, decode_null, decode_max_bytes, decode_max_depth)
 end
 
 function encode(subject: value): string
-  return json.encode(subject, json.EncodeOption.null_value(null),
-    json.EncodeOption.max_bytes(16777216), json.EncodeOption.max_depth(64))
+  return json.encode(subject, encode_null, encode_max_bytes, encode_max_depth)
 end
 
 function object(source: string): {string: value}
@@ -24,15 +31,16 @@ end
 
 function text(object: {string: value}, key: string, fallback: string?): string
   local item? = object[key]
-  if item is string then return item as string end
+  if item is string then return item end
   return fallback or ""
 end
 
 function error_body(message: string): string
-  local body: {string: value} = { ["error"] = message }
-  return encode(body)
+  return encode(ErrorEnvelope(message))
 end
 
 do
-  null = Null()
+  local null = Null()
+  decode_null = json.DecodeOption.null_value(null)
+  encode_null = json.EncodeOption.null_value(null)
 end
