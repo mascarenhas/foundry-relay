@@ -46,6 +46,48 @@ local record Handshake
   const expires: integer
 end
 
+local union EntryState
+  starting()
+  active()
+  stopping()
+  stopped()
+  cleanup_failed()
+end
+
+local const STATE_STARTING = EntryState.starting()
+local const STATE_ACTIVE = EntryState.active()
+local const STATE_STOPPING = EntryState.stopping()
+local const STATE_STOPPED = EntryState.stopped()
+local const STATE_CLEANUP_FAILED = EntryState.cleanup_failed()
+
+local record StartupFailure
+  const status: integer
+  const stage: string
+  const cause: string
+end
+
+local const default_startup_failure = StartupFailure(500, "startup", "startup_failed")
+
+local const startup_failures: {string: StartupFailure} = {
+  ["Browser profile parent is missing"] = StartupFailure(500, "browser_profile", "profile_parent_missing"),
+  ["Browser profile parent is not a directory"] = StartupFailure(500, "browser_profile", "profile_parent_not_directory"),
+  ["Browser profile parent permission denied"] = StartupFailure(500, "browser_profile", "profile_parent_permission_denied"),
+  ["Browser profile parent is unavailable"] = StartupFailure(500, "browser_profile", "profile_parent_unavailable"),
+  ["Browser profile creation failed"] = StartupFailure(500, "browser_profile", "profile_creation_failed"),
+  ["Browser startup timed out"] = StartupFailure(408, "browser_startup", "deadline_expired"),
+  ["Foundry readiness timed out"] = StartupFailure(408, "foundry_readiness", "deadline_expired"),
+  ["CDP command timed out"] = StartupFailure(408, "browser_protocol", "deadline_expired"),
+  ["Browser exited during startup"] = StartupFailure(500, "browser_startup", "browser_exited"),
+  ["Headless browser exited"] = StartupFailure(500, "browser_startup", "browser_exited"),
+  ["Invalid browser debugging endpoint"] = StartupFailure(500, "browser_startup", "invalid_debugging_endpoint"),
+  ["Browser startup failed"] = StartupFailure(500, "browser_startup", "startup_failed"),
+  ["Foundry pairing settings do not match"] = StartupFailure(500, "foundry_readiness", "pairing_mismatch"),
+  ["Foundry loaded a different world"] = StartupFailure(500, "foundry_readiness", "wrong_world"),
+  ["Foundry user is not the configured full GM"] = StartupFailure(500, "foundry_readiness", "wrong_user"),
+  ["Foundry administrator login is required"] = StartupFailure(500, "foundry_readiness", "administrator_login_required"),
+  ["Foundry requires setup or an active REST API module"] = StartupFailure(500, "foundry_readiness", "setup_or_module_required"),
+}
+
 record Entry
   const session_id: string
   const client_id: string
@@ -55,7 +97,7 @@ record Entry
   local const started_at: integer
   local activity: integer
   local metadata: {string: value}
-  local state: string
+  local state: EntryState
   local published: boolean
   local entered: boolean
   local waiter: async.Task?
@@ -88,9 +130,19 @@ local function number(name: string, fallback: integer, maximum: integer): intege
   return n
 end
 
+local function default_launcher(options: foundry.Options, executable: string,
+                                profile_parent: string, worlds: hub.Hub,
+                                timeout_ms: integer): Client
+  return foundry.start(options, executable, profile_parent, worlds, timeout_ms)
+end
+
 function settings(): Options
-  return Options(os.getenv("RELAY_CHROME") or "", os.getenv("RELAY_BROWSER_PROFILES") or "build/browser-profiles",
-    number("RELAY_MAX_SESSIONS", 4, 64), number("RELAY_SESSION_TIMEOUT_MS", 120000, 600000))
+  return Options {
+    executable = os.getenv("RELAY_CHROME") or "",
+    profile_parent = os.getenv("RELAY_BROWSER_PROFILES") or "build/browser-profiles",
+    maximum = number("RELAY_MAX_SESSIONS", 4, 64),
+    timeout_ms = number("RELAY_SESSION_TIMEOUT_MS", 120000, 600000),
+  }
 end
 
 function Manager.new(options: Options, database: store.Store, worlds: hub.Hub,
@@ -103,9 +155,6 @@ function Manager.new(options: Options, database: store.Store, worlds: hub.Hub,
   if options.executable ~= "" then key = crypto.generate() end
   local transferred = false
   defer if not transferred and key then key:close() end
-  local default_launcher = function(o: foundry.Options, e: string, p: string, h: hub.Hub, t: integer): Client
-    return foundry.start(o, e, p, h, t)
-  end
   local result: Manager = {options = options, database = database, worlds = worlds,
     relay_url = relay_url, origins = origins, launcher = launcher or default_launcher,
     instance_id = store.secure_token(16), key = key, handshakes = {}, entries = {},
@@ -127,7 +176,7 @@ local function Manager:prune()
 end
 
 local function foundry_origin(address: string): string
-  local parsed?, _diagnostic? = url.parse(address)
+  local parsed? = url.parse(address)
   if not parsed or (parsed.scheme ~= "http" and parsed.scheme ~= "https") or
      parsed.query ~= nil then raise Error(400, "Invalid Foundry URL") end
   local authority = parsed.host
@@ -148,15 +197,19 @@ function Manager:handshake(address: string, user: string, world: string): {strin
   -- A missing world is resolved at start from exactly one existing pairing.
   local origin = foundry_origin(address)
   local allowed = false
-  for index = 1, #self.origins do if self.origins[index] == origin then allowed = true end end
+  for index = 1, #self.origins do
+    if self.origins[index] == origin then allowed = true; break end
+  end
   if not allowed then raise Error(403, "Foundry origin is not allowed") end
   self:prune()
   local count = 0
-  for _token, _handshake in iteration.pairs(self.handshakes) do count = count + 1 end
+  for _ in iteration.pairs(self.handshakes) do count = count + 1 end
   if count >= 32 then raise Error(429, "Too many pending session handshakes") end
   local token = store.secure_token()
   local nonce = store.secure_token(16)
-  self.handshakes[token] = Handshake(address, origin, user, world, nonce, uv.hrtime() + 300000000000)
+  self.handshakes[token] = Handshake {
+    address = address, origin = origin, user = user, world = world,
+    nonce = nonce, expires = uv.hrtime() + 300000000000 }
   return {["token"] = token, ["publicKey"] = self.key.public_key, ["nonce"] = nonce,
     ["instanceId"] = self.instance_id, ["foundryUrl"] = address, ["username"] = user,
     ["expires"] = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time() + 300)}
@@ -168,56 +221,21 @@ end
 
 -- Only exact relay-authored messages become diagnostics. Never serialize an
 -- arbitrary error, OS diagnostic, evaluated expression, or browser output.
-local function startup_failure(problem: value): (integer, string, string)
-  if problem == "Browser profile parent is missing" then
-    return 500, "browser_profile", "profile_parent_missing"
+local function startup_failure(problem: value): StartupFailure
+  if problem is string then
+    local message: string = problem
+    return startup_failures[message] or default_startup_failure
   end
-  if problem == "Browser profile parent is not a directory" then
-    return 500, "browser_profile", "profile_parent_not_directory"
-  end
-  if problem == "Browser profile parent permission denied" then
-    return 500, "browser_profile", "profile_parent_permission_denied"
-  end
-  if problem == "Browser profile parent is unavailable" then
-    return 500, "browser_profile", "profile_parent_unavailable"
-  end
-  if problem == "Browser profile creation failed" then
-    return 500, "browser_profile", "profile_creation_failed"
-  end
-  if problem == "Browser startup timed out" then return 408, "browser_startup", "deadline_expired" end
-  if problem == "Foundry readiness timed out" then
-    return 408, "foundry_readiness", "deadline_expired"
-  end
-  if problem == "CDP command timed out" then return 408, "browser_protocol", "deadline_expired" end
-  if problem == "Browser exited during startup" or problem == "Headless browser exited" then
-    return 500, "browser_startup", "browser_exited"
-  end
-  if problem == "Invalid browser debugging endpoint" then
-    return 500, "browser_startup", "invalid_debugging_endpoint"
-  end
-  if problem == "Browser startup failed" then return 500, "browser_startup", "startup_failed" end
-  if problem == "Foundry pairing settings do not match" then
-    return 500, "foundry_readiness", "pairing_mismatch"
-  end
-  if problem == "Foundry loaded a different world" then
-    return 500, "foundry_readiness", "wrong_world"
-  end
-  if problem == "Foundry user is not the configured full GM" then
-    return 500, "foundry_readiness", "wrong_user"
-  end
-  if problem == "Foundry administrator login is required" then
-    return 500, "foundry_readiness", "administrator_login_required"
-  end
-  if problem == "Foundry requires setup or an active REST API module" then
-    return 500, "foundry_readiness", "setup_or_module_required"
-  end
-  return 500, "startup", "startup_failed"
+  return default_startup_failure
 end
 
 local function Manager:retire(entry: Entry, client: Client?)
   if self.entries[entry.session_id] ~= entry then return end
-  local failed = entry.state == "cleanup-failed"
-  entry.state = "stopping"
+  local failed = false
+  case entry.state
+  when cleanup_failed() then failed = true
+  end
+  entry.state = STATE_STOPPING
   if client then
     do client:close()
     catch failed = true
@@ -226,11 +244,11 @@ local function Manager:retire(entry: Entry, client: Client?)
   if failed then
     -- Retain admission when retirement could not be proved. A failed cleanup
     -- must not admit a second browser for the same world or hide the resource.
-    entry.state = "cleanup-failed"
+    entry.state = STATE_CLEANUP_FAILED
     log.emit(self.logger, "error", "headless_session_cleanup_failed", {["client_id"] = entry.client_id,
       ["reason"] = "browser_retirement_failed"})
   else
-    entry.state = "stopped"
+    entry.state = STATE_STOPPED
     self.entries[entry.session_id] = nil
     if self.reservations[entry.client_id] == entry then self.reservations[entry.client_id] = nil end
     log.emit(self.logger, "info", "headless_session_stopped", {["client_id"] = entry.client_id})
@@ -269,17 +287,39 @@ function Manager:begin(data: {string: value}): Entry
     raise Error(409, "The paired world already has an active or starting session")
   end
   local count = 0
-  for _id, _entry in iteration.pairs(self.entries) do count = count + 1 end
+  for _ in iteration.pairs(self.entries) do count = count + 1 end
   if count >= self.options.maximum then raise Error(429, "Headless session limit reached") end
-  local entry = Entry(store.secure_token(16), selected.client_id, handshake.address,
-    handshake.user, selected.world_id, os.time() * 1000, os.time() * 1000, {},
-    "starting", false, false, nil, async.ResumeToken("relay.sessions.ready"), nil, 500)
+  local now_ms = os.time() * 1000
+  local entry = Entry {
+    session_id = store.secure_token(16),
+    client_id = selected.client_id,
+    address = handshake.address,
+    user = handshake.user,
+    world = selected.world_id,
+    started_at = now_ms,
+    activity = now_ms,
+    metadata = {},
+    state = STATE_STARTING,
+    published = false,
+    entered = false,
+    waiter = nil,
+    wake = async.ResumeToken("relay.sessions.ready"),
+    worker = nil,
+    failure_status = 500,
+  }
   -- Reserve synchronously before creating the controller or yielding again.
   self.entries[entry.session_id] = entry
   self.reservations[entry.client_id] = entry
   log.emit(self.logger, "info", "headless_session_starting", {["client_id"] = entry.client_id})
-  local pending: foundry.Options? = foundry.Options(handshake.address, handshake.origin,
-    selected.world_id, handshake.user, credentials["password"], selected, self.relay_url)
+  local pending: foundry.Options? = foundry.Options {
+    address = handshake.address,
+    origin = handshake.origin,
+    world = selected.world_id,
+    user = handshake.user,
+    password = credentials["password"],
+    client = selected,
+    relay_url = self.relay_url,
+  }
   entry.worker = async.run<|nil, value|>(function (): nil
     entry.entered = true
     local started = uv.hrtime()
@@ -291,7 +331,7 @@ function Manager:begin(data: {string: value}): Entry
       pending = nil
       if self.closed then return nil end
       entry.metadata = client.metadata
-      entry.state = "active"
+      entry.state = STATE_ACTIVE
       entry:notify()
       while true do
         timer.sleep(1000)
@@ -299,19 +339,22 @@ function Manager:begin(data: {string: value}): Entry
       end
     catch
       pending = nil
-      if not self.closed and entry.state ~= "stopping" and not (error is async.CancellationReason) then
-        local fields: {string: value} = {["client_id"] = entry.client_id,
-          ["reason"] = entry.state == "starting" and "startup_failed" or "connection_lost"}
-        if entry.state == "starting" then
-          local status, stage, cause = startup_failure(error)
-          entry.failure_status = status
-          fields["stage"] = stage
-          fields["cause"] = cause
-          fields["elapsed_ms"] = (uv.hrtime() - started) // 1000000
+      if not self.closed and not (error is async.CancellationReason) then
+        case entry.state
+        when stopping() then
+        when starting() then
+          local failure = startup_failure(error)
+          entry.failure_status = failure.status
+          log.emit(self.logger, "error", "headless_session_failed", {
+            ["client_id"] = entry.client_id, ["reason"] = "startup_failed",
+            ["stage"] = failure.stage, ["cause"] = failure.cause,
+            ["elapsed_ms"] = (uv.hrtime() - started) // 1000000 })
+        else
+          log.emit(self.logger, "error", "headless_session_failed", {
+            ["client_id"] = entry.client_id, ["reason"] = "connection_lost" })
         end
-        log.emit(self.logger, "error", "headless_session_failed", fields)
       end
-      if error == "Browser cleanup failed" then entry.state = "cleanup-failed" end
+      if error == "Browser cleanup failed" then entry.state = STATE_CLEANUP_FAILED end
       return nil
     end
     return nil
@@ -320,25 +363,38 @@ function Manager:begin(data: {string: value}): Entry
 end
 
 function Manager:ready(entry: Entry)
-  if entry.state == "starting" then
+  case entry.state
+  when starting() then
     entry.waiter = async.running()
     defer entry.waiter = nil
     async.suspend(entry.wake)
   end
   if self.closed then raise Error(503, "Session manager is closed") end
-  if entry.state ~= "active" then raise Error(entry.failure_status, "Failed to start headless Foundry session") end
+  case entry.state
+  when active() then
+  else raise Error(entry.failure_status, "Failed to start headless Foundry session")
+  end
 end
 
 function Manager:publish(entry: Entry)
-  if self.closed or entry.state ~= "active" then raise Error(503, "Headless session is no longer active") end
+  if self.closed then raise Error(503, "Headless session is no longer active") end
+  case entry.state
+  when active() then
+  else raise Error(503, "Headless session is no longer active")
+  end
   entry.published = true
   log.emit(self.logger, "info", "headless_session_started", {["client_id"] = entry.client_id})
 end
 
 function Manager:discard(entry: Entry)
-  if entry.state == "stopped" then return end
+  case entry.state
+  when stopped() then return
+  end
   if not entry.published then
-    entry.state = entry.state == "cleanup-failed" and "cleanup-failed" or "stopping"
+    case entry.state
+    when cleanup_failed() then
+    else entry.state = STATE_STOPPING
+    end
     if entry.worker then tasks.drain(entry.worker) end
     if not entry.entered then self:retire(entry, nil) end
   end
@@ -347,21 +403,29 @@ end
 function Manager:finish(id: string)
   local entry? = self.entries[id]
   if not entry then raise Error(404, "Session not found") end
-  if entry.state ~= "cleanup-failed" then entry.state = "stopping" end
+  case entry.state
+  when cleanup_failed() then
+  else entry.state = STATE_STOPPING
+  end
   if entry.worker then tasks.drain(entry.worker) end
   if not entry.entered then self:retire(entry, nil) end
-  if entry.state == "cleanup-failed" then raise Error(503, "Headless session cleanup failed") end
+  case entry.state
+  when cleanup_failed() then raise Error(503, "Headless session cleanup failed")
+  end
 end
 
 function Manager:list(): {string: value}
   local active: {value} = {}
-  for _id, entry in iteration.pairs(self.entries) do
-    if entry.state == "active" and entry.published then
-      local item: {string: value} = {["sessionId"] = entry.session_id, ["clientId"] = entry.client_id,
-        ["foundryUrl"] = entry.address, ["username"] = entry.user, ["worldName"] = entry.world,
-        ["startedAt"] = entry.started_at, ["lastActivity"] = entry.activity}
-      for key, content in iteration.pairs(entry.metadata) do item[key] = content end
-      active[#active + 1] = item
+  for _, entry in iteration.pairs(self.entries) do
+    case entry.state
+    when active() then
+      if entry.published then
+        local item: {string: value} = {["sessionId"] = entry.session_id, ["clientId"] = entry.client_id,
+          ["foundryUrl"] = entry.address, ["username"] = entry.user, ["worldName"] = entry.world,
+          ["startedAt"] = entry.started_at, ["lastActivity"] = entry.activity}
+        for key, content in iteration.pairs(entry.metadata) do item[key] = content end
+        active[#active + 1] = item
+      end
     end
   end
   return {["activeSessions"] = active}
@@ -370,9 +434,9 @@ end
 function Manager:close()
   if self.closed then return end
   self.closed = true
-  for token, _handshake in iteration.pairs(self.handshakes) do self.handshakes[token] = nil end
+  for token in iteration.pairs(self.handshakes) do self.handshakes[token] = nil end
   local admitted: {Entry} = {}
-  for _id, entry in iteration.pairs(self.entries) do
+  for _, entry in iteration.pairs(self.entries) do
     admitted[#admitted + 1] = entry
     if entry.worker then entry.worker:cancel() end
   end
@@ -383,6 +447,8 @@ function Manager:close()
   end
   if self.key then self.key:close(); self.key = nil end
   for index = 1, #admitted do
-    if admitted[index].state == "cleanup-failed" then raise Error(503, "Headless session cleanup failed") end
+    case admitted[index].state
+    when cleanup_failed() then raise Error(503, "Headless session cleanup failed")
+    end
   end
 end

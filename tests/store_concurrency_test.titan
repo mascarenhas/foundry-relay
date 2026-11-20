@@ -7,6 +7,7 @@ local thread = import "thread"
 local timer = import "timer"
 local uv = import "uv"
 local store = import "relay.store.titan"
+local tasks = import "relay.tasks"
 
 record Bootstrap
   path: string
@@ -22,11 +23,6 @@ local function fixture(context: test.Context): (store.Store, string)
   local database = store.open(path)
   context:cleanup(function() database:close() end)
   return database, path
-end
-
-local function drain<|T|>(task: async.Task<|T, value|>)
-  if not task:status():has_finished() then task:cancel() end
-  async.join(task)
 end
 
 local function contender(input: Bootstrap): store.Client
@@ -115,7 +111,7 @@ function test_cancelled_mutation_rolls_back_before_fifo_handoff(context: test.Co
       return nil
     end)
   end)
-  defer drain(writer)
+  defer tasks.drain(writer)
   while not dirty do
     test.assert(not writer:status():has_finished(), "writer ended before its native mutation")
     timer.yield()
@@ -123,12 +119,12 @@ function test_cancelled_mutation_rolls_back_before_fifo_handoff(context: test.Co
   local reader = async.run<|string, value|>(function(): string
     return database:get(client.client_id).world_title
   end)
-  defer drain(reader)
+  defer tasks.drain(reader)
   local next_writer = async.run<|nil, value|>(function(): nil
     database:update(client.client_id, "", "After", "", "")
     return nil
   end)
-  defer drain(next_writer)
+  defer tasks.drain(next_writer)
   while #database.waiters < 2 do timer.yield() end
   local reason = async.CancellationReason<|value|>.simple("cancel after native SQL mutation")
   writer:cancel(reason)

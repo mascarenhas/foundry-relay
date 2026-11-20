@@ -40,13 +40,7 @@ function Fake:close()
     timer.sleep(self.probe.cleanup_ms)
     return nil
   end)
-  local remove: (function(): ())? = nil
-  defer if remove then remove() end
-  async.await_cleanup<|nil, nil|>(function(resolve, _reject, _fatal)
-    if cleanup:status():has_finished() then resolve(nil)
-    else remove = cleanup:add_terminal_listener(function(_status) resolve(nil) end)
-    end
-  end)
+  tasks.await_terminal(cleanup)
   if self.probe.fail_cleanup then raise "private cleanup diagnostic" end
 end
 
@@ -177,7 +171,7 @@ function test_expiry_and_pending_bound(_context: test.Context)
   fixture.manager.handshakes[token] = sessions.Handshake(original.address, original.origin,
     original.user, original.world, original.nonce, uv.hrtime() - 1)
   expect_error(function() fixture.manager:begin({["handshakeToken"] = token}) end, 400)
-  for _index = 1, 32 do fixture.manager:handshake("https://example.test", "GM", "sandbox") end
+  for _ = 1, 32 do fixture.manager:handshake("https://example.test", "GM", "sandbox") end
   expect_error(function() fixture.manager:handshake("https://example.test", "GM", "sandbox") end, 429)
 end
 
