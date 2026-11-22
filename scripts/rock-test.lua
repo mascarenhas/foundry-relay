@@ -1,16 +1,16 @@
 -- `luarocks test` driver. LuaRocks passes its tool directory (where titanc
--- lives) and the SDK include/library directories; remaining arguments go to
--- the native test runner, except a leading `--coverage`, which builds and
--- runs the instrumented images instead (Linux/macOS).
-local scripts_dir, include_dir, library_dir = arg[1], arg[2], arg[3]
-if not (scripts_dir and include_dir and library_dir) then
-   io.stderr:write("usage: lua scripts/rock-test.lua SCRIPTS_DIR LUA_INCDIR LUA_LIBDIR [--coverage] [runner arguments...]\n")
+-- lives) and the SDK prefix; remaining arguments go to the native test
+-- runner, except a leading `--coverage`, which builds and runs the
+-- instrumented images instead (Linux/macOS).
+local scripts_dir, sdk_dir = arg[1], arg[2]
+if not (scripts_dir and sdk_dir) then
+   io.stderr:write("usage: lua scripts/rock-test.lua SCRIPTS_DIR LUA_DIR [--coverage] [runner arguments...]\n")
    os.exit(2)
 end
 local windows = package.config:sub(1, 1) == "\\"
-local coverage = arg[4] == "--coverage"
+local coverage = arg[3] == "--coverage"
 local runner_args = {}
-for index = coverage and 5 or 4, #arg do runner_args[#runner_args + 1] = arg[index] end
+for index = coverage and 4 or 3, #arg do runner_args[#runner_args + 1] = arg[index] end
 
 local function quote(text)
    if windows then return '"' .. text .. '"' end
@@ -43,25 +43,29 @@ if windows then
    local env = 'set "CC=clang" && set "AR=llvm-ar" && set "RANLIB=llvm-ranlib" && set "RC=llvm-rc" && '
       .. 'set "TITAN_RUNTIME_PREBUILT=1" && set "TITAN_PROBE_CACHE_DISABLE=1" && '
    local titanc = quote(scripts_dir .. "\\titanc.exe") .. " --incremental --output build"
-      .. " -DUSING_UV_SHARED=1 -I" .. quote(include_dir) .. " -L" .. quote(library_dir)
+      .. " -DUSING_UV_SHARED=1 -I" .. quote(sdk_dir .. "\\include") .. " -L" .. quote(sdk_dir .. "\\lib")
       .. " -lcrypto --ldflag=-Wl,--stack,8388608"
    run(env .. titanc .. " --exe build\\bin\\foundry-relay.exe foundry_relay")
    -- The standalone-process test relocates a static executable (Linux/macOS).
    run(env .. titanc .. " --test --tree . --test-dir tests --test-exclude tests.process_test"
       .. " --exe build\\bin\\relay-tests.exe")
-   run("build\\bin\\relay-tests.exe" .. arguments())
+   -- The suite loads lua55.dll and native DLLs from the SDK bin directory and
+   -- titan.dll/mk.dll from its provider directory.
+   run('set "PATH=' .. scripts_dir .. ';%PATH%" && set "TITAN_PATH_0_6=' .. sdk_dir .. '\\lib\\titan\\0.6" && '
+      .. "build\\bin\\relay-tests.exe" .. arguments())
    os.exit(0)
 end
 
 local link_env = ""
-if (os.getenv("OPENSSL_MODE") or "system") == "system" then
+local openssl_mode = os.getenv("OPENSSL_MODE") or "system"
+if openssl_mode == "system" then
+   run("pkg-config --print-errors --exists 'openssl >= 3.0'")
    local cflags = output("pkg-config --cflags openssl")
    local libs = output("pkg-config --libs openssl")
-   if not libs or libs == "" then
-      io.stderr:write("rock-test.lua: pkg-config found no OpenSSL; set OPENSSL_MODE=bundled for a bundled-OpenSSL Titan SDK\n")
-      os.exit(1)
-   end
-   link_env = "TITAN_EXTRA_CPPFLAGS=" .. quote(cflags or "") .. " TITAN_EXTRA_LDFLAGS=" .. quote(libs) .. " "
+   link_env = "TITAN_EXTRA_CPPFLAGS=" .. quote(cflags or "") .. " TITAN_EXTRA_LDFLAGS=" .. quote(libs or "") .. " "
+elseif openssl_mode ~= "bundled" then
+   io.stderr:write("rock-test.lua: OPENSSL_MODE must be system or bundled\n")
+   os.exit(1)
 end
 local titanc = quote(scripts_dir .. "/titanc")
 
@@ -78,13 +82,19 @@ end
 -- independently, so each image owns a separate tree.
 local root = assert(output("pwd"), "cannot determine the working directory")
 -- The relocated server in process_test runs without PATH, so its report
--- needs an absolute gcov (COVERAGE_GCOV, else the gcov found on PATH).
-local gcov = os.getenv("COVERAGE_GCOV") or output("command -v gcov")
-if not gcov or gcov == "" then
-   io.stderr:write("rock-test.lua: --coverage needs gcov on PATH or COVERAGE_GCOV\n")
+-- needs the gcov program (COVERAGE_GCOV, else GCOV, else gcov) by absolute
+-- path; trailing words such as `llvm-cov gcov`'s stay as given.
+local gcov_command = os.getenv("COVERAGE_GCOV") or os.getenv("GCOV") or "gcov"
+local gcov_program, gcov_rest = gcov_command:match("^%s*(%S+)(.-)%s*$")
+if gcov_program and gcov_program:sub(1, 1) ~= "/" then
+   gcov_program = output("command -v " .. quote(gcov_program))
+end
+if not gcov_program or gcov_program:sub(1, 1) ~= "/" then
+   io.stderr:write("rock-test.lua: cannot resolve the gcov command '" .. gcov_command
+      .. "' to an absolute path; set COVERAGE_GCOV or GCOV\n")
    os.exit(1)
 end
-local coverage_flags = " --coverage --coverage-gcov " .. quote(gcov)
+local coverage_flags = " --coverage --coverage-gcov " .. quote(gcov_program .. gcov_rest)
 local clean_env = "env -u TITAN_FILTER -u GCOV_PREFIX -u GCOV_PREFIX_STRIP "
 run("rm -rf build/coverage-app build/coverage-tests")
 run(clean_env .. link_env .. titanc .. " --static --output build/coverage-app" .. coverage_flags

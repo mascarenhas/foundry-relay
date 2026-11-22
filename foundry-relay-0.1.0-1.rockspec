@@ -22,17 +22,22 @@ dependencies = {
 -- Linux/macOS link one --static executable. A system-OpenSSL Titan SDK (the
 -- default) takes OpenSSL's compile and final-link flags from pkg-config; set
 -- OPENSSL_MODE=bundled when the SDK bundles OpenSSL.
-local unix_openssl = 'if [ "${OPENSSL_MODE:-system}" = system ]; then '
+local unix_openssl = 'case "${OPENSSL_MODE:-system}" in '
+   .. 'system) pkg-config --print-errors --exists "openssl >= 3.0" || exit 1; '
    .. 'TITAN_EXTRA_CPPFLAGS="`pkg-config --cflags openssl`"; '
    .. 'TITAN_EXTRA_LDFLAGS="`pkg-config --libs openssl`"; '
-   .. 'export TITAN_EXTRA_CPPFLAGS TITAN_EXTRA_LDFLAGS; fi; '
+   .. 'export TITAN_EXTRA_CPPFLAGS TITAN_EXTRA_LDFLAGS;; '
+   .. 'bundled) ;; '
+   .. '*) echo "OPENSSL_MODE must be system or bundled" >&2; exit 1;; '
+   .. 'esac; '
 
 -- Windows (MSYS2 CLANG64 SDK) builds a launcher plus its application DLL
 -- (`foundry_relay.dll`, named after the root module); --static is
 -- unsupported there.
 local windows_env = 'set "CC=clang" && set "AR=llvm-ar" && set "RANLIB=llvm-ranlib" && set "RC=llvm-rc" && '
    .. 'set "TITAN_RUNTIME_PREBUILT=1" && set "TITAN_PROBE_CACHE_DISABLE=1" && '
-local windows_flags = ' -DUSING_UV_SHARED=1 -I"$(LUA_INCDIR)" -L"$(LUA_LIBDIR)" -lcrypto --ldflag=-Wl,--stack,8388608'
+local windows_flags = ' -DUSING_UV_SHARED=1 -I"$(LUA_DIR)\\include" -L"$(LUA_DIR)\\lib" -lcrypto'
+   .. ' --ldflag=-Wl,--stack,8388608'
 
 build = {
    type = "command",
@@ -71,5 +76,5 @@ hooks = {
 test = {
    type = "command",
    script = "scripts/rock-test.lua",
-   flags = { "$(SCRIPTS_DIR)", "$(LUA_INCDIR)", "$(LUA_LIBDIR)" },
+   flags = { "$(SCRIPTS_DIR)", "$(LUA_DIR)" },
 }
