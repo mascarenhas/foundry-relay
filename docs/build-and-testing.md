@@ -39,12 +39,12 @@ under `build/`:
 
 Both commands invoke `titanc` directly; the compiler owns import discovery,
 dependency scheduling, object certification, and final-link reuse. An unchanged
-build compiles and links nothing, and the server and test runner share
-unchanged certified production `.o` files and static providers (`titan.a`,
-`mk.a`) under `build/`. Generated C, headers, and objects preserve the
-repository layout under `build/`, while target-specific synthetic runner and
-entrypoint files live under `build/.titan-links/<key>/synthetic/`. Delete
-`build/` to force a clean rebuild.
+build compiles and links nothing; the server and test runner share unchanged
+certified production `.o` files under `build/` and link against the installed
+static providers (`titan.a`, `mk.a`) in the tree's `lib/titan/0.6`. Generated
+C, headers, and objects preserve the repository layout under `build/`, while
+target-specific synthetic runner and entrypoint files live under
+`build/.titan-links/<key>/synthetic/`. Delete `build/` to force a clean rebuild.
 
 The compiler keeps a disposable precise-stat digest cache at
 `build/.titan/digests`, separate from object and link certificates. Missing or
@@ -180,14 +180,15 @@ four end-to-end delivery checks:
 `luarocks test foundry-relay-0.1.0-1.rockspec` executes `build/relay-tests`
 with `RELAY_TEST_EXECUTABLE=build/foundry-relay` on POSIX (or
 `build\bin\relay-tests.exe` on Windows). The 15 native `tests/*_test.titan`
-modules partition across four verification layers (routing and logging
-primitives are covered by `titan-mk`'s own suites):
+modules partition across four verification layers (routing, logging, `413`
+body-limit, and `WWW-Authenticate` `401` middleware primitives are covered by
+`titan-mk`'s own suites):
 
 | Layer | Test modules | Coverage focus |
 | --- | --- | --- |
 | Unit & boundaries | `api_test`, `store_test`, `session_crypto_test`, `cdp_test` | 91-endpoint `mk.router` integration, parameter validation, and Base64 framing, SQLite schema/mode/pairing reuse, RSA-OAEP interop, single-flight CDP timeouts and error sanitization |
 | Concurrency & lifecycle | `store_concurrency_test`, `replies_test`, `protocol_test`, `threading_test`, `sessions_test` | 4-thread `SQLITE_BUSY` retry, 4-lease reply pool FIFO and channel replacement, WebSocket world engine and reconnect quiescence, `mk` pool/session dispatch and cancelled credential revocation, `sessions.Manager` admission and cleanup quarantine |
-| Browser & HTTP/WS integration | `browser_test`, `foundry_session_test`, `integration_test`, `logging_http_test`, `session_http_test` | Fake-child and installed-Chromium lifecycle, Foundry preload/join/readiness verification, loopback REST/WebSocket/SSE forwarding, `413` body limits, `WWW-Authenticate` `401` headers, `mk.middleware.logger` admission + single-timeout logging, two-phase HTTP session publication |
+| Browser & HTTP/WS integration | `browser_test`, `foundry_session_test`, `integration_test`, `logging_http_test`, `session_http_test` | Fake-child and installed-Chromium lifecycle, Foundry preload/join/readiness verification, loopback REST/WebSocket/SSE forwarding, `mk.middleware.logger` admission + single-timeout logging, two-phase HTTP session publication |
 | Standalone delivery | `process_test` | Relocated static binary launched with stripped `PATH`/`TITAN_*`/`LUA_*`, live pair/WS/SSE lifecycle, graceful `SIGTERM` shutdown, credential-free JSON `stderr`, and child coverage report check |
 
 Every production module (`foundry_relay.titan` and all 19 `relay/*.titan`
