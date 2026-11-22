@@ -22,10 +22,10 @@ env:
   TITAN_RELEASE: v0.6.0
   TITAN_ROCK: titan-0.6.0-1.src.rock
   TITAN_BUILD_PROFILE: validation
-  # titan-mk is installed from the commit this ref selects when the job runs;
-  # pin a release tag here once titan-mk publishes one.
-  MK_REPO: mascarenhas/mk
-  MK_REF: master
+  # titan-mk comes from the mascarenhas/mk GitHub release until it is
+  # published on LuaRocks.
+  MK_RELEASE: v0.1.0
+  MK_ROCK: titan-mk-0.1.0-1.src.rock
 
 jobs:
   linux:
@@ -65,6 +65,25 @@ jobs:
           [[ $commit =~ ^[0-9a-f]{40}$ ]]
           digest=$(gh api "repos/mascarenhas/titan/releases/tags/$TITAN_RELEASE" --jq "
             [.assets[] | select(.name == \"$TITAN_ROCK\")] | select(length == 1) | first |
+            .digest | select(type == \"string\" and test(\"^sha256:[0-9a-f]{64}$\")) |
+            sub(\"^sha256:\"; \"\")" | tr -d '\r')
+          [[ $digest =~ ^[0-9a-f]{64}$ ]]
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "rock-sha256=$digest" >> "$GITHUB_OUTPUT"
+
+      # titan-mk is verified the same way: the commit its tag selects and the
+      # digest of its single source rock asset.
+      - name: Identify the titan-mk release
+        id: mk-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: &identify-mk-release |
+          set -euo pipefail
+          # Strip CR: on Windows this runs in Git Bash around the native gh.exe.
+          commit=$(gh api "repos/mascarenhas/mk/commits/$MK_RELEASE" --jq '.sha' | tr -d '\r')
+          [[ $commit =~ ^[0-9a-f]{40}$ ]]
+          digest=$(gh api "repos/mascarenhas/mk/releases/tags/$MK_RELEASE" --jq "
+            [.assets[] | select(.name == \"$MK_ROCK\")] | select(length == 1) | first |
             .digest | select(type == \"string\" and test(\"^sha256:[0-9a-f]{64}$\")) |
             sub(\"^sha256:\"; \"\")" | tr -d '\r')
           [[ $digest =~ ^[0-9a-f]{64}$ ]]
@@ -138,21 +157,22 @@ jobs:
           path: ${{ env.TITAN_PREFIX }}
           key: ${{ steps.sdk-cache.outputs.cache-primary-key }}
 
-      - name: Identify titan-mk
-        id: mk
+      # From the mascarenhas/mk GitHub release until titan-mk is on LuaRocks.
+      - name: Install the titan-mk release rock
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: &identify-mk |
+          MK_COMMIT: ${{ steps.mk-release.outputs.commit }}
+          MK_ROCK_SHA256: ${{ steps.mk-release.outputs.rock-sha256 }}
+        run: |
           set -euo pipefail
-          # Strip CR: on Windows this runs in Git Bash around the native gh.exe.
-          commit=$(gh api "repos/$MK_REPO/commits/$MK_REF" --jq '.sha' | tr -d '\r')
-          [[ $commit =~ ^[0-9a-f]{40}$ ]]
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-
-      - name: Install titan-mk
-        env:
-          MK_COMMIT: ${{ steps.mk.outputs.commit }}
-        run: bash .github/scripts/install-titan-mk.sh "$RUNNER_TEMP/titan-mk"
+          echo "titan-mk $MK_RELEASE at $MK_COMMIT"
+          mkdir -p "$RUNNER_TEMP/titan-mk"
+          cd "$RUNNER_TEMP/titan-mk"
+          curl -fL --retry 3 -o "$MK_ROCK" \
+            "https://github.com/mascarenhas/mk/releases/download/$MK_RELEASE/$MK_ROCK"
+          echo "$MK_ROCK_SHA256  $MK_ROCK" | sha256sum --check --strict
+          luarocks install "$MK_ROCK"
+          test -f "$TITAN_PREFIX/lib/titan/0.6/mk.so"
+          test -f "$TITAN_PREFIX/lib/titan/0.6/mk.a"
 
       - name: Lint the rockspec
         run: luarocks lint foundry-relay-0.1.0-1.rockspec
@@ -198,6 +218,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: *identify-release
+
+      - name: Identify the titan-mk release
+        id: mk-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: *identify-mk-release
 
       - name: Identify the native toolchain
         id: toolchain
@@ -263,16 +289,22 @@ jobs:
           path: ${{ env.TITAN_PREFIX }}
           key: ${{ steps.sdk-cache.outputs.cache-primary-key }}
 
-      - name: Identify titan-mk
-        id: mk
+      # From the mascarenhas/mk GitHub release until titan-mk is on LuaRocks.
+      - name: Install the titan-mk release rock
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: *identify-mk
-
-      - name: Install titan-mk
-        env:
-          MK_COMMIT: ${{ steps.mk.outputs.commit }}
-        run: bash .github/scripts/install-titan-mk.sh "$RUNNER_TEMP/titan-mk"
+          MK_COMMIT: ${{ steps.mk-release.outputs.commit }}
+          MK_ROCK_SHA256: ${{ steps.mk-release.outputs.rock-sha256 }}
+        run: |
+          set -euo pipefail
+          echo "titan-mk $MK_RELEASE at $MK_COMMIT"
+          mkdir -p "$RUNNER_TEMP/titan-mk"
+          cd "$RUNNER_TEMP/titan-mk"
+          curl -fL --retry 3 -o "$MK_ROCK" \
+            "https://github.com/mascarenhas/mk/releases/download/$MK_RELEASE/$MK_ROCK"
+          echo "$MK_ROCK_SHA256  $MK_ROCK" | shasum -a 256 --check --strict
+          luarocks install "$MK_ROCK"
+          test -f "$TITAN_PREFIX/lib/titan/0.6/mk.so"
+          test -f "$TITAN_PREFIX/lib/titan/0.6/mk.a"
 
       - name: Lint the rockspec
         run: luarocks lint foundry-relay-0.1.0-1.rockspec
@@ -340,6 +372,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: *identify-release
 
+      - name: Identify the titan-mk release
+        id: mk-release
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: *identify-mk-release
+
       - name: Identify the CLANG64 toolchain
         id: toolchain
         run: |
@@ -403,22 +443,24 @@ jobs:
           path: C:/titan-sdk
           key: ${{ steps.sdk-cache.outputs.cache-primary-key }}
 
-      - name: Identify titan-mk
-        id: mk
-        shell: bash
-        working-directory: ${{ github.workspace }}
+      # From the mascarenhas/mk GitHub release until titan-mk is on LuaRocks;
+      # its post_install hook publishes mk.dll through titan-install.
+      - name: Install the titan-mk release rock
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: *identify-mk
-
-      - name: Install titan-mk
-        env:
-          MK_COMMIT: ${{ steps.mk.outputs.commit }}
+          MK_COMMIT: ${{ steps.mk-release.outputs.commit }}
+          MK_ROCK_SHA256: ${{ steps.mk-release.outputs.rock-sha256 }}
         run: |
           set -euo pipefail
           unset LD
           export PATH="$(cygpath -u "$TITAN_PREFIX")/bin:/clang64/bin:$PATH"
-          bash .github/scripts/install-titan-mk.sh /c/titan-mk
+          echo "titan-mk $MK_RELEASE at $MK_COMMIT"
+          mkdir -p /c/titan-mk
+          cd /c/titan-mk
+          curl -fL --retry 3 -o "$MK_ROCK" \
+            "https://github.com/mascarenhas/mk/releases/download/$MK_RELEASE/$MK_ROCK"
+          echo "$MK_ROCK_SHA256  $MK_ROCK" | sha256sum --check --strict
+          luarocks.exe --lua-version=5.5 --tree="$TITAN_PREFIX" install "$MK_ROCK"
+          test -f "$(cygpath -u "$TITAN_PREFIX")/lib/titan/0.6/mk.dll"
 
       - name: Lint the rockspec
         run: |

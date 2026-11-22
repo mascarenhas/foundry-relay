@@ -226,7 +226,7 @@ end
 ```
 *Source: [`tests/store_concurrency_test.titan`](../tests/store_concurrency_test.titan) — `test_busy_retries_roll_back_the_complete_write`*
 
-[GitHub Actions](../.github/workflows/ci.yml) runs `luarocks lint`, `luarocks test`, and an install, standalone-run, and removal smoke ([`.github/scripts/package-smoke.sh`](../.github/scripts/package-smoke.sh)) on Linux x64, macOS arm64, and Windows x64 (MSYS2 CLANG64). Each job builds the pinned Titan release SDK and installs `titan-mk` from `MK_REPO` at `MK_REF`; the Windows job also runs `make -f Makefile.windows test`.
+[GitHub Actions](../.github/workflows/ci.yml) runs `luarocks lint`, `luarocks test`, and an install, standalone-run, and removal smoke ([`.github/scripts/package-smoke.sh`](../.github/scripts/package-smoke.sh)) on Linux x64, macOS arm64, and Windows x64 (MSYS2 CLANG64). Each job builds the pinned Titan release SDK and installs the `titan-mk` source rock from its GitHub release (`MK_RELEASE`), checking both release digests; the Windows job also runs `make -f Makefile.windows test`.
 
 ### Optional test capabilities and platform skips
 
