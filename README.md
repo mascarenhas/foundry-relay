@@ -1,40 +1,50 @@
 # Foundry relay in Titan
 
 A single-user REST-to-WebSocket relay for the Foundry VTT REST API module,
-written in Titan (~5.2k LOC across 22 modules). It implements the core protocol
-of [ThreeHats' Go relay](https://github.com/ThreeHats/foundryvtt-rest-api-relay/tree/main/go-relay),
+written in Titan (~4.6k LOC across 20 modules) on top of
+[`titan-mk`](https://github.com/mascarenhas/mk) (`MIT` licensed; see
+[`LICENSE`](LICENSE)). It implements the core protocol of
+[ThreeHats' Go relay](https://github.com/ThreeHats/foundryvtt-rest-api-relay/tree/main/go-relay),
 with SQLite persistence, an environment API key, and optional headless Chromium
 sessions served by the same binary.
 
-On Linux and macOS, `make` links the application and Titan's standard provider
-into a standalone static executable (`build/foundry-relay`). On Windows,
-[`Makefile.windows`](docs/build-and-testing.md#windows-build) packages an EXE
-launcher with application and runtime DLLs. Neither layout invokes or depends
-on the Titan compiler at runtime.
+On Linux and macOS, `luarocks make` links the application, `titan-mk`, and
+Titan's standard provider into a standalone static executable installed at
+`<tree>/bin/foundry-relay`. On Windows, `luarocks make` installs the launcher
+and `foundry_relay.dll` via `titan-install.bat`, and
+[`Makefile.windows`](docs/build-and-testing.md#windows-build) packages a
+relocatable EXE launcher with application and runtime DLLs. Neither layout
+invokes or depends on the Titan compiler at runtime.
 
-## Build and test
+## Build, install, and test
 
-Install a prepared Titan 0.6 SDK on `PATH` (including `thread`, `http`,
-`websocket`, `sqlite3`, `json`, `peg`, and compiled `titan.test`), a C
-compiler, OpenSSL 3.0+ development headers with `pkg-config`, and GNU `timeout`
-for `make test`.
+Install a prepared Titan 0.6 SDK on `PATH` (including `luarocks`, `thread`,
+`http`, `websocket`, `sqlite3`, `json`, `peg`, and compiled `titan.test`),
+the `titan-mk` (`~> 0.1`) rock, a C compiler, and OpenSSL 3.0+ development
+headers with `pkg-config`.
 
 ```sh
 export PATH=/path/to/titan-prefix/bin:$PATH
-make
-make test
-make test TEST_ARGS="--filter='^tests[.]integration_test'"
+luarocks make foundry-relay-0.1.0-1.rockspec
+luarocks test foundry-relay-0.1.0-1.rockspec
+luarocks test foundry-relay-0.1.0-1.rockspec -- --filter='^tests[.]integration_test'
 ```
 
-`make` compiles `build/foundry-relay`, `make test` builds and runs
-`build/relay-tests`, and `make clean` removes `build`. Both targets use
-compiler-owned incremental builds (`titanc --incremental --static --output
-build`) against system OpenSSL.
+On Linux and macOS, `luarocks make foundry-relay-0.1.0-1.rockspec` compiles
+`build/foundry-relay` via `titanc --incremental --static --output build`
+against system OpenSSL and installs it as `<tree>/bin/foundry-relay` (remove
+with `luarocks remove foundry-relay`). `luarocks test` builds
+`build/foundry-relay` and `build/relay-tests` through
+[`scripts/rock-test.lua`](scripts/rock-test.lua) and runs the native test
+suite. On Windows, `luarocks make` installs `foundry-relay.exe` and publishes
+`foundry_relay.dll` via `titan-install.bat` (remove with
+`titan-uninstall foundry-relay`).
 
-For `OPENSSL_MODE=bundled`, optional Chrome and OpenSSL test variables,
-compiler overrides, and native Windows builds, see
+For `OPENSSL_MODE=bundled`, optional Chrome and OpenSSL test variables, and
+Windows rockspec and relocatable payload builds, see
 [Build and testing](docs/build-and-testing.md). For native executable line
-coverage (`make coverage`), see [Coverage](docs/coverage.md).
+coverage (`luarocks test foundry-relay-0.1.0-1.rockspec -- --coverage`), see
+[Coverage](docs/coverage.md).
 
 ## Run
 
@@ -45,7 +55,7 @@ submitted codes exactly). Treat both values as secrets.
 ```sh
 export FOUNDRY_REST_API_KEY='your-private-api-key'
 export FOUNDRY_PAIRING_CODE='A4X9K2'
-./build/foundry-relay
+foundry-relay
 ```
 
 By default the relay listens on `127.0.0.1:3010`, stores world credentials in

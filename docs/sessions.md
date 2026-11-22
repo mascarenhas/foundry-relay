@@ -34,7 +34,7 @@ mkdir -p build/browser-profiles
 export RELAY_CHROME=/path/to/google-chrome
 export RELAY_BROWSER_PROFILES="$PWD/build/browser-profiles"
 export RELAY_ALLOWED_ORIGINS='https://foundry.example.test'
-./build/foundry-relay
+foundry-relay
 ```
 
 For a system Flatpak Chrome installation, set `RELAY_CHROME` to
@@ -244,10 +244,10 @@ expired/invalid handshakes, bad ciphertext, unsupported `captureBrowserConsole`,
 or missing/ambiguous pairings; `401` for a nonce mismatch or invalid API key;
 `403` for a disallowed Foundry origin; `404` for an unknown `sessionId`; `408`
 for an expired startup deadline; `409` for a world already connected or
-admitted; `429` at the 32-handshake or `RELAY_MAX_SESSIONS` limit; `500` for
-other startup failures; and `503` when session creation is disabled, the server
-is closing, or cleanup failed (`GET /session` returns an empty list when
-creation is disabled).
+admitted; `413` for a request body exceeding 16 MiB; `429` at the 32-handshake
+or `RELAY_MAX_SESSIONS` limit; `500` for other startup failures; and `503` when
+session creation is disabled, the server is closing, or cleanup failed
+(`GET /session` returns an empty list when creation is disabled).
 
 Startup failures log `headless_session_failed` (`reason: "startup_failed"`)
 with `client_id`, `elapsed_ms`, and fixed `stage`/`cause` categories—omitting

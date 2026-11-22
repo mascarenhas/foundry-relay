@@ -4,15 +4,15 @@ A relay sits between many short-lived REST and SSE clients and long-lived Foundr
 
 Titan threads share no Lua state, heap objects, or async `Runtime`. Every thread creates its own Lua state and communicates only through bounded `thread.channel` endpoints carrying immutable values, arrays, records, unions, or transferred channel endpoints. `foundry-relay` organizes its threads into three roles:
 
-- **Main thread** ([`main.titan`](../main.titan), [`relay/server.titan`](../relay/server.titan)) — owns the HTTP listener, the coordinator (`Server:control_loop`), the keep-alive return dispatcher (`return_task`), the main `stderr` log sink (`log_task`), the live world directory and SSE subscriber registry (`Hub` in [`relay/hub.titan`](../relay/hub.titan)), and the headless browser session manager (`Manager` in [`relay/sessions.titan`](../relay/sessions.titan)).
-- **API workers** (`run` in [`relay/api_worker.titan`](../relay/api_worker.titan)) — `RELAY_API_CONCURRENCY` persistent threads spawned before the listener opens. Each parses HTTP targets, enforces origin and API-key checks, translates REST endpoints, and drives SSE streams.
-- **World threads** (`run` in [`relay/world.titan`](../relay/world.titan)) — spawned on demand by `Server:start_world`, one per Foundry module connection. Each owns one authenticated WebSocket transport and all of its framing, heartbeat, and correlation Tasks.
+- **Main thread** ([`foundry_relay.titan`](../foundry_relay.titan), [`relay/server.titan`](../relay/server.titan)) — owns the `mk.App` HTTP listener and worker supervisor, the coordinator (`Server:control_loop`), the live world directory and SSE subscriber registry (`Hub` in [`relay/hub.titan`](../relay/hub.titan)), the headless browser session manager (`Manager` in [`relay/sessions.titan`](../relay/sessions.titan)), and the main `mk.log.Logger` `stderr` sink.
+- **API pool workers** (`WorkerMode.pool` in [`relay/routes.titan`](../relay/routes.titan), handlers in [`relay/api_worker.titan`](../relay/api_worker.titan)) — `RELAY_API_CONCURRENCY` persistent `mk` pool threads spawned during `App:start()`. Each attaches its own SQLite `Store` and 4-lease reply `Pool` in `on_start`, enforces origin/target/API-key middleware, translates REST endpoints, and drives SSE streams.
+- **World session workers** (`WorkerMode.session` with `ephemeral = true` in [`relay/routes.titan`](../relay/routes.titan), engine in [`relay/world.titan`](../relay/world.titan)) — spawned on demand by `mk.App` for each `/relay?id=<clientId>` opening via `world.select_session`. Each attaches its own `Store`, upgrades the WebSocket via `ctx:upgrade_websocket`, authenticates, and owns all framing, heartbeat, and correlation Tasks for one Foundry module connection.
 
 ## Signal-safe startup and shielded retirement
 
-`main` in [`main.titan`](../main.titan) creates the `log.Logger` first and registers `defer logger:close()` before calling `run`, ensuring final shutdown diagnostics flush only after the server and every worker thread have retired. If `RELAY_LOG_LEVEL` itself is invalid, `main` writes a fixed JSON record through `log.fatal` and exits with status `1`.
+`main` in [`foundry_relay.titan`](../foundry_relay.titan) creates the `mk.log.Logger` first (`log.resolve_level(os.getenv("RELAY_LOG_LEVEL"), false, "RELAY_LOG_LEVEL")`) and registers `defer logger:close()` before calling `run`, ensuring final shutdown diagnostics flush only after the server and every worker thread have retired. If `RELAY_LOG_LEVEL` itself is invalid, `main` writes a fixed JSON record through `log.fatal` and exits with status `1`.
 
-Inside `run`, `config.load` validates environment variables before `Server.new` touches SQLite or spawns threads. Once `relay:start()` opens the listener, `run` spawns two signal Tasks waiting on `os.wait_signal("term")` and `os.wait_signal("int")`. Both invoke `relay:close()` and capture any retirement failure into `shutdown_error`. Because closing the listener wakes `relay:serve()` before headless browser retirement finishes, `run` drains both signal Tasks after `relay:serve()` returns and re-raises `shutdown_error` so a failed teardown produces exit status `1`.
+Inside `run`, `config.load` validates environment variables before `Server.new` touches SQLite or constructs the `mk.App`. Once `relay:start()` starts `control_loop` and calls `self.app:start(...)` (spawning the API pool workers and opening the listener), `run` spawns two signal Tasks waiting on `os.wait_signal("term")` and `os.wait_signal("int")`. Both invoke `relay:close()` and capture any retirement failure into `shutdown_error`. Because closing the listener wakes `relay:serve()` before headless browser retirement finishes, `run` drains both signal Tasks after `relay:serve()` returns and re-raises `shutdown_error` so a failed teardown produces exit status `1`.
 
 All teardown paths in the relay rely on [`relay/tasks.titan`](../relay/tasks.titan). When a caller's Task is cancelled, ordinary suspending operations abort immediately with `async.CancellationReason`. Waiting for a child Task, a worker join, or a browser retirement inside `defer` therefore wraps `task:add_terminal_listener` in `async.await_cleanup`, shielding the cleanup wait from outer cancellation while preserving deterministic listener removal.
 
@@ -45,63 +45,39 @@ end
 ```
 *Source: [`relay/tasks.titan`](../relay/tasks.titan) — `await_terminal`, `drain`, `await_retirement`*
 
-## Dispatch
+## Dispatch and worker ownership
 
-`Server:start` starts the coordinator, return dispatcher, and log Tasks, spawns all API workers (waiting on each worker's one-shot capacity-1 `ready` channel via `wait_ready`), and opens `http.listen` with a 128-connection backlog and a 10-second header deadline. It immediately calls `listener:read_ahead(false)` so the HTTP server reads from accepted sockets only on demand.
+[`relay/routes.titan`](../relay/routes.titan) configures the `mk.App` with `WorkerMode.pool(mk.PoolOptions { size = settings.api_concurrency, on_start = api_worker.initializer(settings, coordinator) })` as the default mode for REST and SSE routes, and attaches `WorkerMode.session(mk.SessionOptions { session_id = world.select_session, ephemeral = true, on_start = world.initializer(settings, coordinator), on_exit = world_exited })` specifically to `GET /relay`.
 
-When headers for a request arrive, `Server:handle` yields once with `async.yield()` so the socket never detaches from inside the final native read callback on Windows. It then serializes the connection and any buffered request bytes into a transfer payload via `http.Exchange(request, response):to_transfer_payload()`, wraps that byte string in `messages.Handoff`, and calls `Server:deliver`.
+`titan-mk` owns HTTP listener accept, `read_ahead(false)` demand reads, `http.Exchange` socket detachment and handoff to worker threads, HTTP/1.1 keep-alive `return_pipe` round-trips back to the parent for fresh classification, and cross-thread log forwarding (`mk.log.forward`). When a `/relay` request arrives, `world.select_session` runs on the parent against read-only `mk.RequestMeta`:
 
 ```titan
-local function Server:deliver(opening: messages.Handoff)
-  local consumed = false
-  defer if not consumed then http.Exchange.discard_transfer_payload(opening.payload) end
-  if self.closed then return end
-  local match? = self:classify(opening.method, opening.target)
-  if match then
-    local slot = self:start_world(match)
-    defer if not consumed then slot.worker:cancel(); tasks.await_terminal(slot.monitor) end
-    if self.closed then return end
-    -- ...
-    if not slot.sender:try_send(world.Opening(opening.delivery_id, opening.payload,
-        match.query["worldTitle"] or "", match.query["version"] or "", wire.encode(metadata))) then
-      raise "world opening inbox is full"
-    end
-    consumed = true
-  else
-    local slot = self.api_workers[self.next_api]
-    self.next_api = self.next_api % #self.api_workers + 1
-    -- Sender.send returns immediately after enqueue commits; cancellation while
-    -- waiting for space unregisters its waiter without committing the message.
-    slot.sender:send(opening)
-    consumed = true
-  end
+--- Parent-side session selector: every `/relay?id=...` opening gets its own
+-- ephemeral worker, keyed `opening_key .. ":" .. client_id`.
+function select_session(meta: mk.RequestMeta): string?
+  local client_id = meta:query("id", "")
+  if client_id == "" then raise mk.HttpError(400, "id is required") end
+  return store.secure_token(16) .. ":" .. client_id
 end
 ```
-*Source: [`relay/server.titan`](../relay/server.titan) — `Server:deliver`*
+*Source: [`relay/world.titan`](../relay/world.titan) — `select_session`*
 
-`Server:classify` checks the request against `routes.create()`. A `GET /relay` request with a nonempty `id` query parameter spawns a dedicated world thread through `Server:start_world` and sends a `world.Opening` through its capacity-1 `opening` channel. Every other request goes to the next API worker in round-robin order.
+A missing `id` raises `mk.HttpError(400, "id is required")` on the parent without spawning a thread; every valid opening receives a unique `opening_key:client_id` session key so `mk.App` spawns a dedicated ephemeral session worker for that connection alone. All other routes dispatch round-robin across the `RELAY_API_CONCURRENCY` pool workers.
 
-On an HTTP/1.1 keep-alive connection, `run` in [`relay/api_worker.titan`](../relay/api_worker.titan) adopts the `Handoff` with `http.Exchange.from_transfer_payload` before yielding and hands it to a child Task running `exchange:serve(..., 10000)`. That worker handles the first request itself; every subsequent request on the same connection yields once, converts back to a transfer payload, and sends a fresh `Handoff` onto `bootstrap.returned`. The main thread's `return_task` feeds returned exchanges back into `Server:deliver`, advancing the round-robin cursor or promoting a keep-alive `/relay` upgrade to a new world thread. The 10-second timeout bounds header arrival only—never request bodies, response writes, or SSE streams. A connection awaiting its very first headers stays inside the main listener.
+Per-worker resources live in module-level `local state` variables initialized inside `on_start(wctx)` and torn down LIFO by `wctx:defer_cleanup(...)`: `api_worker.initializer` attaches a `Store` and a 4-lease `replies.Pool`, while `world.initializer` attaches a `Store`.
 
-Nine steady-state bounded channels connect the three thread roles (in addition to the one-shot capacity-1 `ready` and `opening` startup channels):
+Six relay-owned bounded channels connect the three thread roles (alongside `mk`'s internal worker intake pipes, keep-alive `return_pipe`, and log-forwarding channel):
 
 | Channel | Carries | Capacity | Direction |
 | --- | --- | ---: | --- |
 | `controls` | `messages.ControlRequest` | 256 | API and world workers to coordinator |
-| `returned` | `messages.Handoff` | 128 | API workers to main dispatcher |
-| `log_lines` | encoded JSON log lines (`string`) | 1,024 | API and world workers to main logging sink |
-| API worker inbox | `messages.Handoff` | 128 | main dispatcher to one API worker |
 | world `requests` | `world_protocol.WorldRequest` | `RELAY_MAX_PENDING` | API workers to one world |
 | world `commands` | `world_protocol.WorldCommand` | 256 | main to one world |
-| world `health` | `nil`; closed by main after `worker:join()` | 1 | main monitor to every holder of `WorldHandle` |
+| world `health` | `nil`; closed by main in `world_exited` after OS join | 1 | main `on_exit` observer to every holder of `WorldHandle` |
 | reply lease | `world_protocol.WorldReply` | 1 | world to one API worker |
 | subscriber | event JSON (`string`) | 128 | world to one SSE stream |
 
-Transfer payloads hold native socket descriptors outside Lua's garbage collector, so ownership obeys a strict three-state invariant (`Handoff` in [`relay/messages.titan`](../relay/messages.titan)):
-
-1. **Pre-enqueue**: the sender owns the payload and protects it with `defer if not consumed then http.Exchange.discard_transfer_payload(payload) end`.
-2. **In-flight**: once `send` or `try_send` succeeds, the channel owns the payload until its sole consumer dequeues and calls `from_transfer_payload` without an intervening yield.
-3. **Post-join cleanup**: if the consumer terminates with unread messages queued, the worker's `defer` drains its own inbox via `try_receive()` without closing it, and the supervisor closes the producer endpoint before running `discard_handoffs` or `discard_openings` after `worker:join()`. Keeping the receiver open until the producer closes guarantees that a concurrently enqueued raw socket is never discarded inside a closed channel.
+Coordinator requests (`ControlRequest` in [`relay/messages.titan`](../relay/messages.titan)) carry only typed data and channel endpoints—never raw HTTP transports. When `Server:publish_world` publishes a world, it allocates `requests`, `commands`, and `health` channels on the main thread, keeps the `Sender` ends plus `health_tx` in `self.world_slots[opening_key]` (`WorldSlot`), and transfers the sole `requests_rx` and `commands_rx` receivers to the world worker inside `ControlReply.published(...)`.
 
 ## World requests and replies
 
@@ -140,7 +116,9 @@ end
 
 If `operation` returns cleanly with a reply matching `id` before `deadline_ns`, it marks `reusable = true` and `Pool:release` hands the same channel to the next waiter. Any timeout, cancellation, or transport failure leaves `reusable = false`: `operation`'s `defer` closes `lease.receiver`, sends an advisory `WorldCommand.cancel(id)` with `try_send`, and `Pool:release` closes both endpoints and replaces them with a fresh channel. Closing `lease.receiver` discards queued packets and invalidates every earlier transferred `Sender` so a late Foundry response can never contaminate a later borrower; matching `received.request_id == id` likewise discards any duplicate reply on a reused channel. `Pool:request` inspects the final status and emits the single `request_timeout` log event whenever a call finishes with `408`.
 
-Inside [`relay/world.titan`](../relay/world.titan), `execute` attaches to SQLite (`store.attach`), adopts `world.Opening`, enforces `settings:request_origin_allowed`, upgrades the WebSocket with `websocket.accept` (16 MiB `read_limit`, `auth_timeout`), and waits for the first text `auth` frame under an `auth_timeout` deadline Task. After verifying the token locally and updating client metadata in SQLite, it sends `ControlAction.auth_publish(bootstrap.handle, token)` to the coordinator, which re-authenticates inside `Hub:transition` so a concurrent revocation cannot be raced. Upon receiving `ControlReply.published(activation)`, `execute` installs active SSE subscriber targets, writes `{"type":"auth-success"}`, starts `write_loop`, `heartbeat_loop`, and `request_loop`, pushes initial `event-subscription-update` counts, and enters `read_loop`.
+Inside [`relay/world.titan`](../relay/world.titan), `handle_relay` calls `serve`, which extracts `opening_key` and `client_id` from `ctx:session_id()`, upgrades the WebSocket via `ctx:upgrade_websocket(websocket.AcceptOptions { allowed_origins = worker.settings.origins, read_limit = 16777216, handshake_timeout = worker.settings.auth_timeout })`, and waits for the first text `auth` frame under an `auth_timeout` deadline Task. After verifying the token locally and updating client metadata in SQLite, it sends `ControlAction.auth_publish(session_id, opening_key, client_id, token)` to the coordinator.
+
+On the main thread, `Server:publish_world` runs credential authentication, live-worker verification (`self.app:session_worker(session_key)`), slot allocation (`WorldSlot`), and `self.worlds:publish_authenticated(handle, publishable)` inside a single `Hub:transition`. The `publishable` callback re-checks that the relay is open, `health_rx` is open, the same worker is still alive, and the reply channel is still open **after** any incumbent world's `quiesce` + `async.checkpoint()`. If `publishable` fails—or if `control_loop` cannot deliver `ControlReply.published` via `try_send`—`Server:abandon_world` retires the `Hub` entry, sends best-effort `WorldCommand.stop(false)`, closes the `requests` and `commands` `Sender`s, and calls `self.app:stop_worker(slot.worker_id)` without joining the worker itself. Upon receiving `ControlReply.published(activation, _, granted_requests, granted_commands)`, `serve` constructs `Engine(Link(...), connection, logger)`, installs active SSE subscriber targets, writes `{"type":"auth-success"}`, starts `write_loop`, `heartbeat_loop`, and `request_loop`, broadcasts all six subscription counts, and enters `engine:read_loop()`.
 
 `Engine` keeps correlation (`pending`, bounded by `RELAY_MAX_PENDING`), a per-request deadline Task, and a non-suspending `async.BufferedSubscription<|Outgoing, string|>` (`outbox`) capped at `RELAY_MAX_PENDING + 16` queued frames. Immediately before writing a queued frame to the WebSocket, `Engine:write_loop` re-checks liveness via `Outgoing:should_send`:
 
@@ -161,7 +139,7 @@ end
 
 If the caller timed out or disconnected while the request sat in `outbox`, `write_loop` discards the frame and removes the pending slot without transmitting it to Foundry. Once a frame is handed to `connection:write`, requests are never retried.
 
-Failure domains follow thread ownership. When a world thread exits, `Server:start_world`'s monitor closes `health_tx` (waking every waiting `Pool:wait_reply` and any quiescence handshake), closes the world's channels, discards unread openings, and calls `self.worlds:retire(handle.client_id, handle.key)`, affecting only that world's pending calls (503). By contrast, if an API worker thread exits while `not self.closed`, its monitor records `self.failure`, logs `server_failed` (`reason = "api_worker_failed"`), and calls `self:begin_close()` so the relay shuts down rather than silently losing request capacity.
+Failure domains follow `titan-mk`'s worker isolation model. When an ephemeral world session worker exits, `mk.App` invokes `Server:world_exited(session_id, worker_id)` (`SessionOptions.on_exit`) strictly **after** the worker's OS thread has joined: `world_exited` removes `self.world_slots[key]`, closes `slot.health` (waking every waiting `Pool:wait_reply` and any quiescence handshake), closes `requests`/`commands` `Sender`s, and calls `self.worlds:retire(slot.client_id, key)`, affecting only that world's pending calls (`503`). By contrast, if a pool worker exits outside shutdown, `mk.App` triggers forced shutdown and raises the failure from `self.app:serve()` so `Server:serve()` shuts down cleanly and propagates the error rather than silently losing request capacity. Likewise, if `control_loop` fails unexpectedly, it closes `controls`, records `self.failure`, and calls `self.app:initiate_shutdown()`.
 
 ## Persistent state and live coordination
 
@@ -198,18 +176,16 @@ Directory mutations in [`relay/hub.titan`](../relay/hub.titan) serialize through
 
 Two coordination paths require multi-step retirement:
 
-- **Module reconnect (`Hub:publish_authenticated`)**: under `Hub:transition`, an existing `Session` for the same `client_id` runs `old:quiesce("replacement")`, which sends `WorldCommand.quiesce` and races its boolean `ack` against `self:terminal` (`health:receive_result()`). Inside `Engine:quiesce`, the incumbent stops admitting requests, closes `outbox`, completes every pending request with `503`, cancels `self.writer` before yielding to drain deadline Tasks, and awaits `self.writer`'s termination before sending `ack`. Only then—and after `async.checkpoint()` confirms the newcomer was not cancelled—does `Hub:publish_authenticated` install the replacement `Session`, snapshot active SSE subscriptions into an `Activation`, and launch `old:stop(true)` in the background to send WebSocket Close `1000` (`Replaced by reconnect`).
+- **Module reconnect (`Hub:publish_authenticated`)**: under `Hub:transition`, an existing `Session` for the same `client_id` runs `old:quiesce("replacement")`, which sends `WorldCommand.quiesce` and races its boolean `ack` against `self:terminal` (`health:receive_result()`). Inside `Engine:quiesce`, the incumbent stops admitting requests, closes `outbox`, completes every pending request with `503`, cancels `self.writer` before yielding to drain deadline Tasks, and awaits `self.writer`'s termination before sending `ack`. Only then—after `async.checkpoint()` confirms the newcomer was not cancelled and `can_publish()` (`publishable`) still holds—does `Hub:publish_authenticated` install the replacement `Session`, snapshot active SSE subscriptions into an `Activation`, and launch `old:stop(true)` in the background so the incumbent closes gracefully with WebSocket code `1000`.
 - **Credential revocation and deletion (`Server:retire_credential`)**: `POST /api/self-unpair` (`revoke`) and `DELETE /clients/:clientId` (`delete_client`) spawn an independent Task awaited via `tasks.await_terminal`. Once admitted, both the SQLite mutation (`database:revoke` or `database:remove`) and `worlds:disconnect(id)` followed by `retired:close()` complete even if the HTTP caller disconnects. Revocation, deletion, and shutdown call `stop(false)` without a graceful WebSocket Close frame; headless cleanup ([Chapter 4](headless-sessions.md)) retires only the exact `hub.Session` instance it captured.
 
-`Server:shutdown` runs inside a single `Server.retirement` Task created by `Server:begin_close` and awaited by `Server:close` via `tasks.await_retirement`. Its teardown order preserves every channel-ownership invariant:
+`Server:shutdown` runs inside a single `Server.retirement` Task created by `Server:begin_close` and awaited by `Server:close` via `tasks.await_retirement`. `Server.new` registers `on_pre_shutdown` (`Server:close_admission`) and `on_post_shutdown` (`Server:release`) hooks on `self.app:hooks()`, so calling `self.app:shutdown()` drives teardown in exact ownership order (with each step wrapped in `Server:guard` to record the first failure in `self.cleanup_failure`):
 
-1. Close the HTTP listener so no new connections arrive.
-2. Cancel and drain active coordinator `operations`, then close `self.headless` (`sessions.Manager:close`) and `self.worlds` (`Hub:close`) and clear `self.unclaimed`.
-3. Cancel and join all `api_workers`, await their monitors, discard unread `Handoff` payloads, and close their channels. `control_loop` stays alive throughout this phase so cancelled HTTP Tasks can deliver `unsubscribe` and `session_discard` cleanup notices.
-4. Cancel and join all `world_workers`, close `health`, await their monitors, discard unread `Opening` payloads, and close their channels.
-5. Discard any remaining `provisional` headless session entries.
-6. Close `controls` and await `control_task` plus any final cleanup operations; close `returned`, await `return_task`, and discard unread handoffs; close `log_lines` and await `log_task`.
-7. Close `self.database` last. Each worker closes its own `Store` handle and forwarding `Logger` as it exits.
+1. `mk.App` closes the HTTP listener so no new connections arrive.
+2. **`on_pre_shutdown` (`Server:close_admission`)**: marks `self.closed = true`, cancels and drains active coordinator `operations`, closes `self.headless` (`sessions.Manager:close`) and `self.worlds` (`Hub:close`) while world workers are still alive to answer quiescence, and clears `self.unclaimed`.
+3. `mk.App` aborts and drains active HTTP exchanges, cancels and joins all API pool workers and ephemeral world session workers (running worker `defer_cleanup` callbacks and `world_exited` `on_exit` hooks), drains `return_pipe`, and flushes cross-worker log forwarding.
+4. **`on_post_shutdown` (`Server:release`, idempotent via `self.released`)**: discards any remaining `provisional` headless session entries, closes `controls`, awaits `control_task` and any final cleanup operations, closes `control_inbox`, and closes `self.database` last.
+5. `Server:shutdown` also calls `self:release()` directly after `self.app:shutdown()` in case shutdown was invoked before `App:start()`, and returns `self.cleanup_failure` so `Server:close()` raises the first retirement error.
 
 Event streams run inside API workers while world threads write events directly into the bounded subscriber channels registered in `Hub`; [Chapter 2](routing.md) details that streaming and fanout path, and [api.md](api.md#event-streams) defines the external SSE contract.
 

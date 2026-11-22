@@ -376,11 +376,11 @@ end
 Publishing a new session over HTTP uses a two-phase coordinator handshake so a
 client disconnect mid-startup or during response write never strands an
 unacknowledged browser. In [`relay/api_worker.titan`](../relay/api_worker.titan),
-`Worker:session_request` generates a provisional `key`, registers
+`session_start` generates a provisional `key`, registers
 `defer control.notify(..., ControlAction.session_discard(key))`, sends
-`ControlAction.session_start(key, source)` to the main thread, writes the `200`
-JSON response, and only then sends `ControlAction.session_publish(key)`.
-
+`ControlAction.session_start(key, source)` to the main thread, writes and
+commits (`ctx:commit()`) the `200` JSON response, and only then sends
+`ControlAction.session_publish(key)` (calling `ctx:abort()` if publication fails).
 On the main thread, `Server:coordinate` in
 [`relay/server.titan`](../relay/server.titan) executes `Manager:begin` inside
 `worlds:transition`, records the `Entry` in `self.provisional[key]`, awaits

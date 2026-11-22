@@ -1,142 +1,46 @@
 # Chapter 2: Declarative Routing, Request Translation, and Event Streaming
 
-An HTTP request entering an API worker crosses four layers before touching a Foundry world: PEG route matching ([`relay/router.titan`](../relay/router.titan), [`relay/routes.titan`](../relay/routes.titan)), lossless JSON decoding ([`relay/wire.titan`](../relay/wire.titan)), declarative parameter coercion and binary framing ([`relay/api.titan`](../relay/api.titan)), and request or SSE stream dispatch ([`relay/api_worker.titan`](../relay/api_worker.titan), paired with event fanout in [`relay/world.titan`](../relay/world.titan)).
+An HTTP request entering an API worker crosses four layers before touching a Foundry world: `titan-mk` middleware and PEG route matching ([`relay/routes.titan`](../relay/routes.titan) over `mk`, `mk.router`, and `mk.middleware.*`), lossless JSON decoding ([`relay/wire.titan`](../relay/wire.titan)), declarative parameter coercion and binary framing ([`relay/api.titan`](../relay/api.titan)), and request or SSE stream dispatch ([`relay/api_worker.titan`](../relay/api_worker.titan), paired with event fanout in [`relay/world.titan`](../relay/world.titan)).
 
-[`relay/router.titan`](../relay/router.titan) follows the parse-parts-then-compile architecture of [mk.routes](https://github.com/mascarenhas/mk/blob/master/src/mk/routes.lua): a single Relabel PEG grammar parses route declarations into typed parts once, and `Route.new` compiles each declaration into an anchored `peg.Pattern` matcher once. Request matching compiles no grammar, owns no network state, and evaluates routes strictly in declaration order.
+## Application middleware and route precedence
 
-[`relay/routes.titan`](../relay/routes.titan) `create` builds the relay's route table by placing 17 local routes (`/health`, pairing, self-unpair, client status/list/delete, `/relay`, four headless session routes, and six SSE subscribe routes) ahead of the 91 upstream forwarding routes returned by `api.routes()`. Specific local paths therefore always win before any wildcard or parameterized forwarding route runs; [api.md](api.md) documents the complete external route catalog.
-
-## Route syntax
-
-Every pattern begins with `/` and consists of slash-separated parts:
-
-| Part | Meaning |
-| --- | --- |
-| Literal text | Match that complete path segment. |
-| `:name` | Capture one nonempty segment. Names use `[A-Za-z_][A-Za-z0-9_]*`. |
-| Final `*` | Capture the remaining path as `params["wildcard"]`, including slashes. |
-
-Parsing produces a frozen `const {RoutePart}` sequence whose elements are stored alongside the compiled `peg.Pattern` on each immutable `Route`:
+[`relay/routes.titan`](../relay/routes.titan) `create` builds the relay's `mk.App` with explicit routing, body, timeout, and error-handler settings:
 
 ```titan
-union RoutePart
-  literal(text: string, position: integer)
-  parameter(name: string, position: integer)
-  wildcard(position: integer)
-end
--- ...
-record Route
-  const method: string
-  const pattern: string
-  const action: string
-  local const parts: const {RoutePart}
-  local const matcher: peg.Pattern
-end
-```
-*Source: [`relay/router.titan`](../relay/router.titan) — `RoutePart`, `Route`*
-
-The module's root initializer compiles `route_grammar` once per Lua state using Titan's Relabel PEG syntax. Labeled errors (`%{...}`) commit at the exact offending byte, while `peg.define_value` binds the concrete Titan constructor functions `parameter_part`, `literal_part`, and `wildcard_part` directly into capture actions:
-
-```titan
-do
-  route_grammar = peg.compile([[
-    Route <- {|
-      ('/' / %{expected_slash})
-      (!. / (Part ('/' Part)*))
-      (!. / Invalid)
-    |}
-    Part <- Parameter / Wildcard / Literal
-    Parameter <- ({} ':' {Name / %{expected_parameter_name}}
-      (&'/' / !. / %{parameter_tail})) -> parameter_part
-    Name <- [A-Za-z_] [A-Za-z0-9_]*
-    Wildcard <- ({} '*' (!. / %{wildcard_not_terminal})) -> wildcard_part
-    Literal <- ({} {LiteralByte*}) -> literal_part
-    LiteralByte <- '%' (&'00' %{nul_escape} /
-      ([0-9A-Fa-f] / %{percent_escape}) ([0-9A-Fa-f] / %{percent_escape})) /
-      (!('/' / '*' / '?' / '#' / '%' / %control) .)
-    Invalid <- (&('?' / '#') %{query_or_fragment}) /
-      (&'*' %{partial_wildcard}) / (&%control %{control_character}) / %{trailing_input}
-  ]], {
-    peg.define_value("parameter_part", parameter_part),
-    peg.define_value("literal_part", literal_part),
-    peg.define_value("wildcard_part", wildcard_part),
-    peg.define("control", peg.choice(peg.ranges("\0\31"), peg.literal("\127"))),
+  local app = mk.App(mk.Config {
+    case_sensitive = true, strict_routing = true, unescape_path = true, auto_head = false,
+    body_limit = 16777216, idle_timeout_ms = 10000, error_handler = relay_error, logger = logger,
+    workers = mk.WorkerMode.pool(mk.PoolOptions {
+      size = settings.api_concurrency, on_start = api_worker.initializer(settings, coordinator),
+    }),
   })
-end
+  app:use(logger_mw.new(logger_mw.Config { phase = logger_mw.PHASE_ADMISSION }))
+  app:use(origin_policy(settings))
+  app:use(reject_malformed_target)
+  app:use(recover.new(recover.Config { exception_handler = invalid_request }))
 ```
-*Source: [`relay/router.titan`](../relay/router.titan) — `route_grammar`, `parameter_part`, `literal_part`, `wildcard_part`*
+*Source: [`relay/routes.titan`](../relay/routes.titan) — `create`*
 
-`compile_route` folds `const {RoutePart}` into combinator patterns: `literal` segments compile through `literal_matcher`, `parameter` segments compile into `peg.group(peg.capture(segment), name)` over non-`/` bytes, and a terminal `wildcard` compiles into `peg.group(..., "wildcard")` with an optional leading `/` when `index > 1`. Wrapping the sequence and end-of-input anchor `peg.negative(peg.any())` in `peg.table_capture` guarantees a fresh, non-nil capture map on every match, even for parameterless literal routes.
+The routing options match the Foundry relay's strict URI contract:
 
-`/assets/*` matches `/assets`, `/assets/`, and `/assets/a/b`. A bare `/` matches only `/`, while other trailing slashes remain significant (`/api/` and `/api` are distinct). Empty literal segments such as `/api//status` retain both separators. Wildcards occupy a whole final segment; optional parameters, inline suffixes, and nonterminal wildcards are outside this syntax. `parse_route` enforces unique parameter names (including rejecting `:wildcard` alongside `*`) and caps declarations at `max_route_bytes` (1,024 bytes) and `max_route_parts` (64 parts).
+- `case_sensitive = true` and `strict_routing = true` keep path casing and trailing slashes significant (`/api/` and `/api` are distinct).
+- `unescape_path = true` decodes segment-preserving percent escapes through `mk.router` while rejecting malformed escapes, `%00`, fragments, and targets exceeding 16 KiB or 256 query fields (surfaced via `ctx:target_error()`).
+- `auto_head = false` ensures undeclared `HEAD` requests return `405` with an `Allow` header rather than invoking `GET` handlers.
+- `body_limit = 16777216` (16 MiB) causes `ctx:body()` to raise `mk.HttpError(413, ...)` on oversized request bodies, and `idle_timeout_ms = 10000` enforces the 10-second header deadline on initial and keep-alive requests.
 
-## URI decoding and query values
+Global middleware runs in exact registration order ahead of every routing outcome:
 
-Matching preserves URI segment boundaries. `literal_matcher` decodes the declared literal once and emits per-byte PEG units accepting either the raw byte or its case-insensitive `%XX` escape—except for `/` and `%`, which match only their escaped form so an encoded slash never splits a segment. `/%61pi/:id` therefore matches the same paths as `/api/:id`, `/api/A%2FB` captures `A/B` as one parameter, and `/encoded/a%2Fb` matches `/encoded/a%2fb` without matching `/encoded/a/b`. Captured parameter values are decoded after matching in `Route:parameters`, keeping `+` literal in paths.
+1. **Admission logging (`mk.middleware.logger`, `PHASE_ADMISSION`)**: emits one `http_request` JSON record with normalized `method`, classified `route` template (or `"<unmatched>"`), and `worker_id` before any policy rejection or handler executes.
+2. **Origin and CORS (`origin_policy`)**: checks `settings:request_origin_allowed(ctx:get_headers("Origin"), ctx:scheme(), ctx:host())` and raises `403` (`"origin is not allowed"`) ahead of 404/405. Accepted `Origin` headers are echoed in `Access-Control-Allow-Origin` with `Vary: Origin`, and `OPTIONS` preflights return `204` with `Access-Control-Allow-Methods` and `Access-Control-Allow-Headers`.
+3. **Malformed target rejection (`reject_malformed_target`)**: converts any `ctx:target_error()` into `mk.HttpError(400, problem)`.
+4. **Exception recovery (`mk.middleware.recover`)**: `invalid_request` logs `async.OperationError` as `http_request_failed` (`reason = "io_failure"`) and non-string unexpected errors as `reason = "internal_failure"`, converting every unexpected failure into `mk.HttpError(400, "invalid request", "invalid_request", failure)` without leaking internal error text.
 
-`percent_decode` avoids allocations on the common ASCII path by deferring `string.writer()` creation until the first `%` (or `+` when `plus_as_space` is true). When escapes appear, it flushes untouched spans via `string.sub` instead of appending one byte at a time, while rejecting incomplete escapes, non-hex digits, `%00` (NUL), and raw control bytes:
+Route registration places 17 local routes ahead of the 91 upstream forwarding routes returned by `api.definitions()`. Specific local paths therefore always win before any parameterized forwarding route runs; [api.md](api.md) documents the complete external route catalog:
 
-```titan
-function percent_decode(subject: string, plus_as_space: boolean?): string
-  local result: string.StringWriter? = nil
-  local span_start = 1
-  local index = 1
-  local length = #subject
-  while index <= length do
-    local byte: integer = string.byte(subject, index)
-    if byte == 37 then
-      -- ...
-      local decoded = high * 16 + low
-      if decoded == 0 then raise "NUL is not allowed in a request target" end
-      local writer = result or string.writer()
-      result = writer
-      if index > span_start then writer:write(string.sub(subject, span_start, index - 1)) end
-      writer:write(string.char(decoded))
-      index = index + 3
-      span_start = index
-    -- ...
-    end
-  end
-  if result == nil then return subject end
-  local writer = result
-  if span_start <= length then writer:write(string.sub(subject, span_start, length)) end
-  return writer:drain()
-end
-```
-*Source: [`relay/router.titan`](../relay/router.titan) — `percent_decode`*
-
-`parse_target` validates each request target once before route evaluation. It rejects targets exceeding `max_target_bytes` (16 KiB), targets missing a leading `/`, and fragments containing `#`. Before calling `string.split(query_source, "&")`, it scans `query_source` to count `&` delimiters and enforce `max_query_fields` (256 fields, counting empty fields like `&&` while skipping them during decoding). Query names and values decode with `plus_as_space = true`; `query` retains each key's first value while `query_values` preserves all occurrences in wire order.
-
-## Results and diagnostics
-
-`Router:match(method, target)` evaluates routes in declaration order, matching exact method strings or `*`, and returns a `Resolution` (reusing module-level `empty_allowed: const {string}` whenever no `Allow` list is needed):
-
-| Status | Meaning |
-| --- | --- |
-| `200` | `match` holds the first matching `Match` (`route`, `action`, `params`, `query`, `query_values`). |
-| `400` | Malformed target; `error` carries the validation message from `parse_target`. |
-| `404` | No route matched the path. |
-| `405` | One or more routes matched the path for other methods; `allowed` holds unique methods in declaration order. |
-
-`allow_header` formats any `const? {string}` method list into an HTTP `Allow` header via `string.writer()`. `json_response` sets status, `Content-Type: application/json; charset=utf-8`, and `Content-Length` before writing the body; `error_response` encodes an `ErrorEnvelope` JSON object through `error_body`.
-
-`parse_route(pattern)` returns `(const {RoutePart}?, RouteError?)`, and `Route.new` raises that same `RouteError` on invalid declarations. `route_error` maps one-based byte positions to `(line, column)` via `peg.line_column` and populates `code` and `message` from `route_messages`:
-
-| Code | Meaning |
-| --- | --- |
-| `expected_slash` | Missing leading `/`. |
-| `expected_parameter_name` | Missing or invalid parameter identifier. |
-| `parameter_tail` | Extra text after a parameter name. |
-| `wildcard_not_terminal` | Text follows a wildcard. |
-| `partial_wildcard` | A wildcard appears inside a literal segment. |
-| `query_or_fragment` | A literal query or fragment delimiter appears in the declaration. |
-| `percent_escape` | A literal percent escape lacks two hex digits. |
-| `nul_escape` | A literal percent escape represents NUL. |
-| `control_character` | A raw control byte appears in the declaration. |
-| `duplicate_parameter` | A named parameter is repeated, or `:wildcard` accompanies a final `*`. |
-| `route_limit` | The 1,024-byte or 64-part limit is exceeded. |
-| `invalid_declaration` | Method or action is empty. |
-| `trailing_input` | Unexpected trailing declaration input. |
+- Five unauthenticated routes (`/health`, `/auth/pair`, `/api/self-unpair`, `/api/clients/:clientId/active`, and `/relay`, which carries its own ephemeral `WorkerMode.session`) register directly without `keyauth`.
+- Every remaining local route (clients, headless sessions, and the six SSE subscribe routes) and all 91 forwarding routes register `api_key_check(settings)` as their leading route handler. Because `keyauth` is attached per route rather than globally, unmatched paths return `404` and wrong methods return `405` before API-key enforcement returns `401`.
+- `api_key_check` configures `mk.middleware.keyauth` with `Extractor.single_header("x-api-key")` and constant-time `config.secret_equal`; on missing, repeated, or mismatched keys, `keyauth` sets `WWW-Authenticate: ApiKey realm="Restricted"` and raises `401`.
+- `relay_error` (`Config.error_handler`) normalizes every `mk.HttpError` into `{"error": ...}` via `api_worker.error_response`, mapping router `404`/`405` messages to `"route not found"` (never echoing the request target) and both `missing_api_key` and `invalid_api_key` to `"invalid API key"`.
 
 ## Lossless JSON boundaries and declarative API translation
 
@@ -199,26 +103,28 @@ Module-level unit singletons (`KIND_STRING`, `SRC_Q`, `EP_STANDARD`, and their p
 For each declared `Param`, `Param:read` dispatches exhaustively on `self.sources` and returns `(candidate, from_query)`, treating empty query values `""` as absent so `query_then_body` and `body_then_query` fall through cleanly:
 
 ```titan
-local function Param:read(match: router.Match, body: {string: value}): (value, boolean)
+-- Path parameters, decoded first-value query fields, and the JSON body.
+local function Param:read(params: {string: string}, query: {string: string},
+                          body: {string: value}): (value, boolean)
   case self.sources
   when body() then
     local candidate? = body[self.name]
     if candidate ~= nil then return candidate, false end
   when query() then
-    local candidate? = match.query[self.name]
+    local candidate? = query[self.name]
     if candidate ~= nil and candidate ~= "" then return candidate, true end
   when path() then
-    local candidate? = match.params[self.name]
+    local candidate? = params[self.name]
     if candidate ~= nil then return candidate, false end
   when query_then_body() then
-    local query_candidate? = match.query[self.name]
+    local query_candidate? = query[self.name]
     if query_candidate ~= nil and query_candidate ~= "" then return query_candidate, true end
     local body_candidate? = body[self.name]
     if body_candidate ~= nil then return body_candidate, false end
   when body_then_query() then
     local body_candidate? = body[self.name]
     if body_candidate ~= nil then return body_candidate, false end
-    local query_candidate? = match.query[self.name]
+    local query_candidate? = query[self.name]
     if query_candidate ~= nil and query_candidate ~= "" then return query_candidate, true end
   end
   return nil, false
@@ -234,18 +140,14 @@ Binary transfers cross Foundry's JSON WebSocket framed in strict padded Base64 (
 
 ## HTTP dispatch and persistent event streams
 
-In [`relay/api_worker.titan`](../relay/api_worker.titan), `Worker:handle` matches the incoming request once, logs `http_request` with the matched route template (or `<unmatched>`) and normalized `known_methods` (or `"OTHER"`), and passes the `Resolution` to `Worker:dispatch`:
+In [`relay/api_worker.titan`](../relay/api_worker.titan), each endpoint is a plain `mk.Handler` that accesses its thread-local `State` (`worker_id`, `settings`, `database`, `coordinator`, `pool`, `logger`) initialized in `on_start`:
 
-1. **Origin and CORS**: `settings:request_origin_allowed` rejects disallowed `Origin` headers with `403`. Allowed origins receive `Access-Control-Allow-Origin` and `Vary: Origin`, and `OPTIONS` preflights return `204`.
-2. **Routing errors and unauthenticated local routes**: non-`200` resolutions return `400`, `404`, or `405` (with `Allow` from `router.allow_header`). Local routes `/health`, `/auth/pair`, `/relay` (missing `id`), `/api/self-unpair`, and `/api/clients/:clientId/active` run before the API-key gate.
-3. **API-key enforcement and dispatch**: `Worker:authorized` verifies a single `x-api-key` header using constant-time `config.secret_equal` (`401` on mismatch), then routes to `session_request`, `clients`, `forget`, `stream` (`sse:*`), or `forward`.
-
-`Worker:forward` reads either raw binary upload bodies (for `endpoint:is_upload()` when `Content-Type` is not `application/json`, wrapping the bytes as a `data:<content-type>;base64,...` URL) or a 16 MiB-bounded JSON object (`json_body`), calls `api.build_payload`, resolves the target world via `ControlAction.select`, forwards through `self.pool:request` with `settings.request_timeout` (falling back to `endpoint.timeout_ms` when `0`), and writes the `api.response` reply.
-
-For SSE subscriptions, `Worker:stream` obtains a `Subscription` from `ControlAction.subscribe`, registers a `defer` closing `subscription.events` and posting `ControlAction.unsubscribe`, writes `text/event-stream` headers plus the initial `connected` event, and loops over `async.race_two`:
+- `json_body(ctx)` reads `ctx:body()` (enforcing `Config.body_limit` with `413`), treats an empty body as `{}`, and otherwise requires `ctx:is_json()` before decoding via `wire.object`.
+- `forward(key)` wraps `forward_endpoint(ctx, key)`: for `endpoint:is_upload()` when `not ctx:is_json()`, it wraps raw `ctx:body()` bytes as a `data:<content-type>;base64,...` URL; otherwise it decodes `json_body(ctx)`. It calls `api.build_payload(endpoint, ctx:params(), ctx:queries(), data)`, resolves the target world via `ControlAction.select`, forwards through `worker.pool:request` with `settings.request_timeout` (falling back to `endpoint.timeout_ms` when `0`), and writes the `api.response` reply via `ctx:status(...):set(...):send(...)`.
+- For SSE subscriptions, `stream(channel)` invokes `serve_stream(ctx, channel)`, which obtains a `Subscription` from `ControlAction.subscribe`, registers a `defer` closing `subscription.events` and posting `ControlAction.unsubscribe`, sets `text/event-stream`, `Cache-Control: no-cache`, and `X-Accel-Buffering: no`, writes the initial `connected` event with `ctx:write_chunk(...)`, and loops over `async.race_two`:
 
 ```titan
-local function Worker:stream(response: http.Response, match: router.Match)
+local function serve_stream(ctx: mk.Context, channel: string)
   -- ...
   local reading: async.Task<|string?, value|>? = nil
   defer if reading then tasks.drain(reading) end
@@ -261,16 +163,16 @@ local function Worker:stream(response: http.Response, match: router.Match)
         local envelope = wire.object(text)
         local data: {string: value} = envelope
         if envelope["data"] is {string: value} then data = envelope["data"] end
-        response:write("event: " .. sse_name(channel, data) .. "\ndata: " .. wire.encode(data) .. "\n\n")
+        ctx:write_chunk("event: " .. sse_name(channel, data) .. "\ndata: " .. wire.encode(data) .. "\n\n")
         reading = nil
       else return
       end
-    when second() then response:write(": keepalive\n\n")
+    when second() then ctx:write_chunk(": keepalive\n\n")
     end
   end
 end
 ```
-*Source: [`relay/api_worker.titan`](../relay/api_worker.titan) — `Worker:stream`, `wait_keepalive`, `sse_name`*
+*Source: [`relay/api_worker.titan`](../relay/api_worker.titan) — `serve_stream`, `wait_keepalive`, `sse_name`*
 
 Reusing `reading` across 15-second `wait_keepalive` ticks ensures an event arriving right at the keepalive boundary is never cancelled or dropped; only `keepalive` drains on every iteration. `sse_name` derives the SSE event name (`roll`, hook name, or `<prefix>-<eventType>`) and falls back to `"event"` or `prefix` if CR or LF appears, preventing SSE frame injection.
 
