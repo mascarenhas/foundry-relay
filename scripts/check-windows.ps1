@@ -30,6 +30,9 @@ foreach ($payload in @($Application, $TestPayload)) {
   if (-not (Test-Path "$payload\lib\titan\0.6\titan.dll" -PathType Leaf)) {
     throw 'Missing Titan standard provider'
   }
+  if (-not (Test-Path "$payload\lib\titan\0.6\mk.dll" -PathType Leaf)) {
+    throw 'Missing titan-mk provider'
+  }
   foreach ($file in (Get-ChildItem $payload -File -Recurse | Where-Object {
       $_.Extension -in @('.exe', '.dll') })) {
     $imports = (& $ReadObj --coff-imports $file.FullName) -join "`n"

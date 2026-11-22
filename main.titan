@@ -1,9 +1,9 @@
 local os = import "os"
 local async = import "async"
+local log = import "mk.log"
 local config = import "relay.config"
 local server = import "relay.server"
 local tasks = import "relay.tasks"
-local log = import "relay.log"
 
 local function run(logger: log.Logger, phase: string): integer
   local settings = config.load()
@@ -46,7 +46,7 @@ catch
 end
 
 function main(args: {string}): integer
-  local logger = log.Logger(log.resolve_level(os.getenv("RELAY_LOG_LEVEL")))
+  local logger = log.Logger(log.resolve_level(os.getenv("RELAY_LOG_LEVEL"), false, "RELAY_LOG_LEVEL"))
   -- The server and its controllers retire first; then flush their final logs.
   defer logger:close()
   return run(logger, "invalid_configuration")

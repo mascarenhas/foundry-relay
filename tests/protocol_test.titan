@@ -381,19 +381,16 @@ local function writer_fixture(): WriterFixture
   defer if not transferred then connection:close() end
   local endpoint = address("writer")
   defer if not transferred then endpoint:close() end
-  local inbox_tx, inbox_rx = thread.channel<|world.Opening|>(1)
-  local ready_tx, ready_rx = thread.channel<|boolean|>(1)
   local control_tx, control_rx = thread.channel<|messages.ControlRequest|>(1)
   local close_channels = function ()
-    inbox_rx:close(); inbox_tx:close(); ready_rx:close(); ready_tx:close()
     control_rx:close(); control_tx:close()
   end
   defer if not transferred then close_channels() end
   local settings = config.Config("127.0.0.1", 0, "key", "CODE12", "/unused",
     "ws://127.0.0.1/relay", {}, 60000, 60000, 1000, 8, 1)
-  local bootstrap = world.Bootstrap(1, settings, endpoint.handle, endpoint.requests,
-    endpoint.commands, inbox_rx, ready_tx, control_tx, "error", nil)
-  local engine = world.Engine(bootstrap, connection, nil)
+  local link = world.Link(1, settings, endpoint.handle.client_id, endpoint.requests,
+    endpoint.commands, control_tx)
+  local engine = world.Engine(link, connection, nil)
   transferred = true
   return WriterFixture(engine, peer, endpoint, listener, serving, close_channels)
 end

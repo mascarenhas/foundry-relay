@@ -1,5 +1,4 @@
 -- REST declarations adapt the reference Go relay's single-user protocol.
-local router = import "relay.router"
 local wire = import "relay.wire"
 local string = import "string"
 
@@ -79,16 +78,6 @@ function definitions(): const {Endpoint}
   return catalog
 end
 
-function routes(): {router.Route}
-  local entries = definitions()
-  local result: {router.Route} = {}
-  for index = 1, #entries do
-    local endpoint = entries[index]
-    result[index] = router.Route(endpoint.method, endpoint.path, endpoint.key)
-  end
-  return result
-end
-
 function endpoint_for(key: string): Endpoint?
   return endpoints_by_key[key]
 end
@@ -115,26 +104,28 @@ function ParamKind:label(): string
   end
 end
 
-local function Param:read(match: router.Match, body: {string: value}): (value, boolean)
+-- Path parameters, decoded first-value query fields, and the JSON body.
+local function Param:read(params: {string: string}, query: {string: string},
+                          body: {string: value}): (value, boolean)
   case self.sources
   when body() then
     local candidate? = body[self.name]
     if candidate ~= nil then return candidate, false end
   when query() then
-    local candidate? = match.query[self.name]
+    local candidate? = query[self.name]
     if candidate ~= nil and candidate ~= "" then return candidate, true end
   when path() then
-    local candidate? = match.params[self.name]
+    local candidate? = params[self.name]
     if candidate ~= nil then return candidate, false end
   when query_then_body() then
-    local query_candidate? = match.query[self.name]
+    local query_candidate? = query[self.name]
     if query_candidate ~= nil and query_candidate ~= "" then return query_candidate, true end
     local body_candidate? = body[self.name]
     if body_candidate ~= nil then return body_candidate, false end
   when body_then_query() then
     local body_candidate? = body[self.name]
     if body_candidate ~= nil then return body_candidate, false end
-    local query_candidate? = match.query[self.name]
+    local query_candidate? = query[self.name]
     if query_candidate ~= nil and query_candidate ~= "" then return query_candidate, true end
   end
   return nil, false
@@ -229,12 +220,12 @@ local function Endpoint:validate(payload: {string: value})
   end
 end
 
-function build_payload(endpoint: Endpoint, match: router.Match,
+function build_payload(endpoint: Endpoint, params: {string: string}, query: {string: string},
                        body: {string: value}): {string: value}
   local result: {string: value} = {}
   for index = 1, #endpoint.params do
     local param = endpoint.params[index]
-    local candidate, from_query = param:read(match, body)
+    local candidate, from_query = param:read(params, query, body)
     if candidate == nil then
       if param.required then raise "'" .. param.name .. "' is required" end
     elseif param.name ~= "clientId" then

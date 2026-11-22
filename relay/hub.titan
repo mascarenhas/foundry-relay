@@ -4,7 +4,7 @@ local thread = import "thread"
 local iteration = import "iteration"
 local wire = import "relay.wire"
 local store = import "relay.store"
-local log = import "relay.log"
+local log = import "mk.log"
 local protocol = import "relay.world_protocol"
 local tasks = import "relay.tasks"
 local replies = import "relay.replies"
@@ -198,7 +198,11 @@ function Hub:subscription_snapshot(id: string): protocol.Activation
   return protocol.Activation(targets, counts)
 end
 
-function Hub:publish_authenticated(world: protocol.WorldHandle): (Session, protocol.Activation)
+--- Publish an authenticated world, replacing its incumbent. `can_publish`
+-- is rechecked after the incumbent quiesced; when it fails the world is not
+-- published and "Foundry world disconnected" is raised.
+function Hub:publish_authenticated(world: protocol.WorldHandle,
+                                   can_publish: (function (): boolean)?): (Session, protocol.Activation)
   local published = self:transition<|Publication|>(function (): Publication
     if self.closed or world.health:is_closed() then raise "relay is closed" end
     local old? = self.sessions[world.client_id]
@@ -211,6 +215,7 @@ function Hub:publish_authenticated(world: protocol.WorldHandle): (Session, proto
     -- Quiescence is irreversible. Complete incumbent retirement first; a
     -- cancelled admission must not publish its abandoned replacement.
     async.checkpoint()
+    if can_publish ~= nil and not can_publish() then raise "Foundry world disconnected" end
     local session = Session(world.client_id, world, self, false, nil)
     self.sessions[world.client_id] = session
     log.emit(self.logger, "info", "websocket_connected", {["client_id"] = world.client_id})

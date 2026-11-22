@@ -1,38 +1,33 @@
-local http = import "http"
+-- The relay process: the mk application, the parent-owned world directory,
+-- headless sessions, and the coordinator that workers ask for shared state.
 local async = import "async"
 local thread = import "thread"
 local iteration = import "iteration"
-local log = import "relay.log"
+local string = import "string"
+local mk = import "mk"
+local log = import "mk.log"
 local config = import "relay.config"
 local wire = import "relay.wire"
-local router = import "relay.router"
 local routes = import "relay.routes"
 local store = import "relay.store"
 local hub = import "relay.hub"
 local world = import "relay.world"
 local protocol = import "relay.world_protocol"
-local api_worker = import "relay.api_worker"
 local messages = import "relay.messages"
 local tasks = import "relay.tasks"
 local sessions = import "relay.sessions"
 local foundry = import "relay.foundry_session"
 
-local record ApiWorker
-  const id: integer
-  const worker: thread.Thread<|nil|>
-  const sender: thread.Sender<|messages.Handoff|>
-  const inbox: thread.Receiver<|messages.Handoff|>
-  monitor: async.Task<|nil, value|>?
-end
-
-local record WorldWorker
-  const id: integer
+-- A published world's parent-owned endpoints. Its health Sender closes only
+-- after the session worker's OS join (`Server:world_exited`).
+local record WorldSlot
+  const session_key: string
+  const client_id: string
+  const worker_id: integer
   const handle: protocol.WorldHandle
-  const worker: thread.Thread<|nil|>
-  const sender: thread.Sender<|world.Opening|>
-  const inbox: thread.Receiver<|world.Opening|>
   const health: thread.Sender<|nil|>
-  monitor: async.Task<|nil, value|>?
+  const requests: thread.Receiver<|protocol.WorldRequest|>
+  const commands: thread.Receiver<|protocol.WorldCommand|>
 end
 
 local record Operation
@@ -53,32 +48,26 @@ end
 record Server
   const config: config.Config
   const worlds: hub.Hub
+  local const app: mk.App
   local const database: store.Store
-  local const routes: router.Router
   local const headless: sessions.Manager
   local const logger: log.Logger?
-  local listener: http.Server?
   local closed: boolean
   local started: boolean
-  local next_api: integer
-  local next_worker: integer
-  local const api_workers: {ApiWorker}
-  local const world_workers: {string: WorldWorker}
+  local released: boolean
+  local const world_slots: {string: WorldSlot}
   local const operations: {string: Operation}
   local const provisional: {string: Provisional}
   local const unclaimed: {string: Unclaimed}
   local const controls: thread.Sender<|messages.ControlRequest|>
   local const control_inbox: thread.Receiver<|messages.ControlRequest|>
-  local const returned: thread.Sender<|messages.Handoff|>
-  local const return_inbox: thread.Receiver<|messages.Handoff|>
-  local const log_lines: thread.Sender<|string|>
-  local const log_inbox: thread.Receiver<|string|>
   local control_task: async.Task<|nil, value|>?
-  local return_task: async.Task<|nil, value|>?
-  local log_task: async.Task<|nil, value|>?
   local retirement: async.Task<|async.Error?, value|>?
   local failure: async.Error?
+  local cleanup_failure: async.Error?
 end
+
+local const withdrawn = "Foundry world disconnected"
 
 function Server.new(settings: config.Config, headless_options: sessions.Options?,
     launcher: (function(foundry.Options, string, string, hub.Hub, integer): sessions.Client)?,
@@ -91,15 +80,21 @@ function Server.new(settings: config.Config, headless_options: sessions.Options?
   local headless = sessions.Manager(headless_options or sessions.settings(), database, worlds,
     settings.public_url, settings.origins, launcher, logger)
   local controls, control_inbox = thread.channel<|messages.ControlRequest|>(256)
-  local returned, return_inbox = thread.channel<|messages.Handoff|>(128)
-  local log_lines, log_inbox = thread.channel<|string|>(1024)
-  local result: Server = {config = settings, worlds = worlds, database = database,
-    routes = routes.create(), headless = headless, logger = logger, listener = nil,
-    closed = false, started = false, next_api = 1, next_worker = settings.api_concurrency + 1,
-    api_workers = {}, world_workers = {}, operations = {}, provisional = {}, unclaimed = {},
-    controls = controls, control_inbox = control_inbox, returned = returned, return_inbox = return_inbox,
-    log_lines = log_lines, log_inbox = log_inbox, control_task = nil, return_task = nil,
-    log_task = nil, retirement = nil, failure = nil}
+  local owner: Server? = nil
+  local app = routes.create(settings, controls, logger, function (session_id: string, worker_id: integer, _: boolean)
+    local server? = owner
+    if server ~= nil then server:world_exited(session_id, worker_id) end
+  end)
+  local result: Server = {config = settings, worlds = worlds, app = app, database = database,
+    headless = headless, logger = logger, closed = false, started = false, released = false,
+    world_slots = {}, operations = {}, provisional = {}, unclaimed = {},
+    controls = controls, control_inbox = control_inbox, control_task = nil,
+    retirement = nil, failure = nil, cleanup_failure = nil}
+  owner = result
+  -- Each shutdown phase guards its own resources; mk runs pre-shutdown after
+  -- the listener closed and post-shutdown after every worker joined.
+  app:hooks():on_pre_shutdown(function () result:close_admission() end)
+  app:hooks():on_post_shutdown(function (_: async.Error?) result:release() end)
   published = true
   return result
 end
@@ -110,11 +105,95 @@ local function error_reply(status: integer, text: string): messages.ControlReply
   return messages.ControlReply.response(status, wire.error_body(text))
 end
 
+local function Server:guard(step: function (): ())
+  do step()
+  catch if not self.cleanup_failure then self.cleanup_failure = async.Error(error, traceback) end
+  end
+end
+
 local function Server:discard_provisional(key: string, worker_id: integer)
   local pending? = self.provisional[key]
   if not pending or pending.worker_id ~= worker_id then return end
   self.provisional[key] = nil
   self.headless:discard(pending.entry)
+end
+
+--- The session worker serving `client_id`'s published world, if any.
+function Server:world_worker_id(client_id: string): integer?
+  local selected?, _problem? = self.worlds:select(client_id)
+  if selected == nil then return nil end
+  local slot? = self.world_slots[selected.world.key]
+  if slot == nil then return nil end
+  local info? = self.app:session_worker(slot.session_key)
+  if info == nil then return nil end
+  return info.id
+end
+
+-- Detach a registered world whose publication failed and stop its worker
+-- without joining it; `world_exited` finishes after the OS join.
+local function Server:abandon_world(key: string)
+  local slot? = self.world_slots[key]
+  if slot == nil then return end
+  self.worlds:retire(slot.client_id, key)
+  do slot.handle.commands:try_send(protocol.WorldCommand.stop(false)) catch end
+  slot.requests:close()
+  slot.commands:close()
+  self.app:stop_worker(slot.worker_id)
+end
+
+--- Session `on_exit`: the world worker joined, so its health may close.
+local function Server:world_exited(session_id: string, worker_id: integer)
+  local key, _client = world.split_session(session_id)
+  local slot? = self.world_slots[key]
+  if slot == nil or slot.worker_id ~= worker_id then return end
+  -- Health closure may wake quiescence while its caller holds the Hub gate.
+  slot.health:close()
+  slot.requests:close()
+  slot.commands:close()
+  slot.handle.requests:close()
+  slot.handle.commands:close()
+  self.worlds:retire(slot.client_id, key)
+  self.world_slots[key] = nil
+end
+
+-- Credential check, worker validation, registration, and publication run in
+-- one Hub transition, so revoked credentials cannot publish after waiting.
+local function Server:publish_world(request: messages.ControlRequest, session_key: string,
+                                    opening_key: string, client_id: string,
+                                    token: string): messages.ControlReply
+  return self.worlds:transition<|messages.ControlReply|>(function (): messages.ControlReply
+    local client? = self.database:authenticate(client_id, token)
+    if not client then return error_reply(401, "invalid pairing token") end
+    -- No yield from here until the slot is registered.
+    local reply? = request.reply
+    local info? = self.app:session_worker(session_key)
+    if self.closed or info == nil or info.id ~= request.worker_id or not info.alive or
+        self.world_slots[opening_key] ~= nil or reply == nil or reply:is_closed() then
+      return error_reply(503, withdrawn)
+    end
+    local requests_tx, requests_rx = thread.channel<|protocol.WorldRequest|>(self.config.max_pending)
+    local commands_tx, commands_rx = thread.channel<|protocol.WorldCommand|>(256)
+    local health_tx, health_rx = thread.channel<|nil|>(1)
+    local handle = protocol.WorldHandle(opening_key, client_id, requests_tx, commands_tx, health_rx)
+    self.world_slots[opening_key] = WorldSlot(session_key, client_id, request.worker_id, handle,
+      health_tx, requests_rx, commands_rx)
+    local publishable = function (): boolean
+      local current? = self.app:session_worker(session_key)
+      local sender? = request.reply
+      return not self.closed and not health_rx:is_closed() and current ~= nil and
+        current.id == request.worker_id and current.alive and sender ~= nil and not sender:is_closed()
+    end
+    local activation: protocol.Activation? = nil
+    do
+      local _, snapshot = self.worlds:publish_authenticated(handle, publishable)
+      activation = snapshot
+    catch
+      self:abandon_world(opening_key)
+      if error == withdrawn then return error_reply(503, withdrawn) end
+      raise
+    end
+    return messages.ControlReply.published(activation, handle, requests_rx, commands_rx)
+  end)
 end
 
 local function Server:retire_credential(is_revoke: boolean, target: string): messages.ControlReply
@@ -163,20 +242,8 @@ local function Server:coordinate(request: messages.ControlRequest): messages.Con
   end
   if self.closed then return error_reply(503, "relay is closed") end
   case request.action
-  when auth_publish(handle, token) then
-    local slot? = self.world_workers[handle.key]
-    if not slot or slot.id ~= request.worker_id or slot.handle.client_id ~= handle.client_id then
-      return error_reply(503, "Foundry world disconnected")
-    end
-    return self.worlds:transition<|messages.ControlReply|>(function (): messages.ControlReply
-      local client? = self.database:authenticate(handle.client_id, token)
-      if not client then return error_reply(401, "invalid pairing token") end
-      if handle.health:is_closed() or (request.reply and request.reply:is_closed()) then
-        return error_reply(503, "Foundry world disconnected")
-      end
-      local _, activation = self.worlds:publish_authenticated(slot.handle)
-      return messages.ControlReply.published(activation)
-    end)
+  when auth_publish(session_key, opening_key, client_id, token) then
+    return self:publish_world(request, session_key, opening_key, client_id, token)
   when online() then
     return messages.ControlReply.online_ids(self.worlds:online_ids())
   when is_online(client_id) then
@@ -278,6 +345,8 @@ local function Server:control_loop(): nil
             when subscribed(_, subscription) then
               self.unclaimed[id] = nil
               self.worlds:unsubscribe(subscription.key)
+            when published(_, handle) then
+              self:abandon_world(handle.key)
             end
           end
         end
@@ -290,153 +359,13 @@ local function Server:control_loop(): nil
 catch
   self.controls:close()
   self.failure = async.Error(error, traceback)
-  self:begin_close()
+  self.app:initiate_shutdown()
   return nil
 end
 
-local function discard_handoffs(inbox: thread.Receiver<|messages.Handoff|>)
-  while true do
-    local available, opening? = inbox:try_receive()
-    if not available then return end
-    http.Exchange.discard_transfer_payload(opening.payload)
-  end
-end
-
-local function discard_openings(inbox: thread.Receiver<|world.Opening|>)
-  while true do
-    local available, opening? = inbox:try_receive()
-    if not available then return end
-    http.Exchange.discard_transfer_payload(opening.payload)
-  end
-end
-
-local function wait_ready<|T|>(ready: thread.Receiver<|boolean|>, worker: thread.Thread<|T|>)
-  local waiting = async.run<|boolean, value|>(ready:receive)
-  defer tasks.drain(waiting)
-  case async.race_two(waiting, worker:task())
-  when first(status) then
-    case status
-    when succeeded(ok) then if not ok then raise "worker initialization failed" end
-    when failed(failure) then failure:raise()
-    else raise "worker initialization cancelled"
-    end
-  else raise "worker terminated during initialization"
-  end
-end
-
-local function Server:log_level(): string
-  return self.logger and self.logger:level() or "info"
-end
-
-local function Server:log_sender(): thread.Sender<|string|>?
-  if self.logger then return self.log_lines end
-  return nil
-end
-
-local function Server:start_api_workers()
-  for index = 1, self.config.api_concurrency do
-    local sender, inbox = thread.channel<|messages.Handoff|>(128)
-    local ready_tx, ready_rx = thread.channel<|boolean|>(1)
-    defer ready_tx:close()
-    defer ready_rx:close()
-    local worker = thread.spawn_one(api_worker.run, api_worker.Bootstrap(index, self.config,
-      inbox, self.returned, self.controls, ready_tx, self:log_level(), self:log_sender()))
-    local slot = ApiWorker(index, worker, sender, inbox, nil)
-    self.api_workers[#self.api_workers + 1] = slot
-    slot.monitor = async.run<|nil, value|>(function (): nil
-      local status = worker:join()
-      sender:close()
-      discard_handoffs(inbox)
-      if not self.closed then
-        case status
-        when failed(failure) then self.failure = async.Error(failure.error, failure.traceback)
-        else self.failure = async.Error("API worker terminated", "")
-        end
-        log.emit(self.logger, "error", "server_failed", {["reason"] = "api_worker_failed"})
-        self:begin_close()
-      end
-      return nil
-    end)
-    wait_ready(ready_rx, worker)
-  end
-end
-
-local function Server:start_world(match: router.Match): WorldWorker
-  local id = self.next_worker
-  self.next_worker = id + 1
-  local requests_tx, requests_rx = thread.channel<|protocol.WorldRequest|>(self.config.max_pending)
-  local commands_tx, commands_rx = thread.channel<|protocol.WorldCommand|>(256)
-  local health_tx, health_rx = thread.channel<|nil|>(1)
-  local sender, inbox = thread.channel<|world.Opening|>(1)
-  local ready_tx, ready_rx = thread.channel<|boolean|>(1)
-  defer ready_tx:close()
-  defer ready_rx:close()
-  local handle = protocol.WorldHandle(store.secure_token(16), match.query["id"], requests_tx, commands_tx, health_rx)
-  local worker = thread.spawn_one(world.run, world.Bootstrap(id, self.config, handle,
-    requests_rx, commands_rx, inbox, ready_tx, self.controls, self:log_level(), self:log_sender()))
-  local slot = WorldWorker(id, handle, worker, sender, inbox, health_tx, nil)
-  self.world_workers[handle.key] = slot
-  slot.monitor = async.run<|nil, value|>(function (): nil
-    worker:join()
-    -- Health closure may wake quiescence while its caller holds the Hub gate.
-    health_tx:close()
-    sender:close()
-    discard_openings(inbox)
-    inbox:close()
-    requests_tx:close()
-    commands_tx:close()
-    self.worlds:retire(handle.client_id, handle.key)
-    self.world_workers[handle.key] = nil
-    return nil
-  end)
-  local ready = false
-  defer if not ready then worker:cancel(); tasks.await_terminal(slot.monitor) end
-  wait_ready(ready_rx, worker)
-  ready = true
-  return slot
-end
-
-local function Server:classify(method: string, target: string): router.Match?
-  local resolution = self.routes:match(method, target)
-  local match? = resolution.match
-  if resolution.status == 200 and match and match.action == "relay" and
-      match.query["id"] and match.query["id"] ~= "" then return match end
-  return nil
-end
-
-local function Server:deliver(opening: messages.Handoff)
-  local consumed = false
-  defer if not consumed then http.Exchange.discard_transfer_payload(opening.payload) end
-  if self.closed then return end
-  local match? = self:classify(opening.method, opening.target)
-  if match then
-    local slot = self:start_world(match)
-    defer if not consumed then slot.worker:cancel(); tasks.await_terminal(slot.monitor) end
-    if self.closed then return end
-    local metadata: {string: value} = {}
-    for key, item in iteration.pairs(match.query) do metadata[key] = item end
-    log.emit(self.logger, "info", "http_request", {["method"] = "GET", ["route"] = "/relay"})
-    if not slot.sender:try_send(world.Opening(opening.delivery_id, opening.payload,
-        match.query["worldTitle"] or "", match.query["version"] or "", wire.encode(metadata))) then
-      raise "world opening inbox is full"
-    end
-    consumed = true
-  else
-    local slot = self.api_workers[self.next_api]
-    self.next_api = self.next_api % #self.api_workers + 1
-    -- Sender.send returns immediately after enqueue commits; cancellation while
-    -- waiting for space unregisters its waiter without committing the message.
-    slot.sender:send(opening)
-    consumed = true
-  end
-end
-
-function Server:handle(request: http.Request, response: http.Response)
-  if self.closed then response:abort(); return end
-  -- Yield out of the final native read callback before detaching on Windows.
-  async.yield()
-  local payload = http.Exchange(request, response):to_transfer_payload()
-  self:deliver(messages.Handoff(store.secure_token(16), payload, request.method, request.target))
+local function listen_address(host: string, port: integer): string
+  if string.find(host, ":") then return "[" .. host .. "]:" .. port end
+  return host .. ":" .. port
 end
 
 function Server:start()
@@ -446,36 +375,18 @@ function Server:start()
   local published = false
   defer if not published then self:close() end
   self.control_task = async.run<|nil, value|>(self:control_loop)
-  self.return_task = async.run<|nil, value|>(function (): nil
-    for _, opening in self.return_inbox:incoming() do
-      do self:deliver(opening)
-      catch
-        if not self.closed then
-          log.emit(self.logger, "error", "http_request_failed", {["reason"] = "handoff_failed"})
-        end
-      end
-    end
-    return nil
-  catch
-    self.failure = async.Error(error, traceback)
-    self:begin_close()
-    return nil
-  end)
-  self.log_task = async.run<|nil, value|>(function (): nil
-    for _, text in self.log_inbox:incoming() do if self.logger then self.logger:accept(text) end end
-    return nil
-  end)
-  self:start_api_workers()
-  local listener = http.listen(self.config.host, self:handle, self.config.port, 128, 10000)
-  listener:read_ahead(false)
-  self.listener = listener
+  self.app:start(listen_address(self.config.host, self.config.port))
   published = true
 end
 
+--- Serve until shutdown. A pool worker or coordinator failure shuts the
+-- relay down and is raised here.
 function Server:serve()
   self:start()
-  self.listener:serve()
-  if self.retirement then self:close() end
+  do self.app:serve()
+  catch if not self.failure then self.failure = async.Error(error, traceback) end
+  end
+  self:close()
   if self.failure then self.failure:raise() end
 end
 
@@ -488,83 +399,46 @@ local function drain_operations(ops: {string: Operation}, cancel: boolean)
   for index = 1, #list do tasks.await_terminal(list[index]) end
 end
 
-local function Server:shutdown(): async.Error?
-  local failure: async.Error? = nil
-  if self.listener then
-    do self.listener:close()
-    catch if not failure then failure = async.Error(error, traceback) end
-    end
-  end
+-- Pre-shutdown (listener closed): end coordinator work and retire worlds.
+-- Workers are still alive, so world engines answer quiescence themselves.
+local function Server:close_admission()
+  self.closed = true
   drain_operations(self.operations, true)
-  do self.headless:close()
-  catch if not failure then failure = async.Error(error, traceback) end
-  end
-  do self.worlds:close()
-  catch if not failure then failure = async.Error(error, traceback) end
-  end
+  self:guard(function () self.headless:close() end)
+  self:guard(function () self.worlds:close() end)
   for id, _ in iteration.pairs(self.unclaimed) do self.unclaimed[id] = nil end
-  -- Keep the coordinator draining while cancelled HTTP children send cleanup.
-  for index = 1, #self.api_workers do self.api_workers[index].worker:cancel() end
-  for index = 1, #self.api_workers do
-    local slot = self.api_workers[index]
-    do slot.worker:join()
-    catch if not failure then failure = async.Error(error, traceback) end
-    end
-    if slot.monitor then tasks.await_terminal(slot.monitor) end
-    do discard_handoffs(slot.inbox)
-    catch if not failure then failure = async.Error(error, traceback) end
-    end
-    slot.sender:close()
-    slot.inbox:close()
-  end
-  local worlds: {WorldWorker} = {}
-  for _, slot in iteration.pairs(self.world_workers) do worlds[#worlds + 1] = slot end
-  for index = 1, #worlds do worlds[index].worker:cancel() end
-  for index = 1, #worlds do
-    local slot = worlds[index]
-    do slot.worker:join()
-    catch if not failure then failure = async.Error(error, traceback) end
-    end
-    slot.health:close()
-    if slot.monitor then tasks.await_terminal(slot.monitor) end
-    do discard_openings(slot.inbox)
-    catch if not failure then failure = async.Error(error, traceback) end
-    end
-    slot.sender:close()
-    slot.inbox:close()
-  end
+end
+
+-- Post-shutdown (every worker joined): release coordinator-owned state.
+local function Server:release()
+  if self.released then return end
+  self.released = true
   local pending_keys: {string} = {}
   for key, _ in iteration.pairs(self.provisional) do pending_keys[#pending_keys + 1] = key end
   for index = 1, #pending_keys do
     local key = pending_keys[index]
     local pending? = self.provisional[key]
-    if pending then
-      do self:discard_provisional(key, pending.worker_id)
-      catch if not failure then failure = async.Error(error, traceback) end
-      end
-    end
+    if pending then self:guard(function () self:discard_provisional(key, pending.worker_id) end) end
   end
   self.controls:close()
-  if self.control_task then tasks.await_terminal(self.control_task) end
+  local control_task? = self.control_task
+  if control_task then tasks.await_terminal(control_task) end
   drain_operations(self.operations, false)
   self.control_inbox:close()
-  self.returned:close()
-  if self.return_task then tasks.await_terminal(self.return_task) end
-  do discard_handoffs(self.return_inbox)
-  catch if not failure then failure = async.Error(error, traceback) end
-  end
-  self.return_inbox:close()
-  self.log_lines:close()
-  if self.log_task then tasks.await_terminal(self.log_task) end
-  self.log_inbox:close()
-  self.database:close()
-  return failure
+  self:guard(function () self.database:close() end)
+end
+
+local function Server:shutdown(): async.Error?
+  self.closed = true
+  self:guard(function () self.app:shutdown() end)
+  -- The hooks ran inside mk's shutdown; release() is idempotent.
+  self:release()
+  return self.cleanup_failure
 end
 
 local function Server:begin_close()
   if self.retirement then return end
   self.closed = true
-  if self.listener then self.listener:close() end
   self.retirement = async.run<|async.Error?, value|>(self:shutdown)
 end
 

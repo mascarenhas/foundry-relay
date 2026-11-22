@@ -31,14 +31,14 @@ export TITAN_PATH_0_6 := $(WINDOWS_PREFIX)/lib/titan/0.6
 
 require-clang64:
 	test "$(MSYSTEM)" = CLANG64
-	test -f "$(TITAN_COMPILER)" -a -f "$(PREFIX)/lib/titan/0.6/titan.dll"
+	test -f "$(TITAN_COMPILER)" -a -f "$(PREFIX)/lib/titan/0.6/titan.dll" -a -f "$(PREFIX)/lib/titan/0.6/mk.dll"
 
 # Both final images share compiler-owned objects, but keep relocatable payloads.
 all: require-clang64
 	+$(TITANC) $(BUILD_FLAGS) --exe "$(WINDOWS_OUTPUT)/bin/foundry-relay.exe" main
 	mkdir -p build/windows/app/bin build/windows/app/lib/titan/0.6
 	set -e; for name in $(RUNTIME_DLLS); do cp "$(PREFIX)/bin/$$name" build/windows/app/bin/; done
-	cp "$(PREFIX)/lib/titan/0.6/titan.dll" build/windows/app/lib/titan/0.6/
+	cp "$(PREFIX)/lib/titan/0.6/titan.dll" "$(PREFIX)/lib/titan/0.6/mk.dll" build/windows/app/lib/titan/0.6/
 	cp THIRD_PARTY_NOTICES.md build/windows/app/
 	rm -rf build/windows/app/licenses
 	mkdir -p build/windows/app/licenses
@@ -48,13 +48,13 @@ all: require-clang64
 	cp "$(OUTPUT_DIR)/lib/titan/0.6/main.dll" build/windows/app/lib/titan/0.6/
 
 core-test-build: require-clang64
-	+$(TITANC) $(BUILD_FLAGS) --test --tree . --test-dir tests --test-exclude tests.process_test --exe "$(WINDOWS_OUTPUT)/bin/relay-tests.exe" tests.router_test
+	+$(TITANC) $(BUILD_FLAGS) --test --tree . --test-dir tests --test-exclude tests.process_test --exe "$(WINDOWS_OUTPUT)/bin/relay-tests.exe" tests.api_test
 	mkdir -p build/windows/test/bin build/windows/test/lib/titan/0.6
 	set -e; for name in $(RUNTIME_DLLS); do cp "$(PREFIX)/bin/$$name" build/windows/test/bin/; done
-	cp "$(PREFIX)/lib/titan/0.6/titan.dll" build/windows/test/lib/titan/0.6/
+	cp "$(PREFIX)/lib/titan/0.6/titan.dll" "$(PREFIX)/lib/titan/0.6/mk.dll" build/windows/test/lib/titan/0.6/
 	cp "$(OUTPUT_DIR)/bin/relay-tests.exe" build/windows/test/bin/
 	mkdir -p build/windows/test/lib/titan/0.6/tests
-	cp "$(OUTPUT_DIR)/lib/titan/0.6/tests/router_test.dll" build/windows/test/lib/titan/0.6/tests/
+	cp "$(OUTPUT_DIR)/lib/titan/0.6/tests/api_test.dll" build/windows/test/lib/titan/0.6/tests/
 
 test: all core-test-build
 	powershell.exe -NoProfile -NonInteractive -File "$(WINDOWS_ROOT)/scripts/check-windows.ps1" -Application "$(WINDOWS_ROOT)/build/windows/app" -TestPayload "$(WINDOWS_ROOT)/build/windows/test" -ReadObj "$$(cygpath -m "$$(command -v llvm-readobj)")"

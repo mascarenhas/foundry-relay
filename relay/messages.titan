@@ -7,7 +7,7 @@ union ControlAction
   cancel()
   unsubscribe(key: string)
   session_discard(request_key: string)
-  auth_publish(world: world.WorldHandle, token: string)
+  auth_publish(session_key: string, opening_key: string, client_id: string, token: string)
   online()
   is_online(client_id: string)
   select(client_id: string)
@@ -28,7 +28,8 @@ union ControlReply
   active(online: boolean)
   selected(world: world.WorldHandle)
   subscribed(world: world.WorldHandle, subscription: world.Subscription)
-  published(activation: world.Activation)
+  published(activation: world.Activation, handle: world.WorldHandle,
+            requests: thread.Receiver<|world.WorldRequest|>, commands: thread.Receiver<|world.WorldCommand|>)
 end
 
 record ControlRequest
@@ -36,13 +37,4 @@ record ControlRequest
   const worker_id: integer
   const action: ControlAction
   const reply: thread.Sender<|ControlReply|>?
-end
-
--- The sender owns payload until enqueue succeeds. The queue then owns it until
--- immediate adoption, or explicit disposal after its sole consumer has joined.
-record Handoff
-  const delivery_id: string
-  const payload: string
-  const method: string
-  const target: string
 end

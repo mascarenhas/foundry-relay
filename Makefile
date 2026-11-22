@@ -26,8 +26,8 @@ COVERAGE_OPTIONS = --coverage --coverage-gcov "$(COVERAGE_GCOV)"
 all: build/foundry-relay
 
 check-sdk:
-	@test -f "$(TITAN_PREFIX)/bin/titanc" -a -f "$(TITAN_STDLIB)/titan.a" || { \
-		printf '%s\n' 'Use a prepared Titan SDK with compiled titan.test Case/run support; set TITANC to its bin/titanc.' >&2; exit 1; \
+	@test -f "$(TITAN_PREFIX)/bin/titanc" -a -f "$(TITAN_STDLIB)/titan.a" -a -f "$(TITAN_STDLIB)/mk.a" || { \
+		printf '%s\n' 'Use a prepared Titan SDK with compiled titan.test Case/run support and the titan-mk rock installed; set TITANC to its bin/titanc.' >&2; exit 1; \
 	}
 
 check-openssl:
@@ -54,12 +54,12 @@ coverage-build: | check-sdk check-openssl
 	test -n "$(COVERAGE_GCOV)"
 	rm -rf build/coverage-app build/coverage-tests
 	+env -u GCOV_PREFIX -u GCOV_PREFIX_STRIP $(TITANC) --output build/coverage-app --static -j $(TITAN_JOBS) $(OPENSSL_FLAGS) $(COVERAGE_OPTIONS) --exe build/coverage-app/main main
-	+env -u GCOV_PREFIX -u GCOV_PREFIX_STRIP $(TITANC) --output build/coverage-tests --static -j $(TITAN_JOBS) $(OPENSSL_FLAGS) $(COVERAGE_OPTIONS) --test --tree . --test-dir tests --exe build/coverage-tests/tests/router_test main
+	+env -u GCOV_PREFIX -u GCOV_PREFIX_STRIP $(TITANC) --output build/coverage-tests --static -j $(TITAN_JOBS) $(OPENSSL_FLAGS) $(COVERAGE_OPTIONS) --test --tree . --test-dir tests --exe build/coverage-tests/relay-tests main
 
 coverage-run:
 	rm -rf build/coverage-tests/.coverage/report build/coverage-app/.coverage/report
 	mkdir -p build/coverage-tests/.coverage/report build/coverage-app/.coverage/report
-	env -u TITAN_FILTER -u GCOV_PREFIX -u GCOV_PREFIX_STRIP TITAN_PATH_0_6="$(TITAN_STDLIB)" RELAY_TEST_EXECUTABLE="$(ROOT)/build/coverage-app/main" RELAY_TEST_COVERAGE_REPORT="$(ROOT)/build/coverage-app/.coverage/report" timeout $(TEST_TIMEOUT)s build/coverage-tests/tests/router_test
+	env -u TITAN_FILTER -u GCOV_PREFIX -u GCOV_PREFIX_STRIP TITAN_PATH_0_6="$(TITAN_STDLIB)" RELAY_TEST_EXECUTABLE="$(ROOT)/build/coverage-app/main" RELAY_TEST_COVERAGE_REPORT="$(ROOT)/build/coverage-app/.coverage/report" timeout $(TEST_TIMEOUT)s build/coverage-tests/relay-tests
 
 coverage: coverage-build
 	$(MAKE) coverage-run
