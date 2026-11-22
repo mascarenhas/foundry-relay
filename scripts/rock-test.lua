@@ -49,9 +49,11 @@ if windows then
    -- The standalone-process test relocates a static executable (Linux/macOS).
    run(env .. titanc .. " --test --tree . --test-dir tests --test-exclude tests.process_test"
       .. " --exe build\\bin\\relay-tests.exe")
-   -- The suite loads lua55.dll and native DLLs from the SDK bin directory and
-   -- titan.dll/mk.dll from its provider directory.
-   run('set "PATH=' .. scripts_dir .. ';%PATH%" && set "TITAN_PATH_0_6=' .. sdk_dir .. '\\lib\\titan\\0.6" && '
+   -- The suite loads lua55.dll and native DLLs from the SDK bin directory,
+   -- its compiled test DLL from build\lib\titan\0.6, and titan.dll/mk.dll
+   -- from the SDK provider directory.
+   run('set "PATH=' .. scripts_dir .. ';%PATH%" && set "TITAN_PATH_0_6=%CD%\\build\\lib\\titan\\0.6;'
+      .. sdk_dir .. '\\lib\\titan\\0.6" && '
       .. "build\\bin\\relay-tests.exe" .. arguments())
    os.exit(0)
 end
