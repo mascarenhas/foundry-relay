@@ -1,42 +1,50 @@
 # Appendix A: Native Builds, Windows Packaging, Testing, and Retired Records
 
-Both the `foundry-relay` server and its 17-module test suite compile directly
-to native code with `titanc`. Neither artifact depends on the Titan compiler at
-runtime. On POSIX, the server and test runner link statically against Titan's
-standard provider; on Windows, each image ships as a self-contained launcher
-executable plus application and runtime DLLs.
+Both the `foundry-relay` server and its 15-module test suite compile directly
+to native code with `titanc`, orchestrated by
+[`foundry-relay-0.1.0-1.rockspec`](../foundry-relay-0.1.0-1.rockspec) (format
+`3.0`, `MIT` license, dependencies `lua ~> 5.5`, `titan ~> 0.6`, and
+`titan-mk ~> 0.1`) and [`scripts/rock-test.lua`](../scripts/rock-test.lua).
+Neither artifact depends on the Titan compiler at runtime. On POSIX, the server
+and test runner link statically against `titan-mk` and Titan's standard
+provider; on Windows, each image ships as a launcher executable plus
+application and runtime DLLs.
 
 ## POSIX build
 
-Build on Linux or macOS against a prepared Titan 0.6 SDK containing `thread`,
-`http`, `websocket`, `sqlite3`, `json`, and `peg`—including channel endpoint
-transfer, portable demand reads, HTTP exchange transfer/disposal,
-`Exchange:serve` header deadlines, HTTP `Response:abort()`, the compiled
-`titan.test.Case`/`run` API, compiler-owned `--incremental` builds, native
-input switches (`--cflag`, `--ldflag`), `--output`, `--exe`, and
-`--test-dir`/`--test-exclude`. Prepending an SDK's `bin` directory to `PATH`
-selects its compiler and matching standard provider without pinning a Titan
-source revision; see [Build and test](../README.md#build-and-test) for the
-quickstart commands.
+Build on Linux or macOS against a prepared Titan 0.6 SDK containing `luarocks`,
+`thread`, `http`, `websocket`, `sqlite3`, `json`, `peg`, and compiled
+`titan.test`, with the `titan-mk` (`~> 0.1`) rock installed in the same tree.
+Prepending the SDK's `bin` directory to `PATH` selects its compiler, LuaRocks,
+and matching providers without pinning a Titan source revision; see
+[Build, install, and test](../README.md#build-install-and-test) for quickstart
+commands.
 
-[`Makefile`](../Makefile) defines two `.PHONY` image targets compiled in place
-from authored sources:
+[`foundry-relay-0.1.0-1.rockspec`](../foundry-relay-0.1.0-1.rockspec) and
+[`scripts/rock-test.lua`](../scripts/rock-test.lua) compile two native images
+under `build/`:
 
-- `build/foundry-relay` links root `main`.
-- `build/relay-tests` compiles one native `titan.test` runner via
-  `--test --tree . --test-dir tests`, collecting every `tests/*_test.titan`
-  module.
+- `luarocks make foundry-relay-0.1.0-1.rockspec` compiles root module
+  `foundry_relay` (`--incremental --static --output build --exe
+  build/foundry-relay foundry_relay`) and installs the standalone executable to
+  `<tree>/bin/foundry-relay`. Remove it with `luarocks remove foundry-relay`.
+- `luarocks test foundry-relay-0.1.0-1.rockspec` invokes
+  [`scripts/rock-test.lua`](../scripts/rock-test.lua), which compiles both
+  `build/foundry-relay` and the native `titan.test` runner `build/relay-tests`
+  (`--incremental --static --output build --test --tree . --test-dir tests
+  --exe build/relay-tests`), collecting every `tests/*_test.titan` module, and
+  runs `RELAY_TEST_EXECUTABLE=build/foundry-relay build/relay-tests`. Pass
+  runner arguments after `--`, such as
+  `luarocks test foundry-relay-0.1.0-1.rockspec -- --filter='^tests[.]api_test'`.
 
-Both targets pass
-`--incremental --static --output build -j $(TITAN_JOBS) $(OPENSSL_FLAGS)` with
-`--exe $@`. Make invokes `titanc` on every request; the compiler owns import
-discovery, dependency scheduling, object certification, and final-link reuse.
-An unchanged build compiles and links nothing, and the server and test runner
-share unchanged certified production `.o` files and the static standard
-provider (`titan.a`) under `build/`. Generated C, headers, and objects preserve
-the repository layout under `build/`, while target-specific synthetic runner
-and entrypoint files live under `build/.titan-links/<key>/synthetic/`.
-`make clean` deletes `build/`.
+Both commands invoke `titanc` directly; the compiler owns import discovery,
+dependency scheduling, object certification, and final-link reuse. An unchanged
+build compiles and links nothing; the server and test runner share unchanged
+certified production `.o` files under `build/` and link against the installed
+static providers (`titan.a`, `mk.a`) in the tree's `lib/titan/0.6`. Generated
+C, headers, and objects preserve the repository layout under `build/`, while
+target-specific synthetic runner and entrypoint files live under
+`build/.titan-links/<key>/synthetic/`. Delete `build/` to force a clean rebuild.
 
 The compiler keeps a disposable precise-stat digest cache at
 `build/.titan/digests`, separate from object and link certificates. Missing or
@@ -48,35 +56,28 @@ or flag configurations.
 ### OpenSSL modes and build variables
 
 POSIX builds default to `OPENSSL_MODE=system`, matching Titan's default SDK.
-Install OpenSSL 3.0 or newer development files and `pkg-config`
-(`PKG_CONFIG=/path/to/pkg-config` overrides discovery). `check-openssl`
-validates `openssl >= 3.0`, and `Makefile` forwards
-`pkg-config --cflags --libs openssl` as explicit `titanc` flags (`-I`, `-D`,
-`-L`, `-l`, `--cflag=`, `--ldflag=`). Caller-supplied `TITAN_EXTRA_CPPFLAGS`,
-`TITAN_EXTRA_CFLAGS`, and `TITAN_EXTRA_LDFLAGS` remain ambient compiler inputs.
-The resulting executable embeds Titan's standard provider and dynamically links
-system OpenSSL at runtime.
+Install OpenSSL 3.0 or newer development files and `pkg-config`. Both the
+rockspec `build_command` and [`scripts/rock-test.lua`](../scripts/rock-test.lua)
+verify `openssl >= 3.0` and export `pkg-config --cflags openssl` /
+`pkg-config --libs openssl` via `TITAN_EXTRA_CPPFLAGS` and
+`TITAN_EXTRA_LDFLAGS`. The resulting executable embeds `titan-mk` and Titan's
+standard provider and dynamically links system OpenSSL at runtime.
 
 When the installed Titan SDK was built with bundled OpenSSL, pass
-`OPENSSL_MODE=bundled` to `make` and `make test`. Bundled mode links the
-OpenSSL objects carried by the SDK without invoking `pkg-config`.
-`OPENSSL_MODE` must match the installed SDK; it does not rebuild or reconfigure
-that SDK.
+`OPENSSL_MODE=bundled` in the environment to `luarocks make` and
+`luarocks test`. Bundled mode links the OpenSSL objects carried by the SDK
+without invoking `pkg-config`. `OPENSSL_MODE` must match the installed SDK; it
+does not rebuild or reconfigure that SDK.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `TITANC` | `titanc` | Compiler command; use `/abs/path/bin/titanc` to select an SDK, or `titanc -v` for verbose native command and certification logs on `stderr` |
-| `TITAN_STDLIB` | `$(TITAN_PREFIX)/lib/titan/0.6` | Standard-provider directory; exported as `TITAN_PATH_0_6` during `make test` |
-| `TITAN_JOBS` | `2` | Worker and native-compilation concurrency inside each `titanc` invocation |
 | `OPENSSL_MODE` | `system` | `system` (`pkg-config`) or `bundled` (SDK-bundled OpenSSL) |
-| `TEST_TIMEOUT` | `300` | Execution budget in seconds passed to `timeout` by `make test` and `make coverage-run` |
-| `TEST_ARGS` | empty | Runner flags passed to `build/relay-tests`, such as `--filter='^tests[.]integration_test'` |
+| `COVERAGE_GCOV` / `GCOV` | `gcov` | Coverage backend command resolved by [`scripts/rock-test.lua`](../scripts/rock-test.lua) when `--coverage` is passed |
+| `TITAN_PROBE_CACHE_DISABLE` | unset | Set to `1` on restricted hosts so native-header probes do not write into an immutable SDK |
 
-Capture both streams when inspecting verbose compiler output
-(`make TITANC="titanc -v" 2>&1 | tee build.log`). On restricted hosts, point
-`CCACHE_DIR` at a writable directory and set `TITAN_PROBE_CACHE_DISABLE=1` so
-persistent native-header probes do not write into an immutable SDK (also useful
-after a failed sandboxed probe).
+On restricted hosts, point `CCACHE_DIR` at a writable directory and set
+`TITAN_PROBE_CACHE_DISABLE=1` so persistent native-header probes do not write
+into an immutable SDK (also useful after a failed sandboxed probe).
 
 [`titan-config.lua`](../titan-config.lua) sets `include = { "./" }` and
 `source_module_roots = { "./" }` so the Titan language server resolves
@@ -86,17 +87,45 @@ executable-line coverage, see [Appendix B: Executable Line Coverage](coverage.md
 ## Windows build
 
 Windows builds target an experimentally supported native x64 Titan Windows SDK
-with WebSocket and compiled `titan.test.Case`/`run` support. From an MSYS2
-`CLANG64` shell in a separate local NTFS checkout, supply the absolute SDK
-prefix to [`Makefile.windows`](../Makefile.windows):
+with WebSocket, compiled `titan.test.Case`/`run`, and `titan-mk` (`mk.dll`)
+installed. Because `--static` is unsupported on Windows, the root entry module
+is named `foundry_relay` ([`foundry_relay.titan`](../foundry_relay.titan)) so
+its compiled provider is `foundry_relay.dll` rather than colliding as
+`main.dll` inside shared `lib/titan/0.6`.
+
+### LuaRocks install and test on Windows
+
+[`foundry-relay-0.1.0-1.rockspec`](../foundry-relay-0.1.0-1.rockspec) defines
+`platforms.windows` build, install, and `post_install` hooks:
+
+- `luarocks make foundry-relay-0.1.0-1.rockspec` builds
+  `build\bin\foundry-relay.exe` and `build\lib\titan\0.6\foundry_relay.dll`
+  with `titanc.exe`, installs `foundry-relay.exe` into `<tree>\bin`, stages
+  `foundry_relay.dll` into `$(PREFIX)\dist\modules\`, and runs
+  `titan-install.bat --path "$(PREFIX)"` to publish `foundry_relay.dll` into
+  `<tree>\lib\titan\0.6`. Remove the rock and published DLL cleanly with
+  `titan-uninstall foundry-relay`.
+- `luarocks test foundry-relay-0.1.0-1.rockspec` builds
+  `build\bin\foundry-relay.exe` and `build\bin\relay-tests.exe`
+  (`--test-exclude tests.process_test`) via
+  [`scripts/rock-test.lua`](../scripts/rock-test.lua) and runs the suite with
+  `PATH` and `TITAN_PATH_0_6` pointing at the SDK (`--coverage` is Linux and
+  macOS only).
+
+### Relocatable payload packaging (`Makefile.windows`)
+
+To assemble and verify self-contained, compiler-free Windows payloads from an
+MSYS2 `CLANG64` shell in a separate local NTFS checkout, supply the absolute
+SDK prefix to [`Makefile.windows`](../Makefile.windows):
 
 ```sh
 make -f Makefile.windows PREFIX=/c/Titan/sdk
 make -f Makefile.windows test PREFIX=/c/Titan/sdk
 ```
 
-`Makefile.windows` selects `clang`, `llvm-ar`, `llvm-ranlib`, and `llvm-rc`,
-sets `TITAN_JOBS := 1`, `TITAN_RUNTIME_PREBUILT := 1`,
+`Makefile.windows` requires `titan.dll` and `mk.dll` in `$(PREFIX)/lib/titan/0.6`,
+selects `clang`, `llvm-ar`, `llvm-ranlib`, and `llvm-rc`, sets
+`TITAN_JOBS := 1`, `TITAN_RUNTIME_PREBUILT := 1`,
 `TITAN_PROBE_CACHE_DISABLE := 1`, `MSYS2_ARG_CONV_EXCL := *`,
 `-DUSING_UV_SHARED=1`, `-lcrypto`, and `--ldflag=-Wl,--stack,8388608`, and
 invokes the SDK's `bin/titanc.exe` directly (which locates its installation
@@ -108,15 +137,15 @@ the SDK:
 - **Application payload (`build/windows/app`)**: `bin/foundry-relay.exe`, six
   adjacent runtime DLLs (`lua55.dll`, `libuv-1.dll`, `libllhttp-9.4.dll`,
   `libsqlite3-0.dll`, `libcrypto-3-x64.dll`, `libssl-3-x64.dll`),
-  `lib/titan/0.6/main.dll` and `titan.dll`,
+  `lib/titan/0.6/foundry_relay.dll`, `mk.dll`, and `titan.dll`,
   [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md), and SDK notices under
   `licenses/`. Run `bin/foundry-relay.exe` and retain the full `bin`, `lib`,
   and license layout.
 - **Test payload (`build/windows/test`)**: `bin/relay-tests.exe`, the same six
-  runtime DLLs, `lib/titan/0.6/titan.dll`, and
-  `lib/titan/0.6/tests/router_test.dll`. `core-test-build` discovers test
-  modules with `--test-dir tests --test-exclude tests.process_test` and passes
-  the explicit root `tests.router_test` so the packaged test provider keeps a
+  runtime DLLs, `lib/titan/0.6/titan.dll`, `lib/titan/0.6/mk.dll`, and
+  `lib/titan/0.6/tests/api_test.dll`. `core-test-build` discovers test modules
+  with `--test-dir tests --test-exclude tests.process_test` and passes the
+  explicit root `tests.api_test` so the packaged test provider keeps a
   deterministic DLL path.
 
 `make -f Makefile.windows test` runs
@@ -124,11 +153,11 @@ the SDK:
 policy must allow script execution; the target does not modify it), performing
 four end-to-end delivery checks:
 
-1. **PE import audit**: Verifies all six runtime DLLs and `titan.dll` exist in
-   both payloads, then runs `llvm-readobj --coff-imports` on every `.exe` and
-   `.dll` across both trees to confirm `COFF-x86-64` format and reject any
-   regular or delay-loaded import outside the six private DLLs, the 15
-   allowlisted Windows system DLLs, and `api-ms-win-crt-*.dll`.
+1. **PE import audit**: Verifies all six runtime DLLs, `titan.dll`, and
+   `mk.dll` exist in both payloads, then runs `llvm-readobj --coff-imports` on
+   every `.exe` and `.dll` across both trees to confirm `COFF-x86-64` format
+   and reject any regular or delay-loaded import outside the six private DLLs,
+   the 15 allowlisted Windows system DLLs, and `api-ms-win-crt-*.dll`.
 2. **Unicode relocation without toolchain `PATH`**: Verifies local NTFS scratch
    storage, copies `build/windows/app` into a Unicode directory
    (`relay Windows 世界`), and launches `foundry-relay.exe` from a separate
@@ -148,25 +177,27 @@ four end-to-end delivery checks:
 
 ## Test architecture
 
-`make test` executes `build/relay-tests` under `timeout $(TEST_TIMEOUT)s`
-(requiring GNU coreutils `timeout` on `PATH`; macOS does not ship one) with
-`RELAY_TEST_EXECUTABLE` set to `$(ROOT)/build/foundry-relay`. The 17 native
-`tests/*_test.titan` modules partition across four verification layers:
+`luarocks test foundry-relay-0.1.0-1.rockspec` executes `build/relay-tests`
+with `RELAY_TEST_EXECUTABLE=build/foundry-relay` on POSIX (or
+`build\bin\relay-tests.exe` on Windows). The 15 native `tests/*_test.titan`
+modules partition across four verification layers (routing, logging, `413`
+body-limit, and `WWW-Authenticate` `401` middleware primitives are covered by
+`titan-mk`'s own suites):
 
 | Layer | Test modules | Coverage focus |
 | --- | --- | --- |
-| Unit & boundaries | `router_test`, `api_test`, `store_test`, `log_test`, `session_crypto_test`, `cdp_test` | PEG route parsing and percent-decoding, 91-endpoint validation and Base64 framing, SQLite schema/mode/pairing reuse, logger queue bounds and sink isolation, RSA-OAEP interop, single-flight CDP timeouts and error sanitization |
-| Concurrency & lifecycle | `store_concurrency_test`, `replies_test`, `protocol_test`, `threading_test`, `sessions_test` | 4-thread `SQLITE_BUSY` retry, 4-lease reply pool FIFO and channel replacement, WebSocket world engine and reconnect quiescence, keepalive round-robin dispatch and cancelled credential revocation, `sessions.Manager` admission and cleanup quarantine |
-| Browser & HTTP/WS integration | `browser_test`, `foundry_session_test`, `integration_test`, `logging_http_test`, `session_http_test` | Fake-child and installed-Chromium lifecycle, Foundry preload/join/readiness verification, loopback REST/WebSocket/SSE forwarding and deadlines, HTTP admission and single-timeout logging, two-phase HTTP session publication |
+| Unit & boundaries | `api_test`, `store_test`, `session_crypto_test`, `cdp_test` | 91-endpoint `mk.router` integration, parameter validation, and Base64 framing, SQLite schema/mode/pairing reuse, RSA-OAEP interop, single-flight CDP timeouts and error sanitization |
+| Concurrency & lifecycle | `store_concurrency_test`, `replies_test`, `protocol_test`, `threading_test`, `sessions_test` | 4-thread `SQLITE_BUSY` retry, 4-lease reply pool FIFO and channel replacement, WebSocket world engine and reconnect quiescence, `mk` pool/session dispatch and cancelled credential revocation, `sessions.Manager` admission and cleanup quarantine |
+| Browser & HTTP/WS integration | `browser_test`, `foundry_session_test`, `integration_test`, `logging_http_test`, `session_http_test` | Fake-child and installed-Chromium lifecycle, Foundry preload/join/readiness verification, loopback REST/WebSocket/SSE forwarding, `mk.middleware.logger` admission + single-timeout logging, two-phase HTTP session publication |
 | Standalone delivery | `process_test` | Relocated static binary launched with stripped `PATH`/`TITAN_*`/`LUA_*`, live pair/WS/SSE lifecycle, graceful `SIGTERM` shutdown, credential-free JSON `stderr`, and child coverage report check |
 
-Every production module (`main.titan` and all 21 `relay/*.titan` files) uses
-ordinary compiled imports with zero `.titan` source imports, enforcing strict
-public interfaces across the codebase. White-box tests selectively use explicit
-`.titan` source imports (such as `import "relay.store.titan"`,
-`import "relay.server.titan"`, `import "relay.replies.titan"`, and
-`import "relay.sessions.titan"`) to reach `local` internals deterministically:
-holding `Store:acquire` inside `cancelled_security_transition` in
+Every production module (`foundry_relay.titan` and all 19 `relay/*.titan`
+files) uses ordinary compiled imports with zero `.titan` source imports,
+enforcing strict public interfaces across the codebase. White-box tests
+selectively use explicit `.titan` source imports (such as
+`import "relay.store.titan"`, `import "relay.server.titan"`,
+`import "relay.replies.titan"`, and `import "relay.sessions.titan"`) to reach
+`local` internals deterministically:
 [`tests/threading_test.titan`](../tests/threading_test.titan) to cancel a
 credential transition mid-SQLite wait, asserting `#f.pool.waiters` and
 `#f.pool.leases` in [`tests/replies_test.titan`](../tests/replies_test.titan),
@@ -195,13 +226,15 @@ end
 ```
 *Source: [`tests/store_concurrency_test.titan`](../tests/store_concurrency_test.titan) — `test_busy_retries_roll_back_the_complete_write`*
 
+[GitHub Actions](../.github/workflows/ci.yml) runs `luarocks lint`, `luarocks test`, and an install, standalone-run, and removal smoke ([`.github/scripts/package-smoke.sh`](../.github/scripts/package-smoke.sh)) on Linux x64, macOS arm64, and Windows x64 (MSYS2 CLANG64). Each job builds the pinned Titan release SDK and installs the `titan-mk` source rock from its GitHub release (`MK_RELEASE`), checking both release digests; the Windows job also runs `make -f Makefile.windows test`.
+
 ### Optional test capabilities and platform skips
 
 | Variable | Effect |
 | --- | --- |
 | `RELAY_TEST_CHROME` and `RELAY_TEST_BROWSER_PROFILES` | Enable installed-Chromium lifecycle ([`tests/browser_test.titan`](../tests/browser_test.titan)) and Foundry login/readiness DOM cases ([`tests/foundry_session_test.titan`](../tests/foundry_session_test.titan)); both must be set. With Flatpak Chrome, point `RELAY_TEST_BROWSER_PROFILES` at a workspace-local directory accessible to the sandbox rather than `/tmp`. |
 | `RELAY_TEST_OPENSSL` | OpenSSL CLI executable for independent-client RSA-OAEP cases in [`tests/session_crypto_test.titan`](../tests/session_crypto_test.titan); defaults to `openssl` and skips when missing (`ENOENT`). |
-| `RELAY_TEST_EXECUTABLE` | Server binary tested by [`tests/process_test.titan`](../tests/process_test.titan); set automatically by `make test` and `make coverage-run`. |
+| `RELAY_TEST_EXECUTABLE` | Server binary tested by [`tests/process_test.titan`](../tests/process_test.titan); set automatically by `luarocks test` (`scripts/rock-test.lua`). |
 
 POSIX runs skip the Windows exclusive-file-sharing case in
 [`tests/browser_test.titan`](../tests/browser_test.titan). Windows runs skip
@@ -218,9 +251,11 @@ skips when `UV_THREADPOOL_SIZE` is set to anything other than `4`.
 Route and wire-protocol compatibility was researched from the upstream Go relay
 at `65ce83d6a534ea6d340c8a89d72251f4c6a0294e` and the locally installed Foundry
 module's source map, and checked live against Foundry 14.368 with REST API
-module 3.4.1. [Third-party notices](../THIRD_PARTY_NOTICES.md) preserve the
-upstream MIT notice. The router's PEG design follows the route parser approach
-in [mk/routes.lua](https://github.com/mascarenhas/mk/blob/master/src/mk/routes.lua).
+module 3.4.1. `foundry-relay` itself is licensed under the MIT License
+([`LICENSE`](../LICENSE)), and [Third-party notices](../THIRD_PARTY_NOTICES.md)
+preserve the upstream MIT notice. HTTP routing, middleware, worker pools,
+ephemeral session workers, and structured logging are supplied directly by the
+installed [`titan-mk`](https://github.com/mascarenhas/mk) framework.
 
 ## Retired records
 

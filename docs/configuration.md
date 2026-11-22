@@ -117,7 +117,7 @@ Every record carries `timestamp` (UTC ISO-8601 at one-second resolution),
 `level`, and `event`, along with fixed event-specific fields:
 
 ```json
-{"event":"http_request","level":"info","method":"GET","route":"/world-info","timestamp":"2026-10-11T20:00:00Z"}
+{"event":"http_request","level":"info","method":"GET","route":"/world-info","timestamp":"2026-10-11T20:00:00Z","worker_id":1}
 ```
 
 ### Admission, privacy, and delivery guarantees
@@ -125,11 +125,12 @@ Every record carries `timestamp` (UTC ISO-8601 at one-second resolution),
 - **HTTP admission.** `http_request` records cover every request reaching the
   relay's HTTP handler, including authentication failures, unmatched paths,
   `OPTIONS`, SSE streams, and `/relay` upgrades. They are emitted before
-  dispatch. `route` records the declared route template (such as
-  `/clients/:clientId`) or `<unmatched>`; standard HTTP methods (`GET`, `POST`,
-  `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `HEAD`, `CONNECT`, `TRACE`) are recorded
-  verbatim, and other methods as `OTHER`. Requests rejected by the HTTP parser
-  never reach this handler.
+  dispatch by `mk.middleware.logger` in admission mode. `route` records the
+  declared route template (such as `/clients/:clientId`) or `<unmatched>`;
+  standard HTTP methods (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`,
+  `HEAD`, `CONNECT`, `TRACE`) are recorded verbatim, and other methods as
+  `OTHER`; worker-handled requests also include `worker_id`. Requests rejected
+  by the HTTP parser never reach this handler.
 - **Strict sanitization.** Logs omit HTTP headers, query values, route
   parameters, bodies, API keys, pairing codes, tokens, passwords, world
   metadata, browser/CDP contents, arbitrary error text, and peer Close reasons.
@@ -156,7 +157,7 @@ Every record carries `timestamp` (UTC ISO-8601 at one-second resolution),
   to a regular file, which is unsupported and disables the log sink:
 
 ```sh
-./build/foundry-relay 2>&1 | tee relay.log
+foundry-relay 2>&1 | tee relay.log
 ```
 
 ## Shutdown and limits
@@ -168,10 +169,9 @@ SQLite store. If a headless browser fails to retire cleanly during shutdown,
 the server logs `server_failed` (`reason: "serve_or_shutdown_failed"`) and
 exits with status `1`.
 
-Shutdown cancels and joins the Tasks serving adopted HTTP exchanges without
-aborting their underlying TCP transports. If an HTTP client permanently stalls
-while sending a request body or reading a response, shutdown is not guaranteed
-to be bounded.
+During worker teardown, `titan-mk` aborts active exchange transports before
+cancelling and joining worker request Tasks, preventing a stalled HTTP client
+from blocking worker retirement indefinitely.
 
 ### Operational limits
 
@@ -180,7 +180,7 @@ to be bounded.
 | Listener accept backlog | 128 pending connections | OS TCP listen backlog |
 | HTTP header read timeout | 10 s (initial and keep-alive) | Connection closes |
 | Request target / query fields | 16 KiB / 256 query fields | HTTP `400` |
-| HTTP body / WebSocket frame / JSON depth | 16 MiB / 16 MiB / 64 levels | HTTP `400` or WebSocket close |
+| HTTP body / WebSocket frame / JSON depth | 16 MiB / 16 MiB / 64 levels | HTTP `413` (body) / WebSocket close (frame) / HTTP `400` (JSON depth) |
 | Pending forwarding requests per world | `RELAY_MAX_PENDING` (default 128, max 10,000) | HTTP `429` |
 | Per-world WebSocket output queue | `RELAY_MAX_PENDING + 16` messages | HTTP `503` |
 | Per-SSE subscriber queue | 128 events | Subscriber retired; stream ends after draining queued events |

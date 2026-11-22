@@ -1,114 +1,163 @@
+-- REST handlers. They run on mk pool workers; each worker state attaches its
+-- own Store and reply pool in on_start and asks the coordinator for state it
+-- does not own.
 local async = import "async"
-local http = import "http"
-local thread = import "thread"
-local timer = import "timer"
 local iteration = import "iteration"
 local string = import "string"
-local config = import "relay.config"
-local store = import "relay.store"
-local router = import "relay.router"
-local routes = import "relay.routes"
+local thread = import "thread"
+local timer = import "timer"
+local mk = import "mk"
+local log = import "mk.log"
 local api = import "relay.api"
-local wire = import "relay.wire"
-local log = import "relay.log"
-local tasks = import "relay.tasks"
+local config = import "relay.config"
+local control = import "relay.control"
 local messages = import "relay.messages"
 local protocol = import "relay.world_protocol"
-local control = import "relay.control"
 local replies = import "relay.replies"
+local store = import "relay.store"
+local tasks = import "relay.tasks"
+local wire = import "relay.wire"
 
-record Bootstrap
+-- Per worker state: every pool worker is an independent Lua state.
+local record State
   const worker_id: integer
   const settings: config.Config
-  const inbox: thread.Receiver<|messages.Handoff|>
-  const returned: thread.Sender<|messages.Handoff|>
-  const coordinator: thread.Sender<|messages.ControlRequest|>
-  const ready: thread.Sender<|boolean|>
-  const log_level: string
-  const log_lines: thread.Sender<|string|>?
-end
-
-local record Worker
-  const id: integer
-  const settings: config.Config
   const database: store.Store
-  const routes: router.Router
   const coordinator: thread.Sender<|messages.ControlRequest|>
-  const returned: thread.Sender<|messages.Handoff|>
   const pool: replies.Pool
   const logger: log.Logger?
 end
 
+local state: State? = nil
+
 local const online_action = messages.ControlAction.online()
 local const session_list_action = messages.ControlAction.session_list()
 
-local const known_methods: {string: boolean} = {
-  ["GET"] = true, ["POST"] = true, ["PUT"] = true, ["PATCH"] = true,
-  ["DELETE"] = true, ["OPTIONS"] = true, ["HEAD"] = true,
-  ["CONNECT"] = true, ["TRACE"] = true,
-}
+--- Worker initializer: attach the Store and reply pool for this worker.
+function initializer(settings: config.Config,
+                     coordinator: thread.Sender<|messages.ControlRequest|>): mk.WorkerInit
+  return function (wctx: mk.WorkerContext)
+    local database = store.attach(settings.database)
+    local pool = replies.Pool(4, wctx.logger)
+    state = State(wctx.id, settings, database, coordinator, pool, wctx.logger)
+    wctx:defer_cleanup(function ()
+      state = nil
+      pool:close()
+      database:close()
+    end)
+  end
+end
+
+local function current(): State
+  local initialized? = state
+  if initialized == nil then raise "API worker is not initialized" end
+  return initialized
+end
+
+--- Write a JSON response body.
+function json_response(ctx: mk.Context, status: integer, body: string)
+  ctx:status(status):set("Content-Type", "application/json; charset=utf-8"):send(body)
+end
+
+--- Write `{"error": message}`.
+function error_response(ctx: mk.Context, status: integer, message: string)
+  json_response(ctx, status, wire.error_body(message))
+end
+
+local function ask(action: messages.ControlAction): messages.ControlReply
+  local worker = current()
+  return control.call(worker.coordinator, worker.worker_id, action)
+end
+
+local function write_reply(ctx: mk.Context, reply: messages.ControlReply)
+  case reply
+  when response(status, body) then json_response(ctx, status, body)
+  else error_response(ctx, 500, "unexpected coordinator reply")
+  end
+end
+
+-- An empty body is {} without requiring a JSON Content-Type.
+local function json_body(ctx: mk.Context): {string: value}
+  local source = ctx:body()
+  if source == "" then return {} end
+  if not ctx:is_json() then raise "request body must use application/json" end
+  return wire.object(source)
+end
+
+function health(ctx: mk.Context)
+  json_response(ctx, 200, "{\"status\":\"ok\"}")
+end
+
+function pair(ctx: mk.Context)
+  local worker = current()
+  local data = json_body(ctx)
+  local code = wire.text(data, "code")
+  if not config.secret_equal(code, worker.settings.pairing_code) then
+    error_response(ctx, 401, "invalid pairing code")
+    return
+  end
+  local world_id = wire.text(data, "worldId")
+  if world_id == "" then error_response(ctx, 400, "worldId is required"); return end
+  local client = worker.database:pair(world_id, wire.text(data, "worldTitle", world_id),
+    wire.text(data, "serverFingerprint"), wire.text(data, "serverOrigin"), wire.text(data, "existingClientId"))
+  log.emit(worker.logger, "info", "pairing_created", {["client_id"] = client.client_id})
+  local result: {string: value} = { ["token"] = client.token, ["clientId"] = client.client_id,
+    ["relayUrl"] = worker.settings.public_url }
+  json_response(ctx, 200, wire.encode(result))
+end
+
+function unpair(ctx: mk.Context)
+  local data = json_body(ctx)
+  write_reply(ctx, ask(messages.ControlAction.revoke(wire.text(data, "token"))))
+end
+
+function active(ctx: mk.Context)
+  local id = ctx:param("clientId")
+  if not current().database:get(id) then error_response(ctx, 404, "unknown client"); return end
+  case ask(messages.ControlAction.is_online(id))
+  when active(is_active) then
+    json_response(ctx, 200, is_active and "{\"active\":true}" or "{\"active\":false}")
+  when response(status, reply_body) then json_response(ctx, status, reply_body)
+  else error_response(ctx, 500, "unexpected coordinator reply")
+  end
+end
+
+function clients(ctx: mk.Context)
+  local paired = current().database:list()
+  local online: {string: boolean} = {}
+  case ask(online_action)
+  when online_ids(ids) then
+    for index = 1, #ids do online[ids[index]] = true end
+  when response(status, body) then
+    json_response(ctx, status, body)
+    return
+  else
+    error_response(ctx, 500, "unexpected coordinator reply")
+    return
+  end
+  local results: {value} = {}
+  for index = 1, #paired do
+    local client = paired[index]
+    local metadata = wire.object(client.metadata_json)
+    local item: {string: value} = {["id"] = client.client_id, ["clientId"] = client.client_id,
+      ["worldId"] = client.world_id, ["worldTitle"] = client.world_title,
+      ["version"] = client.module_version, ["lastSeen"] = client.last_seen,
+      ["connected"] = online[client.client_id] == true}
+    for key, content in iteration.pairs(metadata) do
+      if key ~= "id" and key ~= "token" and key ~= "clientId" and key ~= "connected" then item[key] = content end
+    end
+    results[index] = item
+  end
+  json_response(ctx, 200, wire.encode(results))
+end
+
+function forget(ctx: mk.Context)
+  write_reply(ctx, ask(messages.ControlAction.delete_client(ctx:param("clientId"))))
+end
 
 local function wait_keepalive(): nil
   timer.sleep(15000)
   return nil
-end
-
-local function Worker:ask(action: messages.ControlAction): messages.ControlReply
-  return control.call(self.coordinator, self.id, action)
-end
-
-local function write_reply(response: http.Response, reply: messages.ControlReply)
-  case reply
-  when response(status, body) then router.json_response(response, status, body)
-  else router.error_response(response, 500, "unexpected coordinator reply")
-  end
-end
-
-local function body(request: http.Request): string
-  local output = string.writer()
-  local length = 0
-  for chunk in request:read do
-    length = length + #chunk
-    if length > 16777216 then raise "request body exceeds 16 MiB" end
-    output:write(chunk)
-  end
-  return output:drain()
-end
-
-local function require_json_header(request: http.Request)
-  local content_type = string.lower(request.headers:get("Content-Type") or "")
-  if string.sub(content_type, 1, 16) ~= "application/json" then
-    raise "request body must use application/json"
-  end
-end
-
-local function json_body(request: http.Request): {string: value}
-  local source = body(request)
-  if source == "" then return {} end
-  require_json_header(request)
-  return wire.object(source)
-end
-
-local function Worker:authorized(request: http.Request): boolean
-  local keys = request.headers:values("x-api-key")
-  return #keys == 1 and config.secret_equal(keys[1], self.settings.api_key)
-end
-
-local function Worker:pair(request: http.Request, response: http.Response)
-  local data = json_body(request)
-  local code = wire.text(data, "code")
-  if not config.secret_equal(code, self.settings.pairing_code) then
-    router.error_response(response, 401, "invalid pairing code")
-    return
-  end
-  local world_id = wire.text(data, "worldId")
-  if world_id == "" then router.error_response(response, 400, "worldId is required"); return end
-  local client = self.database:pair(world_id, wire.text(data, "worldTitle", world_id),
-    wire.text(data, "serverFingerprint"), wire.text(data, "serverOrigin"), wire.text(data, "existingClientId"))
-  log.emit(self.logger, "info", "pairing_created", {["client_id"] = client.client_id})
-  local result: {string: value} = { ["token"] = client.token, ["clientId"] = client.client_id,
-    ["relayUrl"] = self.settings.public_url }
-  router.json_response(response, 200, wire.encode(result))
 end
 
 local function sse_name(channel: string, data: {string: value}): string
@@ -128,81 +177,22 @@ local function sse_name(channel: string, data: {string: value}): string
   return name
 end
 
-local function Worker:forward(request: http.Request, response: http.Response, match: router.Match)
-  local endpoint = api.endpoint_for(match.action)
-  local data: {string: value} = {}
-  local content_type = request.headers:get("Content-Type") or "application/octet-stream"
-  if endpoint:is_upload() and string.sub(string.lower(content_type), 1, 16) ~= "application/json" then
-    -- Binary upload metadata comes from the declared query parameters.
-    data["fileData"] = "data:" .. content_type .. ";base64," .. api.encode_base64(body(request))
-  else
-    data = json_body(request)
-  end
-  local payload = api.build_payload(endpoint, match, data)
-  local client_id? = match.query["clientId"]
-  if not client_id and data["clientId"] is string then client_id = data["clientId"] end
-  local world: protocol.WorldHandle? = nil
-  case self:ask(messages.ControlAction.select(client_id or ""))
-  when selected(handle) then world = handle
-  when response(status, body) then router.json_response(response, status, body); return
-  else router.error_response(response, 500, "unexpected coordinator reply"); return
-  end
-  local timeout = self.settings.request_timeout
-  if timeout == 0 then timeout = endpoint.timeout_ms end
-  local reply = self.pool:request(world, endpoint.action, payload, timeout)
-  if reply.status ~= 200 then router.json_response(response, reply.status, reply.body); return end
-  local converted = api.response(endpoint, wire.object(reply.body), match.query["format"])
-  response:set_status(converted.status)
-  response:set_header("Content-Type", converted.content_type)
-  for key, content in iteration.pairs(converted.headers) do response:set_header(key, content) end
-  response:write(converted.body)
-end
-
-local function Worker:clients(response: http.Response)
-  local clients = self.database:list()
-  local online: {string: boolean} = {}
-  case self:ask(online_action)
-  when online_ids(ids) then
-    for index = 1, #ids do online[ids[index]] = true end
-  when response(status, body) then
-    router.json_response(response, status, body)
-    return
-  else
-    router.error_response(response, 500, "unexpected coordinator reply")
-    return
-  end
-  local results: {value} = {}
-  for index = 1, #clients do
-    local client = clients[index]
-    local metadata = wire.object(client.metadata_json)
-    local item: {string: value} = {["id"] = client.client_id, ["clientId"] = client.client_id,
-      ["worldId"] = client.world_id, ["worldTitle"] = client.world_title,
-      ["version"] = client.module_version, ["lastSeen"] = client.last_seen,
-      ["connected"] = online[client.client_id] == true}
-    for key, content in iteration.pairs(metadata) do
-      if key ~= "id" and key ~= "token" and key ~= "clientId" and key ~= "connected" then item[key] = content end
-    end
-    results[index] = item
-  end
-  router.json_response(response, 200, wire.encode(results))
-end
-
-local function Worker:stream(response: http.Response, match: router.Match)
-  local channel = string.sub(match.action, 5)
+local function serve_stream(ctx: mk.Context, channel: string)
+  local worker = current()
   local subscription: protocol.Subscription? = nil
-  case self:ask(messages.ControlAction.subscribe(match.query["clientId"] or "", channel))
+  case ask(messages.ControlAction.subscribe(ctx:query("clientId", ""), channel))
   when subscribed(_, sub) then subscription = sub
-  when response(status, body) then router.json_response(response, status, body); return
-  else router.error_response(response, 500, "unexpected coordinator reply"); return
+  when response(status, body) then json_response(ctx, status, body); return
+  else error_response(ctx, 500, "unexpected coordinator reply"); return
   end
   defer do
     subscription.events:close()
-    control.notify(self.coordinator, self.id, messages.ControlAction.unsubscribe(subscription.key))
+    control.notify(worker.coordinator, worker.worker_id, messages.ControlAction.unsubscribe(subscription.key))
   end
-  response:set_header("Content-Type", "text/event-stream")
-  response:set_header("Cache-Control", "no-cache")
-  response:set_header("X-Accel-Buffering", "no")
-  response:write("event: connected\ndata: " .. wire.encode({["clientId"] = subscription.client_id}) .. "\n\n")
+  ctx:set("Content-Type", "text/event-stream")
+  ctx:set("Cache-Control", "no-cache")
+  ctx:set("X-Accel-Buffering", "no")
+  ctx:write_chunk("event: connected\ndata: " .. wire.encode({["clientId"] = subscription.client_id}) .. "\n\n")
   local reading: async.Task<|string?, value|>? = nil
   defer if reading then tasks.drain(reading) end
   while true do
@@ -217,189 +207,107 @@ local function Worker:stream(response: http.Response, match: router.Match)
         local envelope = wire.object(text)
         local data: {string: value} = envelope
         if envelope["data"] is {string: value} then data = envelope["data"] end
-        response:write("event: " .. sse_name(channel, data) .. "\ndata: " .. wire.encode(data) .. "\n\n")
+        ctx:write_chunk("event: " .. sse_name(channel, data) .. "\ndata: " .. wire.encode(data) .. "\n\n")
         reading = nil
       else return
       end
-    when second() then response:write(": keepalive\n\n")
+    when second() then ctx:write_chunk(": keepalive\n\n")
     end
   end
 end
 
-local function single_header(request: http.Request, name: string, required: boolean): string
-  local values = request.headers:values(name)
+--- Server-sent events for one world event channel.
+function stream(channel: string): mk.Handler
+  return function (ctx: mk.Context) serve_stream(ctx, channel) end
+end
+
+local function single_header(ctx: mk.Context, name: string, required: boolean): string
+  local values = ctx:get_headers(name)
   if #values > 1 or (required and (#values ~= 1 or values[1] == "")) then
     raise "invalid session header"
   end
   return #values == 1 and values[1] or ""
 end
 
-local function Worker:session_request(request: http.Request, response: http.Response, match: router.Match)
-  response:set_header("Cache-Control", "no-store")
-  if match.action == "session-handshake" then
-    local address = single_header(request, "x-foundry-url", true)
-    local user = single_header(request, "x-username", true)
-    local world = single_header(request, "x-world-name", false)
-    write_reply(response, self:ask(messages.ControlAction.session_handshake(address, user, world)))
-    return
+function session_handshake(ctx: mk.Context)
+  ctx:set("Cache-Control", "no-store")
+  local address = single_header(ctx, "x-foundry-url", true)
+  local user = single_header(ctx, "x-username", true)
+  local world = single_header(ctx, "x-world-name", false)
+  write_reply(ctx, ask(messages.ControlAction.session_handshake(address, user, world)))
+end
+
+function session_start(ctx: mk.Context)
+  ctx:set("Cache-Control", "no-store")
+  local worker = current()
+  local source = ctx:body()
+  if source == "" then
+    source = "{}"
+  else
+    if not ctx:is_json() then raise "request body must use application/json" end
+    wire.object(source)
   end
-  if match.action == "session-start" then
-    local source = body(request)
-    if source == "" then
-      source = "{}"
-    else
-      require_json_header(request)
-      wire.object(source)
-    end
-    local key = store.secure_token(16)
-    defer control.notify(self.coordinator, self.id, messages.ControlAction.session_discard(key))
-    case self:ask(messages.ControlAction.session_start(key, source))
-    when response(status, reply_body) then
-      router.json_response(response, status, reply_body)
-      if status == 200 then
-        case self:ask(messages.ControlAction.session_publish(key))
-        when ack() then
-        else response:abort()
-        end
+  local key = store.secure_token(16)
+  defer control.notify(worker.coordinator, worker.worker_id, messages.ControlAction.session_discard(key))
+  case ask(messages.ControlAction.session_start(key, source))
+  when response(status, reply_body) then
+    json_response(ctx, status, reply_body)
+    if status == 200 then
+      -- The client owns the session only once this response is on the wire.
+      ctx:commit()
+      case ask(messages.ControlAction.session_publish(key))
+      when ack() then
+      else ctx:abort()
       end
-    else router.error_response(response, 500, "unexpected coordinator reply")
     end
-    return
-  end
-  if match.action == "session-end" then
-    local id = match.query["sessionId"] or ""
-    if id == "" then id = wire.text(json_body(request), "sessionId") end
-    write_reply(response, self:ask(messages.ControlAction.session_end(id)))
-    return
-  end
-  write_reply(response, self:ask(session_list_action))
-end
-
-local function Worker:dispatch(request: http.Request, response: http.Response, resolution: router.Resolution)
-  if not self.settings:request_origin_allowed(request.headers:values("Origin"),
-      request.url.scheme, request.url.authority) then
-    router.error_response(response, 403, "origin is not allowed")
-    return
-  end
-  local origin? = request.headers:get("Origin")
-  if origin then
-    response:set_header("Access-Control-Allow-Origin", origin)
-    response:set_header("Vary", "Origin")
-  end
-  if request.method == "OPTIONS" then
-    response:set_header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-    response:set_header("Access-Control-Allow-Headers", "Content-Type,X-API-Key,X-Foundry-Url,X-Username,X-World-Name")
-    response:set_status(204)
-    return
-  end
-  if resolution.status ~= 200 then
-    if resolution.status == 405 then response:set_header("Allow", router.allow_header(resolution.allowed)) end
-    router.error_response(response, resolution.status, resolution.error or "route not found")
-    return
-  end
-  local match = resolution.match
-  if match.action == "health" then router.json_response(response, 200, "{\"status\":\"ok\"}"); return end
-  if match.action == "pair" then self:pair(request, response); return end
-  if match.action == "relay" then router.error_response(response, 400, "id is required"); return end
-  if match.action == "unpair" then
-    local data = json_body(request)
-    write_reply(response, self:ask(messages.ControlAction.revoke(wire.text(data, "token"))))
-    return
-  end
-  if match.action == "active" then
-    local id = match.params["clientId"]
-    if not self.database:get(id) then router.error_response(response, 404, "unknown client"); return end
-    case self:ask(messages.ControlAction.is_online(id))
-    when active(is_active) then
-      router.json_response(response, 200, is_active and "{\"active\":true}" or "{\"active\":false}")
-    when response(status, reply_body) then router.json_response(response, status, reply_body)
-    else router.error_response(response, 500, "unexpected coordinator reply")
-    end
-    return
-  end
-  if not self:authorized(request) then router.error_response(response, 401, "invalid API key"); return end
-  if string.sub(match.action, 1, 8) == "session-" then self:session_request(request, response, match); return end
-  if match.action == "clients" then self:clients(response); return end
-  if match.action == "forget" then
-    write_reply(response, self:ask(messages.ControlAction.delete_client(match.params["clientId"])))
-    return
-  end
-  if string.sub(match.action, 1, 4) == "sse:" then self:stream(response, match); return end
-  self:forward(request, response, match)
-catch
-  do
-    if error is async.OperationError then
-      log.emit(self.logger, "error", "http_request_failed", {["reason"] = "io_failure"})
-    elseif not (error is string) and not (error is async.CancellationReason) then
-      log.emit(self.logger, "error", "http_request_failed", {["reason"] = "internal_failure"})
-    end
-    router.error_response(response, 400, "invalid request")
-  catch
-    response:abort()
+  else error_response(ctx, 500, "unexpected coordinator reply")
   end
 end
 
-local function Worker:handle(request: http.Request, response: http.Response)
-  local resolution = self.routes:match(request.method, request.target)
-  local route = "<unmatched>"
-  if resolution.match then route = resolution.match.route.pattern end
-  local method = known_methods[request.method] and request.method or "OTHER"
-  log.emit(self.logger, "info", "http_request", {["method"] = method, ["route"] = route})
-  self:dispatch(request, response, resolution)
+function session_end(ctx: mk.Context)
+  ctx:set("Cache-Control", "no-store")
+  local id = ctx:query("sessionId", "")
+  if id == "" then id = wire.text(json_body(ctx), "sessionId") end
+  write_reply(ctx, ask(messages.ControlAction.session_end(id)))
 end
 
-function run(bootstrap: Bootstrap): nil
-  local database = store.attach(bootstrap.settings.database)
-  defer database:close()
-  local logger? = log.forward(bootstrap.log_level, bootstrap.log_lines)
-  defer if logger then logger:close() end
-  local pool = replies.Pool(4, logger)
-  defer pool:close()
-  local worker = Worker(bootstrap.worker_id, bootstrap.settings, database, routes.create(),
-    bootstrap.coordinator, bootstrap.returned, pool, logger)
-  local active: {string: async.Task<|nil, value|>} = {}
-  defer do
-    local children: {async.Task<|nil, value|>} = {}
-    for _, child in iteration.pairs(active) do children[#children + 1] = child end
-    for index = 1, #children do children[index]:cancel() end
-    for index = 1, #children do tasks.await_terminal(children[index]) end
-    -- No child can adopt another queued payload after this point.
-    while true do
-      local available, opening? = bootstrap.inbox:try_receive()
-      if not available then break end
-      http.Exchange.discard_transfer_payload(opening.payload)
-    end
+function session_list(ctx: mk.Context)
+  ctx:set("Cache-Control", "no-store")
+  write_reply(ctx, ask(session_list_action))
+end
+
+local function forward_endpoint(ctx: mk.Context, key: string)
+  local worker = current()
+  local endpoint = api.endpoint_for(key) as api.Endpoint
+  local data: {string: value} = {}
+  local content_type = ctx:get("Content-Type", "application/octet-stream")
+  if endpoint:is_upload() and not ctx:is_json() then
+    -- Binary upload metadata comes from the declared query parameters.
+    data["fileData"] = "data:" .. content_type .. ";base64," .. api.encode_base64(ctx:body())
+  else
+    data = json_body(ctx)
   end
-  bootstrap.ready:send(true)
-  for _, opening in bootstrap.inbox:incoming() do
-    -- Dequeue/adoption has no intervening yield: the worker owns these bytes.
-    local exchange = http.Exchange.from_transfer_payload(opening.payload)
-    local key = opening.delivery_id
-    local handling = async.run<|nil, value|>(function (): nil
-      defer active[key] = nil
-      local first = true
-      exchange:serve(function (request: http.Request, response: http.Response)
-        if first then
-          first = false
-          worker:handle(request, response)
-        else
-          -- Each later request returns to the main dispatcher, which advances
-          -- the API worker index or starts a dedicated /relay world thread.
-          async.yield()
-          local payload = http.Exchange(request, response):to_transfer_payload()
-          local accepted = false
-          defer if not accepted then http.Exchange.discard_transfer_payload(payload) end
-          local opening = messages.Handoff(store.secure_token(16), payload, request.method, request.target)
-          bootstrap.returned:send(opening)
-          accepted = true
-        end
-      end, 10000)
-      return nil
-    catch
-      -- A request-local network/cancellation failure retires only its transport.
-      return nil
-    end)
-    active[key] = handling
+  local query = ctx:queries()
+  local payload = api.build_payload(endpoint, ctx:params(), query, data)
+  local client_id? = query["clientId"]
+  if not client_id and data["clientId"] is string then client_id = data["clientId"] as string end
+  local world: protocol.WorldHandle? = nil
+  case ask(messages.ControlAction.select(client_id or ""))
+  when selected(handle) then world = handle
+  when response(status, body) then json_response(ctx, status, body); return
+  else error_response(ctx, 500, "unexpected coordinator reply"); return
   end
-  return nil
+  local timeout = worker.settings.request_timeout
+  if timeout == 0 then timeout = endpoint.timeout_ms end
+  local reply = worker.pool:request(world, endpoint.action, payload, timeout)
+  if reply.status ~= 200 then json_response(ctx, reply.status, reply.body); return end
+  local converted = api.response(endpoint, wire.object(reply.body), query["format"])
+  ctx:status(converted.status):set("Content-Type", converted.content_type)
+  for name, content in iteration.pairs(converted.headers) do ctx:set(name, content) end
+  ctx:send(converted.body)
+end
+
+--- Forward one declared REST endpoint to the selected Foundry world.
+function forward(key: string): mk.Handler
+  return function (ctx: mk.Context) forward_endpoint(ctx, key) end
 end

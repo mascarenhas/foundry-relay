@@ -3,7 +3,7 @@
 Three support subsystems sit beneath the server, API workers, and world
 engines: startup configuration in [`relay/config.titan`](../relay/config.titan),
 cooperative SQLite storage in [`relay/store.titan`](../relay/store.titan), and
-non-suspending JSON logging in [`relay/log.titan`](../relay/log.titan). Each
+non-suspending JSON logging via `mk.log` and `mk.middleware.logger`. Each
 solves a cross-cutting systems constraint for a multi-threaded Titan server:
 validating secrets and browser origins without timing leaks, coordinating
 SQLite writes across OS threads without starving libuv's shared thread pool,
@@ -15,15 +15,15 @@ reverse-proxy settings, and log schemas, see
 ## Startup validation and constant-time secrets
 
 Configuration enters once during process startup in `run` inside
-[`main.titan`](../main.titan) through `load` in
+[`foundry_relay.titan`](../foundry_relay.titan) through `load` in
 [`relay/config.titan`](../relay/config.titan), before any database file or
 network listener opens. The result is an immutable `Config` record whose twelve
 fields (`host`, `port`, `api_key`, `pairing_code`, `database`, `public_url`,
 `origins`, `request_timeout`, `heartbeat`, `auth_timeout`, `max_pending`,
 `api_concurrency`) are all declared `const`. Because `Config` holds only
-strings, integers, and a string Array, `Server` passes it directly inside
-`api_worker.Bootstrap` and `world.Bootstrap` across OS threads with no shared
-mutable state.
+strings, integers, and a string Array, [`relay/routes.titan`](../relay/routes.titan)
+captures it directly in the transferable worker initializers (`api_worker.initializer`
+and `world.initializer`) across OS threads with no shared mutable state.
 
 Validation fails fast on any malformed setting:
 
@@ -50,13 +50,13 @@ accumulator with `#left ~ #right`, scans to the maximum length of the two
 strings using `string.byte(...) or 0`, and folds each byte difference with
 bitwise OR.
 
-`Config:request_origin_allowed` centralizes the `Origin` policy shared by
-`Worker:dispatch` in [`relay/api_worker.titan`](../relay/api_worker.titan) and
-`execute` in [`relay/world.titan`](../relay/world.titan). Native clients that
+`Config:request_origin_allowed` centralizes the HTTP `Origin` policy in
+`origin_policy` ([`relay/routes.titan`](../relay/routes.titan)), while WebSocket
+upgrades in [`relay/world.titan`](../relay/world.titan) also pass
+`worker.settings.origins` to `websocket.AcceptOptions`. Native clients that
 omit `Origin` pass; requests carrying multiple `Origin` headers fail;
 same-origin requests matching `scheme .. "://" .. authority` pass; and all
 other browser origins must match an exact entry via `Config:allows_origin`.
-
 ```titan
 -- Scan all bytes, including when lengths differ; secrets never appear in logs.
 function secret_equal(left: string, right: string): boolean
@@ -259,109 +259,43 @@ records (`row_client`), closing statements and cursors before returning:
 ## Non-suspending structured logging
 
 Every HTTP request, WebSocket frame, timeout, and lifecycle transition emits
-structured JSON lines through [`relay/log.titan`](../relay/log.titan). If log
-admission suspended on `stderr` I/O, a stalled pipe reader could pause request
-dispatch, delay heartbeat Pongs, or inject unexpected yields into state
-transitions.
+structured JSON lines through `titan-mk`'s `mk.log` and `mk.middleware.logger`
+modules. If log admission suspended on `stderr` I/O, a stalled pipe reader
+could pause request dispatch, delay heartbeat Pongs, or inject unexpected
+yields into state transitions.
 
-`Logger` eliminates that coupling by placing an
-`async.BufferedSubscription<|string, nil|>` (`source`) between synchronous
-callers and a single background writer Task (`worker`). Callers invoke
-`Logger:emit` (or the nil-safe module helper `emit`), which checks
-`self.closed` and `self.failed`, maps the level through `rank` (`error` = 1,
-`info` = 2, `debug` = 3), drops messages above `self.minimum`, enforces the
-queue bound (`self.queued >= self.capacity`, default 1,024), encodes the JSON
-record with `line`, and pushes it via `self.publish(encoded)`.
+`foundry_relay.titan` constructs one process-level `mk.log.Logger` from
+`log.resolve_level(os.getenv("RELAY_LOG_LEVEL"), false, "RELAY_LOG_LEVEL")`,
+defers `logger:close()` outside `run`, and passes that `Logger` into
+`server.Server` and `mk.Config { logger = logger }`:
 
-To keep hot fieldless events allocation-light, `line` branches on
-`fields == nil`. Fieldless records such as `server_stopped` and
-`websocket_authentication_rejected` encode a typed `SimpleRecord` directly
-without allocating a temporary `{string: value}` Map. When structured fields
-are supplied, `line` copies them into a fresh Map and overwrites `"timestamp"`,
-`"level"`, and `"event"` so caller data cannot shadow envelope keys. Both paths
-pass `encode_limit` (`json.EncodeOption.max_bytes(16384)`), and `Logger:emit`'s
-`catch` turns invalid UTF-8, cycles, unsupported types, or oversized payloads
-into a silent increment of `self.dropped`.
-
-```titan
-local record SimpleRecord
-  const event: string
-  const level: string
-  const timestamp: string
-end
-
--- ...
-
-local function line(level: string, event: string, fields: {string: value}?): string
-  local timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
-  if fields == nil then
-    return json.encode(SimpleRecord(event, level, timestamp), encode_limit) .. "\n"
-  end
-  local contents: {string: value} = {}
-  for key, item in iteration.pairs(fields) do contents[key] = item end
-  contents["timestamp"] = timestamp
-  contents["level"] = level
-  contents["event"] = event
-  return json.encode(contents, encode_limit) .. "\n"
-end
-```
-*Source: [`relay/log.titan`](../relay/log.titan) — `SimpleRecord`, `line`*
-
-The writer Task runs `Logger:write_loop`, pulling one encoded line at a time
-from `self.source:next()`, invoking `self.sink` (default `write_stderr`,
-writing to `os.stderr`), and calling `Logger:report_dropped` after each
-successful write and at stream shutdown to emit an error-level `log_dropped`
-event with the accumulated count. Any sink error—such as a closed pipe or an
-unsupported regular-file stderr target—sets `self.failed = true`, resets
-`self.queued = 0`, and exits cleanly so logging failures never become uncaught
-Task errors or mask application failures.
-
-```titan
-local function Logger:write_loop(): nil
-  defer self.source:close()
-  while true do
-    case self.source:next()
-    when item(text) then
-      self.queued = self.queued - 1
-      self.sink(text)
-      self:report_dropped()
-    else
-      self:report_dropped()
-      return nil
-    end
-  end
-  return nil
-catch
-  -- A failed destination disables logging and discards unread records. It must
-  -- never become an uncaught Task error or replace an application failure.
-  self.failed = true
-  self.queued = 0
-  return nil
-end
-```
-*Source: [`relay/log.titan`](../relay/log.titan) — `Logger:write_loop`*
-
-Worker threads forward their logs to the main thread without blocking on the
-shared channel. Both `run` in
-[`relay/api_worker.titan`](../relay/api_worker.titan) and `run` in
-[`relay/world.titan`](../relay/world.titan) call
-`log.forward(bootstrap.log_level, bootstrap.log_lines)`, constructing a
-thread-local `Logger` whose custom sink pushes encoded lines onto the borrowed
-`thread.Sender<|string|>` (`log_lines`, capacity 1,024) via non-blocking
-`try_send`, tracking its own `lost` counter for `log_dropped`. The `Sender`
-stays borrowed so one worker's exit cannot close logging for sibling threads.
-On the main thread, `Server.log_task` drains `log_inbox` into
-`self.logger:accept(text)`, which enforces `maximum_line_bytes + 1` and
-`self.capacity` without re-encoding.
-
-During shutdown, `Logger:close` marks `self.closed = true`, invokes
-`self.finish()` to signal end-of-stream, and awaits `self.worker` via
-`tasks.await_terminal`. Because [`main.titan`](../main.titan) defers
-`logger:close()` outside `run`, `Server:close()` joins every worker and drains
-`log_task` before the main logger flushes its final records. If `resolve_level`
-fails on an invalid `RELAY_LOG_LEVEL` before any `Logger` exists, `main`
-invokes `log.fatal`, writing a single fixed JSON error line to `os.stderr`
-inside an isolated `catch`.
+- **Non-suspending admission:** `mk.log.Logger` decouples synchronous callers
+  from `os.stderr` through a bounded `async.BufferedSubscription` (1,024 queued
+  records plus one in-flight record) drained by a background writer Task.
+  Records are capped at 16 KiB; overflow, oversized records, or encoding errors
+  increment a drop counter emitted as an `error`-level `log_dropped` event. A
+  `stderr` write failure disables logging without turning into an uncaught Task
+  error or masking application errors.
+- **Automatic cross-thread worker forwarding:** Passing `logger` in `mk.Config`
+  causes `mk.App` to wire a non-blocking forwarding `mk.log.Logger` into every
+  API pool worker and ephemeral world session worker (`wctx.logger` in
+  `on_start`, `ctx:logger()`, and `ctx:log(...)`). Each worker's forwarding
+  logger writes encoded lines onto a shared 1,024-entry channel drained on the
+  parent thread into the main `Logger`, borrowing the `Sender` so one worker's
+  exit never closes logging for sibling threads.
+- **HTTP admission logging:** [`relay/routes.titan`](../relay/routes.titan)
+  registers `mk.middleware.logger` globally with `PHASE_ADMISSION` as the very
+  first middleware, emitting one `http_request` record per admitted request with
+  normalized `method`, classified `route` template (or `"<unmatched>"`), and
+  `worker_id` before origin, routing, or auth dispatch runs.
+- **Ordered shutdown and startup fallback:** Because
+  [`foundry_relay.titan`](../foundry_relay.titan) defers `logger:close()`
+  outside `run`, `Server:close()` stops the `mk.App`, joins every worker, and
+  drains `mk`'s cross-worker log forwarder before the main logger flushes its
+  final `server_stopped` or `server_failed` record. If `resolve_level` fails on
+  an invalid `RELAY_LOG_LEVEL` before any `Logger` exists, `main` invokes
+  `log.fatal("server_failed", "invalid_log_configuration")`, writing a single
+  fixed JSON error line to `os.stderr`.
 
 ---
 

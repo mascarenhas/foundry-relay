@@ -1,42 +1,44 @@
--- One isolated state owns one authenticated Foundry WebSocket and all its Tasks.
+-- One ephemeral mk session worker owns one authenticated Foundry WebSocket
+-- and all its Tasks.
 local async = import "async"
 local timer = import "timer"
 local thread = import "thread"
 local uv = import "uv"
-local http = import "http"
 local websocket = import "websocket"
 local iteration = import "iteration"
+local string = import "string"
+local mk = import "mk"
+local log = import "mk.log"
 local protocol = import "relay.world_protocol"
 local messages = import "relay.messages"
 local control = import "relay.control"
 local config = import "relay.config"
 local store = import "relay.store"
 local wire = import "relay.wire"
-local router = import "relay.router"
-local log = import "relay.log"
 local api = import "relay.api"
 local tasks = import "relay.tasks"
 
-record Opening
-  const delivery_id: string
-  const payload: string
-  const world_title: string
-  const module_version: string
-  const metadata_json: string
-end
-
-record Bootstrap
+--- What a published world engine reads: its worker, settings, client, the
+-- request and command receivers granted by the coordinator, and the
+-- coordinator itself.
+record Link
   const worker_id: integer
   const settings: config.Config
-  const handle: protocol.WorldHandle
+  const client_id: string
   const requests: thread.Receiver<|protocol.WorldRequest|>
   const commands: thread.Receiver<|protocol.WorldCommand|>
-  const inbox: thread.Receiver<|Opening|>
-  const ready: thread.Sender<|boolean|>
   const coordinator: thread.Sender<|messages.ControlRequest|>
-  const log_level: string
-  const log_lines: thread.Sender<|string|>?
 end
+
+-- Per worker state: every session worker is an independent Lua state.
+local record State
+  const settings: config.Config
+  const database: store.Store
+  const coordinator: thread.Sender<|messages.ControlRequest|>
+  const logger: log.Logger?
+end
+
+local state: State? = nil
 
 local const event_channels: {string: string} = {
   ["chat-event"] = "chat-events",
@@ -80,7 +82,7 @@ local function Outgoing:should_send(pending_requests: {string: Pending}): boolea
 end
 
 local record Engine
-  const bootstrap: Bootstrap
+  const link: Link
   const connection: websocket.Connection
   const pending: {string: Pending}
   const targets: {string: protocol.SubscriptionTarget}
@@ -97,21 +99,21 @@ local record Engine
   local closed: boolean
 end
 
-local function Engine.new(bootstrap: Bootstrap, connection: websocket.Connection, logger: log.Logger?): Engine
+local function Engine.new(link: Link, connection: websocket.Connection, logger: log.Logger?): Engine
   local publish: (function (Outgoing): boolean)? = nil
   local finish: (function (): boolean)? = nil
   local outbox = async.BufferedSubscription<|Outgoing, string|>(function (p, _, f)
     publish = p; finish = f
     return async.SubscriptionActions<|Outgoing|>(noop_stop, noop_close)
   end)
-  return {bootstrap = bootstrap, connection = connection, pending = {}, targets = {}, counts = {},
+  return {link = link, connection = connection, pending = {}, targets = {}, counts = {},
     outbox = outbox, publish = publish, finish = finish, logger = logger, writer = nil,
     count = 0, queued = 0, admitting = true, activated = false, closed = false}
 end
 
 local function Engine:enqueue(text: string, id: string?, kind: string?)
   if not self.admitting then raise "Foundry world is disconnected" end
-  if self.queued >= self.bootstrap.settings.max_pending + 16 then raise "Foundry output queue is full" end
+  if self.queued >= self.link.settings.max_pending + 16 then raise "Foundry output queue is full" end
   if not self.publish(Outgoing(text, id, message_type(kind or "unknown"))) then raise "Foundry output queue is closed" end
   self.queued = self.queued + 1
 end
@@ -129,7 +131,7 @@ local function Engine:quiesce()
   if self.admitting then
     self.admitting = false
     local code? = self.connection:close_status()
-    log.emit(self.logger, "info", "websocket_disconnected", {["client_id"] = self.bootstrap.handle.client_id, ["close_code"] = code})
+    log.emit(self.logger, "info", "websocket_disconnected", {["client_id"] = self.link.client_id, ["close_code"] = code})
     self.finish()
     -- Detach all queued mutations before any retirement can yield.
     local disconnected: string? = nil
@@ -163,11 +165,11 @@ local function Engine:log_failure(reason: string, cause: value)
   if cause is websocket.Error then
     local failure: websocket.Error = cause
     if failure.kind == "state" then
-      log.emit(self.logger, "debug", "websocket_closing", {["client_id"] = self.bootstrap.handle.client_id})
+      log.emit(self.logger, "debug", "websocket_closing", {["client_id"] = self.link.client_id})
       return
     end
   end
-  log.emit(self.logger, "error", "websocket_failed", {["client_id"] = self.bootstrap.handle.client_id, ["reason"] = reason})
+  log.emit(self.logger, "error", "websocket_failed", {["client_id"] = self.link.client_id, ["reason"] = reason})
 end
 
 local function Engine:write_loop(): nil
@@ -178,11 +180,11 @@ local function Engine:write_loop(): nil
       if not self.admitting then return nil end
       if item:should_send(self.pending) then
         self.connection:write(websocket.TEXT, item.text)
-        log.emit(self.logger, "debug", "websocket_message_sent", {["client_id"] = self.bootstrap.handle.client_id,
+        log.emit(self.logger, "debug", "websocket_message_sent", {["client_id"] = self.link.client_id,
           ["type"] = item.kind or "unknown", ["bytes"] = #item.text})
       else
         if item.request_id then self:remove(item.request_id) end
-        log.emit(self.logger, "debug", "websocket_message_discarded", {["client_id"] = self.bootstrap.handle.client_id,
+        log.emit(self.logger, "debug", "websocket_message_discarded", {["client_id"] = self.link.client_id,
           ["type"] = item.kind or "unknown", ["reason"] = "request_retired"})
       end
     else return nil
@@ -200,11 +202,11 @@ end
 
 local function Engine:heartbeat_loop(): nil
   while self.admitting do
-    timer.sleep(self.bootstrap.settings.heartbeat)
+    timer.sleep(self.link.settings.heartbeat)
     if self.admitting then
-      log.emit(self.logger, "debug", "websocket_ping", {["client_id"] = self.bootstrap.handle.client_id})
+      log.emit(self.logger, "debug", "websocket_ping", {["client_id"] = self.link.client_id})
       self.connection:ping(5000)
-      log.emit(self.logger, "debug", "websocket_pong", {["client_id"] = self.bootstrap.handle.client_id})
+      log.emit(self.logger, "debug", "websocket_pong", {["client_id"] = self.link.client_id})
     end
   end
   return nil
@@ -229,12 +231,12 @@ local function Engine:prune()
 end
 
 local function Engine:request_loop(): nil
-  for _, job in self.bootstrap.requests:incoming() do
+  for _, job in self.link.requests:incoming() do
     self:prune()
     local pending = Pending(job, false, nil)
     if not self.admitting then pending:complete(503, wire.error_body("Foundry world disconnected"))
     elseif uv.hrtime() >= job.deadline_ns then pending:complete(408, wire.error_body("Foundry request timed out"))
-    elseif self.count >= self.bootstrap.settings.max_pending then pending:complete(429, wire.error_body("too many pending requests"))
+    elseif self.count >= self.link.settings.max_pending then pending:complete(429, wire.error_body("too many pending requests"))
     elseif job.reply:is_closed() then
       -- A timed out caller has already retired this request's reply lease.
     else
@@ -254,7 +256,7 @@ local function Engine:request_loop(): nil
         pending:complete(503, wire.error_body("Foundry output queue is full"))
         self:remove(job.request_id)
       end
-      log.emit(self.logger, "debug", "request_forwarded", {["client_id"] = self.bootstrap.handle.client_id,
+      log.emit(self.logger, "debug", "request_forwarded", {["client_id"] = self.link.client_id,
         ["type"] = message_type(job.action), ["pending"] = self.count})
     end
   end
@@ -271,13 +273,13 @@ local function Engine:notify(channel: string, count: integer, force: boolean?)
   if self.admitting and self.activated and (force or previous ~= count) then
     local payload: {string: value} = {["type"] = "event-subscription-update", ["channel"] = channel, ["count"] = count}
     self:enqueue(wire.encode(payload), nil, "event-subscription-update")
-    log.emit(self.logger, "debug", "subscription_changed", {["client_id"] = self.bootstrap.handle.client_id,
+    log.emit(self.logger, "debug", "subscription_changed", {["client_id"] = self.link.client_id,
       ["channel"] = channel, ["count"] = count})
   end
 end
 
 local function Engine:command_loop(): nil
-  for _, command in self.bootstrap.commands:incoming() do
+  for _, command in self.link.commands:incoming() do
     case command
     when quiesce(_, ack) then
       self:quiesce()
@@ -285,7 +287,7 @@ local function Engine:command_loop(): nil
     when stop(graceful) then
       self:quiesce()
       if graceful then
-        log.emit(self.logger, "debug", "websocket_replaced", {["client_id"] = self.bootstrap.handle.client_id})
+        log.emit(self.logger, "debug", "websocket_replaced", {["client_id"] = self.link.client_id})
         do self.connection:shutdown(1000, "Replaced by reconnect", 1000) catch end
       end
       self:close()
@@ -311,7 +313,7 @@ local function Engine:receive(text: string)
   if not self.admitting then return end
   local message = wire.object(text)
   local kind = wire.text(message, "type")
-  local id = self.bootstrap.handle.client_id
+  local id = self.link.client_id
   log.emit(self.logger, "debug", "websocket_message_received", {["client_id"] = id, ["type"] = message_type(kind), ["bytes"] = #text})
   if kind == "ping" then self:enqueue("{\"type\":\"pong\"}", nil, "pong"); return end
   local channel? = event_channels[kind]
@@ -330,7 +332,7 @@ local function Engine:receive(text: string)
     end
     if #dropped > 0 then self:notify(channel, (self.counts[channel] or #dropped) - #dropped) end
     for index = 1, #dropped do
-      control.notify(self.bootstrap.coordinator, self.bootstrap.worker_id,
+      control.notify(self.link.coordinator, self.link.worker_id,
         messages.ControlAction.unsubscribe(dropped[index].key))
     end
     return
@@ -354,7 +356,7 @@ local function Engine:read_loop()
     case kind
     when text() then self:receive(data)
     else
-      log.emit(self.logger, "error", "websocket_failed", {["client_id"] = self.bootstrap.handle.client_id, ["reason"] = "text_messages_required"})
+      log.emit(self.logger, "error", "websocket_failed", {["client_id"] = self.link.client_id, ["reason"] = "text_messages_required"})
       return
     end
   end
@@ -367,98 +369,126 @@ local function reject_auth(connection: websocket.Connection, logger: log.Logger?
   connection:shutdown(1008, "authentication failed", 1000)
 end
 
-local function execute(bootstrap: Bootstrap, logger: log.Logger?): nil
-  defer do
-    -- Only bytes still queued here are known not to have been adopted.
-    while true do
-      local found, opening? = bootstrap.inbox:try_receive()
-      if not found then break end
-      http.Exchange.discard_transfer_payload(opening.payload)
-    end
-    -- Supervisor closes the producer before its final post-join drain.
-    -- Closing this Receiver here could discard a concurrently enqueued raw resource.
-    bootstrap.requests:close(); bootstrap.commands:close()
+--- Session worker initializer: attach this world's Store.
+function initializer(settings: config.Config,
+                     coordinator: thread.Sender<|messages.ControlRequest|>): mk.WorkerInit
+  return function (wctx: mk.WorkerContext)
+    local database = store.attach(settings.database)
+    state = State(settings, database, coordinator, wctx.logger)
+    wctx:defer_cleanup(function ()
+      state = nil
+      database:close()
+    end)
   end
-  local database = store.attach(bootstrap.settings.database)
-  defer database:close()
-  bootstrap.ready:send(true)
-  local opening = bootstrap.inbox:receive()
-  local exchange = http.Exchange.from_transfer_payload(opening.payload)
-  defer exchange:close()
-  local request = exchange.request
-  local response = exchange.response
-  if not bootstrap.settings:request_origin_allowed(request.headers:values("Origin"),
-      request.url.scheme, request.url.authority) then
-    router.error_response(response, 403, "origin is not allowed")
-    return nil
-  end
-  local connection = websocket.accept(request, response, websocket.AcceptOptions {
-    allowed_origins = bootstrap.settings.origins, read_limit = 16777216, handshake_timeout = bootstrap.settings.auth_timeout})
+end
+
+--- Parent-side session selector: every `/relay?id=...` opening gets its own
+-- ephemeral worker, keyed `opening_key .. ":" .. client_id`.
+function select_session(meta: mk.RequestMeta): string?
+  local client_id = meta:query("id", "")
+  if client_id == "" then raise mk.HttpError(400, "id is required") end
+  return store.secure_token(16) .. ":" .. client_id
+end
+
+--- The opening key and client id of a session id from `select_session`.
+function split_session(session_id: string): (string, string)
+  local separator = string.find(session_id, ":")
+  return string.sub(session_id, 1, separator - 1), string.sub(session_id, separator + 1)
+end
+
+local function serve(ctx: mk.Context, worker: State)
+  local session_id = ctx:session_id() as string
+  local opening_key, client_id = split_session(session_id)
+  local query = ctx:queries()
+  local world_title = query["worldTitle"] or ""
+  local module_version = query["version"] or ""
+  local metadata: {string: value} = {}
+  for key, item in iteration.pairs(query) do metadata[key] = item end
+  local logger? = worker.logger
+  local connection = ctx:upgrade_websocket(websocket.AcceptOptions {
+    allowed_origins = worker.settings.origins, read_limit = 16777216,
+    handshake_timeout = worker.settings.auth_timeout })
   defer connection:close()
-  local engine = Engine(bootstrap, connection, logger)
-  defer do engine:close(); engine.outbox:close() end
-  local commands = async.run<|nil, value|>(engine:command_loop)
-  defer tasks.drain(commands)
   local deadline = async.run<|nil, value|>(function (): nil
-    timer.sleep(bootstrap.settings.auth_timeout); connection:close(); return nil
+    timer.sleep(worker.settings.auth_timeout); connection:close(); return nil
   end)
   defer tasks.drain(deadline)
   local kind?, text? = connection:read()
-  if not kind then return nil end
+  if not kind then return end
   case kind
   when text() then
   else
-    log.emit(logger, "error", "websocket_failed", {["reason"] = "authentication_requires_text"}); return nil
+    log.emit(logger, "error", "websocket_failed", {["reason"] = "authentication_requires_text"}); return
   end
   log.emit(logger, "debug", "websocket_message_received", {["type"] = "authentication", ["bytes"] = #text})
   local auth = wire.object(text)
   local token = wire.text(auth, "token")
-  local client? = database:authenticate(bootstrap.handle.client_id, token)
+  local client? = worker.database:authenticate(client_id, token)
   if wire.text(auth, "type") ~= "auth" or not client then
     reject_auth(connection, logger)
-    return nil
+    return
   end
   tasks.drain(deadline)
-  database:update(client.client_id, client.world_id, opening.world_title ~= "" and opening.world_title or client.world_title,
-    opening.module_version, opening.metadata_json)
-  local published = control.call(bootstrap.coordinator, bootstrap.worker_id,
-    messages.ControlAction.auth_publish(bootstrap.handle, token))
+  worker.database:update(client.client_id, client.world_id, world_title ~= "" and world_title or client.world_title,
+    module_version, wire.encode(metadata))
+  local requests: thread.Receiver<|protocol.WorldRequest|>? = nil
+  local commands: thread.Receiver<|protocol.WorldCommand|>? = nil
   local activation: protocol.Activation? = nil
-  case published
-  when published(snapshot) then activation = snapshot
+  case control.call(worker.coordinator, ctx:worker_id(),
+      messages.ControlAction.auth_publish(session_id, opening_key, client_id, token))
+  when published(snapshot, _, granted_requests, granted_commands) then
+    activation = snapshot
+    requests = granted_requests
+    commands = granted_commands
   else
-    if engine.admitting then reject_auth(connection, logger) end
-    return nil
+    reject_auth(connection, logger)
+    return
   end
-  if not engine.admitting then return nil end
+  defer do requests:close(); commands:close() end
+  local engine = Engine(Link(ctx:worker_id(), worker.settings, client_id, requests, commands,
+    worker.coordinator), connection, logger)
+  defer do engine:close(); engine.outbox:close() end
+  local command_task = async.run<|nil, value|>(engine:command_loop)
+  defer tasks.drain(command_task)
   for index = 1, #activation.targets do
     local target = activation.targets[index]
     if not target.events:is_closed() then engine.targets[target.key] = target end
   end
   connection:write(websocket.TEXT, "{\"type\":\"auth-success\"}")
   log.emit(logger, "debug", "websocket_message_sent", {["client_id"] = client.client_id, ["type"] = "auth-success", ["bytes"] = 23})
-  if not engine.admitting then return nil end
+  if not engine.admitting then return end
   engine.activated = true
   local writer = async.run<|nil, value|>(engine:write_loop)
   engine.writer = writer
   local heartbeat = async.run<|nil, value|>(engine:heartbeat_loop)
-  local requests = async.run<|nil, value|>(engine:request_loop)
-  defer do engine:close(); tasks.drain(requests); tasks.drain(heartbeat); tasks.drain(writer) end
+  local request_task = async.run<|nil, value|>(engine:request_loop)
+  defer do engine:close(); tasks.drain(request_task); tasks.drain(heartbeat); tasks.drain(writer) end
   for index = 1, #activation.counts do
     local count = activation.counts[index]
     engine:notify(count.channel, engine.counts[count.channel] or count.count, true)
   end
   engine:read_loop()
-  return nil
-catch
-  if not (error is async.CancellationReason) then log.emit(logger, "error", "websocket_failed", {["reason"] = "handshake_or_authentication_failed"}) end
-  return nil
 end
 
-function run(bootstrap: Bootstrap): nil
-  local logger? = log.forward(bootstrap.log_level, bootstrap.log_lines)
-  defer if logger then logger:close() end
-  return execute(bootstrap, logger)
+--- `GET /relay` handler on the opening's session worker. Failures are
+-- logged; a handshake rejection keeps its HTTP response, and any other
+-- failure before the upgrade aborts the transport instead of answering 200.
+function handle_relay(ctx: mk.Context)
+  local worker? = state
+  if worker == nil then raise "world worker is not initialized" end
+  do
+    serve(ctx, worker)
+  catch
+    if error is async.CancellationReason then raise end
+    if error is mk.HttpError then
+      if (error as mk.HttpError).code == "websocket_handshake" then
+        log.emit(worker.logger, "error", "websocket_failed", {["reason"] = "handshake_or_authentication_failed"})
+      end
+      raise
+    end
+    log.emit(worker.logger, "error", "websocket_failed", {["reason"] = "handshake_or_authentication_failed"})
+    if not ctx:committed() then ctx:abort() end
+  end
 end
 
 do

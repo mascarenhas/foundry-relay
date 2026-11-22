@@ -1,27 +1,119 @@
+-- The relay's mk application: global middleware, routes, and worker modes.
+local async = import "async"
+local thread = import "thread"
+local mk = import "mk"
+local log = import "mk.log"
+local keyauth = import "mk.middleware.keyauth"
+local logger_mw = import "mk.middleware.logger"
+local recover = import "mk.middleware.recover"
 local api = import "relay.api"
-local router = import "relay.router"
+local api_worker = import "relay.api_worker"
+local config = import "relay.config"
+local messages = import "relay.messages"
+local world = import "relay.world"
 
-function create(): router.Router
-  local declarations = api.routes()
-  local local_routes: {router.Route} = {
-    router.Route("GET", "/health", "health"),
-    router.Route("POST", "/auth/pair", "pair"),
-    router.Route("POST", "/api/self-unpair", "unpair"),
-    router.Route("GET", "/api/clients/:clientId/active", "active"),
-    router.Route("GET", "/relay", "relay"),
-    router.Route("GET", "/clients", "clients"),
-    router.Route("DELETE", "/clients/:clientId", "forget"),
-    router.Route("POST", "/session-handshake", "session-handshake"),
-    router.Route("POST", "/start-session", "session-start"),
-    router.Route("DELETE", "/end-session", "session-end"),
-    router.Route("GET", "/session", "session-list"),
-    router.Route("GET", "/chat/subscribe", "sse:chat-events"),
-    router.Route("GET", "/rolls/subscribe", "sse:roll-events"),
-    router.Route("GET", "/hooks/subscribe", "sse:hooks"),
-    router.Route("GET", "/encounters/subscribe", "sse:combat-events"),
-    router.Route("GET", "/actor/subscribe", "sse:actor-events"),
-    router.Route("GET", "/scene/subscribe", "sse:scene-events") }
+-- Errors keep the relay's `{"error": ...}` bodies; routing misses never echo
+-- the request target, and API key failures share one message.
+local function relay_error(ctx: mk.Context, failure: mk.HttpError)
+  local message = failure.message
+  local code? = failure.code
+  if code == nil and (failure.status == 404 or failure.status == 405) then
+    message = "route not found"
+  elseif code == "missing_api_key" or code == "invalid_api_key" then
+    message = "invalid API key"
+  end
+  api_worker.error_response(ctx, failure.status, message)
+end
+
+-- Unexpected handler failures become 400 without exposing their contents.
+local function invalid_request(ctx: mk.Context, failure: value, _: string): mk.HttpError
+  if failure is async.OperationError then
+    ctx:log("error", "http_request_failed", {["reason"] = "io_failure"})
+  elseif not (failure is string) then
+    ctx:log("error", "http_request_failed", {["reason"] = "internal_failure"})
+  end
+  return mk.HttpError(400, "invalid request", "invalid_request", failure)
+end
+
+-- Origin policy (403) and CORS preflight (204) precede every routing outcome.
+local function origin_policy(settings: config.Config): mk.Handler
+  return function (ctx: mk.Context)
+    if not settings:request_origin_allowed(ctx:get_headers("Origin"), ctx:scheme(), ctx:host()) then
+      raise mk.HttpError(403, "origin is not allowed")
+    end
+    local origin? = ctx:header_opt("Origin")
+    if origin ~= nil then
+      ctx:set("Access-Control-Allow-Origin", origin)
+      ctx:set("Vary", "Origin")
+    end
+    if ctx:method() == "OPTIONS" then
+      ctx:set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+      ctx:set("Access-Control-Allow-Headers", "Content-Type,X-API-Key,X-Foundry-Url,X-Username,X-World-Name")
+      ctx:no_content()
+      return
+    end
+    ctx:next()
+  end
+end
+
+local function reject_malformed_target(ctx: mk.Context)
+  local problem? = ctx:target_error()
+  if problem ~= nil then raise mk.HttpError(400, problem) end
+  ctx:next()
+end
+
+local function api_key_check(settings: config.Config): mk.Handler
+  local expected = settings.api_key
+  return keyauth.new(keyauth.Config {
+    extractor = keyauth.Extractor.single_header("x-api-key"),
+    validator = function (_: mk.Context, key: string): boolean
+      return config.secret_equal(key, expected)
+    end,
+  })
+end
+
+--- Build the relay application. REST routes run on `api_concurrency` pool
+-- workers; each `/relay` opening runs on its own ephemeral session worker,
+-- and `world_exited` observes that worker's OS join on the parent.
+function create(settings: config.Config, coordinator: thread.Sender<|messages.ControlRequest|>,
+                logger: log.Logger?, world_exited: mk.SessionExitHook): mk.App
+  local app = mk.App(mk.Config {
+    case_sensitive = true, strict_routing = true, unescape_path = true, auto_head = false,
+    body_limit = 16777216, idle_timeout_ms = 10000, error_handler = relay_error, logger = logger,
+    workers = mk.WorkerMode.pool(mk.PoolOptions {
+      size = settings.api_concurrency, on_start = api_worker.initializer(settings, coordinator),
+    }),
+  })
+  app:use(logger_mw.new(logger_mw.Config { phase = logger_mw.PHASE_ADMISSION }))
+  app:use(origin_policy(settings))
+  app:use(reject_malformed_target)
+  app:use(recover.new(recover.Config { exception_handler = invalid_request }))
+  local auth = api_key_check(settings)
+  app:get("/health", api_worker.health)
+  app:post("/auth/pair", api_worker.pair)
+  app:post("/api/self-unpair", api_worker.unpair)
+  app:get("/api/clients/:clientId/active", api_worker.active)
+  app:get("/relay", world.handle_relay):workers(mk.WorkerMode.session(mk.SessionOptions {
+    session_id = world.select_session, ephemeral = true,
+    on_start = world.initializer(settings, coordinator), on_exit = world_exited,
+  }))
+  app:get("/clients", auth, api_worker.clients)
+  app:delete("/clients/:clientId", auth, api_worker.forget)
+  app:post("/session-handshake", auth, api_worker.session_handshake)
+  app:post("/start-session", auth, api_worker.session_start)
+  app:delete("/end-session", auth, api_worker.session_end)
+  app:get("/session", auth, api_worker.session_list)
+  app:get("/chat/subscribe", auth, api_worker.stream("chat-events"))
+  app:get("/rolls/subscribe", auth, api_worker.stream("roll-events"))
+  app:get("/hooks/subscribe", auth, api_worker.stream("hooks"))
+  app:get("/encounters/subscribe", auth, api_worker.stream("combat-events"))
+  app:get("/actor/subscribe", auth, api_worker.stream("actor-events"))
+  app:get("/scene/subscribe", auth, api_worker.stream("scene-events"))
   -- Specific local routes precede the upstream route table.
-  for index = 1, #declarations do local_routes[#local_routes + 1] = declarations[index] end
-  return router.Router(local_routes)
+  local endpoints = api.definitions()
+  for index = 1, #endpoints do
+    local endpoint = endpoints[index]
+    app:add({endpoint.method}, endpoint.path, auth, api_worker.forward(endpoint.key))
+  end
+  return app
 end

@@ -1,15 +1,29 @@
 local test = import "test"
 local api = import "relay.api.titan"
-local router = import "relay.router"
+local router = import "mk.router"
 local wire = import "relay.wire"
 local string = import "string"
 
+-- The relay application's routing options: case-sensitive, strict, unescaped.
+local const relay_routing = router.PatternOptions(true, true, true, false)
+
+-- Resolve a request target to its endpoint the way the relay routes it.
+local function resolve(method: string, target: string): (api.Endpoint, {string: string}, {string: string})
+  local parsed = router.parse_target(target)
+  local endpoints = api.definitions()
+  for index = 1, #endpoints do
+    local endpoint = endpoints[index]
+    if endpoint.method == method then
+      local found? = router.compile_pattern(endpoint.path, relay_routing):match(parsed.path)
+      if found ~= nil then return endpoint, found.params, parsed.query end
+    end
+  end
+  raise "expected an API route for " .. method .. " " .. target
+end
+
 local function payload(method: string, target: string, body: string): {string: value}
-  local routes = router.Router(api.routes())
-  local resolved = routes:match(method, target)
-  test.assert(resolved.status == 200, "expected an API route")
-  local endpoint = api.endpoint_for(resolved.match.action)
-  return api.build_payload(endpoint, resolved.match, wire.object(body))
+  local endpoint, params, query = resolve(method, target)
+  return api.build_payload(endpoint, params, query, wire.object(body))
 end
 
 local function expect_error(operation: function(): (), expected: string)
@@ -37,7 +51,6 @@ function test_catalog_is_complete(context: test.Context)
               "standard endpoint reported is_upload()")
   test.assert(not api.endpoint_for("GET /download"):is_upload(),
               "download endpoint reported is_upload()")
-  local routes = router.Router(api.routes())
   for index = 1, #endpoints do
     local endpoint = endpoints[index]
     context:run(endpoint.key, function(_child: test.Context)
@@ -45,9 +58,9 @@ function test_catalog_is_complete(context: test.Context)
       test.assert(endpoint.timeout_ms > 0)
     end)
   end
-  local macro = routes:match("POST", "/macro/Macro.test/execute")
-  test.assert(macro.match.params["uuid"] == "Macro.test")
-  test.assert(api.endpoint_for(macro.match.action).action == "macro-execute")
+  local macro, params, _query = resolve("POST", "/macro/Macro.test/execute")
+  test.assert(params["uuid"] == "Macro.test")
+  test.assert(macro.action == "macro-execute")
 end
 
 function test_query_coercion_preserves_false(_context: test.Context)

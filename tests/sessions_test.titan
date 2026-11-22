@@ -11,7 +11,7 @@ local hub = import "relay.hub"
 local tasks = import "relay.tasks"
 local wire = import "relay.wire"
 local encryption = import "tests.session_crypto_test"
-local log = import "relay.log"
+local log = import "mk.log"
 
 local record Probe
   started: integer

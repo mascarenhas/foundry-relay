@@ -15,7 +15,7 @@ local hub = import "relay.hub"
 local store = import "relay.store"
 local tasks = import "relay.tasks"
 local wire = import "relay.wire"
-local log = import "relay.log"
+local log = import "mk.log"
 
 record Error
   const status: integer

@@ -23,11 +23,13 @@ These rules apply to every route, including public ones:
 - **Authentication.** Every route except `/health`, `/auth/pair`,
   `/api/self-unpair`, `/api/clients/:clientId/active`, and `/relay` requires
   exactly one `x-api-key` header equal to `FOUNDRY_REST_API_KEY`. A missing,
-  wrong, or repeated header returns 401.
+  wrong, or repeated header returns 401 with
+  `WWW-Authenticate: ApiKey realm="Restricted"`.
 - **Bodies.** A route that reads a JSON body requires `Content-Type:
   application/json` and a JSON object nested at most 64 levels when the body is
-  nonempty; an empty body counts as `{}`. Bodies are capped at 16 MiB. Raw
-  `POST /upload` is the sole exception, specified under [responses](#responses).
+  nonempty; an empty body counts as `{}`. Bodies are capped at 16 MiB; larger
+  request bodies return 413. Raw `POST /upload` is the sole exception to JSON
+  parsing, specified under [responses](#responses).
 - **World selection.** Forwarding routes and event streams take `clientId` from
   the query; forwarding routes also accept a string `clientId` in the body. When
   it is omitted and exactly one world is online, that world is used. Several
@@ -35,9 +37,9 @@ These rules apply to every route, including public ones:
   unknown or offline world, or no online world, returns 503.
 - **Errors.** Failures return a JSON body `{"error":"..."}`. A malformed target
   returns 400; an unmatched path returns 404; a path declared only for other
-  methods returns 405 with an `Allow` header. Invalid parameters, an oversized
-  or non-JSON body, and other rejected input return 400 with the generic
-  message `invalid request`.
+  methods returns 405 with an `Allow` header; an oversized request body returns
+  413. Invalid parameters, a non-JSON or malformed JSON body, and other rejected
+  input return 400 with the generic message `invalid request`.
 
 ## Local routes
 

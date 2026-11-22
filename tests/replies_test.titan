@@ -7,7 +7,7 @@ local string = import "string"
 local uv = import "uv"
 local protocol = import "relay.world_protocol"
 local replies = import "relay.replies.titan"
-local log = import "relay.log"
+local log = import "mk.log"
 local tasks = import "relay.tasks"
 local wire = import "relay.wire"
 

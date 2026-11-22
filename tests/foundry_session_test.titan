@@ -39,18 +39,16 @@ local function relay_fixture(worlds: hub.Hub, id: string?): RelayFixture
     local requests_tx, requests_rx = thread.channel<|protocol.WorldRequest|>(8)
     local commands_tx, commands_rx = thread.channel<|protocol.WorldCommand|>(8)
     local health_tx, health_rx = thread.channel<|nil|>(1)
-    local inbox_tx, inbox_rx = thread.channel<|world.Opening|>(1)
-    local ready_tx, ready_rx = thread.channel<|boolean|>(1)
     local control_tx, control_rx = thread.channel<|messages.ControlRequest|>(1)
     defer do
-      requests_rx:close(); commands_rx:close(); inbox_rx:close(); ready_rx:close(); control_rx:close()
-      requests_tx:close(); commands_tx:close(); inbox_tx:close(); ready_tx:close(); control_tx:close()
+      requests_rx:close(); commands_rx:close(); control_rx:close()
+      requests_tx:close(); commands_tx:close(); control_tx:close()
     end
     local key = store.secure_token(16)
-    local handle = protocol.WorldHandle(key, id or "retirement-world", requests_tx, commands_tx, health_rx)
+    local client_id = id or "retirement-world"
+    local handle = protocol.WorldHandle(key, client_id, requests_tx, commands_tx, health_rx)
     local settings = config.Config("127.0.0.1", 0, "key", "CODE12", "/unused", "ws://127.0.0.1/relay", {}, 60000, 60000, 1000, 8, 1)
-    local bootstrap = world.Bootstrap(1, settings, handle, requests_rx, commands_rx, inbox_rx, ready_tx, control_tx, "error", nil)
-    engine = world.Engine(bootstrap, stream, nil)
+    engine = world.Engine(world.Link(1, settings, client_id, requests_rx, commands_rx, control_tx), stream, nil)
     defer do engine:close(); engine.outbox:close() end
     local requests = async.run<|nil, value|>(engine:request_loop)
     defer tasks.drain(requests)
