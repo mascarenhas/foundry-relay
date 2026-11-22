@@ -56,7 +56,7 @@ stop_relay() {
   if [[ -n $relay ]] && kill -0 "$relay" 2> /dev/null; then
     if ((windows)); then
       # MSYS2 runs a native program under a stub; end the whole process tree.
-      taskkill //F //T //PID "$(cat "/proc/$relay/winpid")" || true
+      MSYS2_ARG_CONV_EXCL='*' taskkill /F /T /PID "$(cat "/proc/$relay/winpid")" || true
     else
       kill -KILL "$relay" || true
     fi
@@ -135,7 +135,7 @@ else
 fi
 grep -q '"event":"server_started"' relay.log
 test ! -s relay.out
-if grep -qF -e "$api_key" -e "$token" relay.log; then exit 1; fi
+if grep -qF -e "$api_key" -e "$pairing_code" -e "$token" relay.log; then exit 1; fi
 cd - > /dev/null
 
 # 3. Remove the rock: LuaRocks owns the executable; on Windows titan-uninstall
