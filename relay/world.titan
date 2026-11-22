@@ -470,16 +470,24 @@ local function serve(ctx: mk.Context, worker: State)
   engine:read_loop()
 end
 
---- `GET /relay` handler on the opening's session worker. Failures after the
--- upgrade are logged; the transport closes when the handler returns.
+--- `GET /relay` handler on the opening's session worker. Failures are
+-- logged; a handshake rejection keeps its HTTP response, and any other
+-- failure before the upgrade aborts the transport instead of answering 200.
 function handle_relay(ctx: mk.Context)
   local worker? = state
   if worker == nil then raise "world worker is not initialized" end
   do
     serve(ctx, worker)
   catch
-    if error is async.CancellationReason or error is mk.HttpError then raise end
+    if error is async.CancellationReason then raise end
+    if error is mk.HttpError then
+      if (error as mk.HttpError).code == "websocket_handshake" then
+        log.emit(worker.logger, "error", "websocket_failed", {["reason"] = "handshake_or_authentication_failed"})
+      end
+      raise
+    end
     log.emit(worker.logger, "error", "websocket_failed", {["reason"] = "handshake_or_authentication_failed"})
+    if not ctx:committed() then ctx:abort() end
   end
 end
 

@@ -617,6 +617,16 @@ function test_client_active_endpoint_reports_online_status(_context: test.Contex
   end)
 end
 
+function test_plain_relay_request_is_rejected(_context: test.Context)
+  with_relay(function(fixture)
+    local credentials = pair(fixture, "world")
+    -- No upgrade offer: the world worker must reject it, never answer 200.
+    local reply = call(fixture, "GET", "/relay?id=" .. credentials.id, nil, nil)
+    test.assert(reply.status >= 400 and reply.status < 500, "plain /relay request was answered " .. reply.status)
+    test.assert(not fixture.instance.worlds:online(credentials.id), "a plain request published a world")
+  end)
+end
+
 function test_sse_event_names_sanitize_line_breaks(_context: test.Context)
   with_relay(function(fixture)
     local credentials = pair(fixture, "world")

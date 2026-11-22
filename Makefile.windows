@@ -35,7 +35,7 @@ require-clang64:
 
 # Both final images share compiler-owned objects, but keep relocatable payloads.
 all: require-clang64
-	+$(TITANC) $(BUILD_FLAGS) --exe "$(WINDOWS_OUTPUT)/bin/foundry-relay.exe" main
+	+$(TITANC) $(BUILD_FLAGS) --exe "$(WINDOWS_OUTPUT)/bin/foundry-relay.exe" foundry_relay
 	mkdir -p build/windows/app/bin build/windows/app/lib/titan/0.6
 	set -e; for name in $(RUNTIME_DLLS); do cp "$(PREFIX)/bin/$$name" build/windows/app/bin/; done
 	cp "$(PREFIX)/lib/titan/0.6/titan.dll" "$(PREFIX)/lib/titan/0.6/mk.dll" build/windows/app/lib/titan/0.6/
@@ -45,7 +45,7 @@ all: require-clang64
 	cp "$(PREFIX)/share/titan/LICENSE" "$(PREFIX)/share/titan/THIRD_PARTY_NOTICES.md" build/windows/app/licenses/
 	cp -R "$(PREFIX)/share/titan/LICENSES" build/windows/app/licenses/
 	cp "$(OUTPUT_DIR)/bin/foundry-relay.exe" build/windows/app/bin/
-	cp "$(OUTPUT_DIR)/lib/titan/0.6/main.dll" build/windows/app/lib/titan/0.6/
+	cp "$(OUTPUT_DIR)/lib/titan/0.6/foundry_relay.dll" build/windows/app/lib/titan/0.6/
 
 core-test-build: require-clang64
 	+$(TITANC) $(BUILD_FLAGS) --test --tree . --test-dir tests --test-exclude tests.process_test --exe "$(WINDOWS_OUTPUT)/bin/relay-tests.exe" tests.api_test

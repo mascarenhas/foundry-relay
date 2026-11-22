@@ -63,7 +63,7 @@ end
 
 function test_relocated_executable_runs_without_compiler_or_provider(_context: test.Context)
   local source? = os.getenv("RELAY_TEST_EXECUTABLE")
-  if not source then test.skip("capability: set RELAY_TEST_EXECUTABLE or use make test") end
+  if not source then test.skip("capability: set RELAY_TEST_EXECUTABLE or use luarocks test") end
   local binary = fs.tmpname()
   defer fs.unlink(binary)
   fs.write_file(binary, fs.read_file(source))

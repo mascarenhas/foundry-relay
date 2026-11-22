@@ -19,15 +19,15 @@ local sessions = import "relay.sessions"
 local foundry = import "relay.foundry_session"
 
 -- A published world's parent-owned endpoints. Its health Sender closes only
--- after the session worker's OS join (`Server:world_exited`).
+-- after the session worker's OS join (`Server:world_exited`). The request
+-- and command receivers belong to the worker alone: the parent never keeps
+-- clones, so a released or failed delivery leaves no receiver behind.
 local record WorldSlot
   const session_key: string
   const client_id: string
   const worker_id: integer
   const handle: protocol.WorldHandle
   const health: thread.Sender<|nil|>
-  const requests: thread.Receiver<|protocol.WorldRequest|>
-  const commands: thread.Receiver<|protocol.WorldCommand|>
 end
 
 local record Operation
@@ -136,8 +136,10 @@ local function Server:abandon_world(key: string)
   if slot == nil then return end
   self.worlds:retire(slot.client_id, key)
   do slot.handle.commands:try_send(protocol.WorldCommand.stop(false)) catch end
-  slot.requests:close()
-  slot.commands:close()
+  -- Closing the Senders ends a running engine's loops; Receiver:close() would
+  -- also discard a delivered engine's state for every clone.
+  slot.handle.requests:close()
+  slot.handle.commands:close()
   self.app:stop_worker(slot.worker_id)
 end
 
@@ -146,14 +148,12 @@ local function Server:world_exited(session_id: string, worker_id: integer)
   local key, _client = world.split_session(session_id)
   local slot? = self.world_slots[key]
   if slot == nil or slot.worker_id ~= worker_id then return end
+  self.world_slots[key] = nil
   -- Health closure may wake quiescence while its caller holds the Hub gate.
   slot.health:close()
-  slot.requests:close()
-  slot.commands:close()
   slot.handle.requests:close()
   slot.handle.commands:close()
   self.worlds:retire(slot.client_id, key)
-  self.world_slots[key] = nil
 end
 
 -- Credential check, worker validation, registration, and publication run in
@@ -176,7 +176,7 @@ local function Server:publish_world(request: messages.ControlRequest, session_ke
     local health_tx, health_rx = thread.channel<|nil|>(1)
     local handle = protocol.WorldHandle(opening_key, client_id, requests_tx, commands_tx, health_rx)
     self.world_slots[opening_key] = WorldSlot(session_key, client_id, request.worker_id, handle,
-      health_tx, requests_rx, commands_rx)
+      health_tx)
     local publishable = function (): boolean
       local current? = self.app:session_worker(session_key)
       local sender? = request.reply
